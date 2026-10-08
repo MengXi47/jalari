@@ -3,7 +3,7 @@ resolver = "3"
 members = ["jalari", "jalari-macros"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 homepage = "https://github.com/MengXi47/jalari"
@@ -17,7 +17,7 @@ clap = { version = "4", features = ["derive", "env"] }
 croner = "4"
 gethostname = "1"
 inventory = "0.3"
-jalari-macros = { path = "jalari-macros", version = "=0.1.0" }
+jalari-macros = { path = "jalari-macros", version = "=0.2.0" }
 proc-macro2 = "1"
 quote = "1"
 serde = { version = "1", features = ["derive"] }
