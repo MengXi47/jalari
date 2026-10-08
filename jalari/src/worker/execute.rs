@@ -1,16 +1,20 @@
 use std::any::Any;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::{AssertSqlSafe, Connection, PgConnection, Postgres, Transaction};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, info_span, warn};
 
+use super::middleware::{JobMeta, Next};
 use super::runner::Shared;
-use crate::job::JobState;
+use crate::job::context::{self, Captured};
 use crate::job::registry::JobRegistration;
+use crate::job::{JobState, run};
 use crate::storage::interval;
-use crate::{Error, ErrorKind, JobError, JobResult, Result, Schema};
+use crate::{Error, ErrorKind, JobError, JobId, JobResult, JobRun, Result, Schema};
 
 const CLAIM_LEASE: Duration = Duration::from_secs(2);
 const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -38,6 +42,7 @@ struct ClaimedJob {
     timeout_ms: Option<i32>,
     queue_key: Option<String>,
     updated_at: DateTime<Utc>,
+    context: Option<Value>,
 }
 
 struct AbortOnDrop(JoinHandle<JobResult>);
@@ -123,7 +128,8 @@ impl Shared {
         excluded_keys: &[String],
     ) -> Result<Option<ClaimedJob>> {
         let sql = format!(
-            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, updated_at
+            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, updated_at,
+                 context
              FROM {job}
              WHERE queue = $1
                  AND state IN ('scheduled', 'enqueued')
@@ -155,8 +161,8 @@ impl Shared {
         async move {
             let started = Instant::now();
             let result = match self.jobs.get(job.task.as_str()) {
-                Some(registration) => {
-                    let run = job.run(registration);
+                Some(&registration) => {
+                    let run = job.run(self, registration, queue, attempt);
                     tokio::pin!(run);
                     loop {
                         tokio::select! {
@@ -336,7 +342,8 @@ impl ClaimedJob {
         queue_key: &str,
     ) -> Result<()> {
         let siblings: Vec<ClaimedJob> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, updated_at
+            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, updated_at,
+                 context
              FROM {job}
              WHERE queue_key = $1 AND id <> $2 AND state IN ('scheduled', 'enqueued')
                  AND attempts > 0
@@ -442,8 +449,38 @@ impl ClaimedJob {
         Ok(())
     }
 
-    async fn run(&self, registration: &JobRegistration) -> JobResult {
-        let mut handle = AbortOnDrop(tokio::spawn((registration.run)(&self.payload)));
+    async fn run(
+        &self,
+        shared: &Shared,
+        registration: &'static JobRegistration,
+        queue: &str,
+        attempt: i32,
+    ) -> JobResult {
+        let job_run = JobRun::new(
+            JobId(self.id),
+            registration.name,
+            Arc::from(queue),
+            attempt,
+            self.max_attempts,
+            shared.job_shutdown.child_token(),
+        );
+        let meta = JobMeta::new(job_run.clone(), self.context.clone());
+        let captured = Captured::from_stored(self.context.clone());
+        let middlewares = Arc::clone(&shared.middlewares);
+        let payload = self.payload.clone();
+        let attempt = async move {
+            Next::start(
+                &middlewares,
+                &meta,
+                (registration.context)(),
+                registration.run,
+                &payload,
+            )
+            .run()
+            .await
+        };
+        let attempt = run::within(job_run, context::within(captured, attempt)).in_current_span();
+        let mut handle = AbortOnDrop(tokio::spawn(attempt));
         let joined = match self.timeout_ms {
             Some(timeout_ms) => {
                 let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));

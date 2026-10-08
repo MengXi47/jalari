@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::JobId;
+use crate::job::context::Captured;
 
 /// What to do when a job with the same `job_key` is already waiting or running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,6 +64,29 @@ pub struct EnqueueOptions {
     pub(super) queue_key: Option<String>,
     pub(super) timeout: Option<Duration>,
     pub(super) on_conflict: OnConflict,
+    pub(super) context: ContextChoice,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) enum ContextChoice {
+    #[default]
+    Inherit,
+    Set(Captured),
+    Clear,
+}
+
+impl ContextChoice {
+    pub(super) fn inherits(&self) -> bool {
+        matches!(self, Self::Inherit)
+    }
+
+    pub(super) fn resolve(self) -> Captured {
+        match self {
+            Self::Inherit => crate::job::context::current(),
+            Self::Set(captured) => captured,
+            Self::Clear => Captured::Empty,
+        }
+    }
 }
 
 impl EnqueueOptions {
@@ -124,6 +149,24 @@ impl EnqueueOptions {
     /// [`OnConflict::KeepExisting`].
     pub fn on_conflict(mut self, on_conflict: OnConflict) -> Self {
         self.on_conflict = on_conflict;
+        self
+    }
+
+    /// Stores `context` with the job instead of the one from the surrounding
+    /// [`scope`](crate::scope).
+    ///
+    /// Workers pass it to their [`JobMiddleware`](crate::JobMiddleware) through
+    /// [`JobMeta::context`](crate::JobMeta::context). It is serialized here; a value that cannot
+    /// be serialized makes the enqueue fail with
+    /// [`PayloadEncodeFailed`](crate::ErrorKind::PayloadEncodeFailed).
+    pub fn context<C: Serialize>(mut self, context: &C) -> Self {
+        self.context = ContextChoice::Set(Captured::encode(context));
+        self
+    }
+
+    /// Stores no context with the job, even inside a [`scope`](crate::scope) or a running job.
+    pub fn no_context(mut self) -> Self {
+        self.context = ContextChoice::Clear;
         self
     }
 }

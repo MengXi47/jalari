@@ -92,6 +92,13 @@ pub enum ErrorKind {
     /// The worker's heartbeat interval is zero or not shorter than the cluster's
     /// [`worker_timeout`](crate::ClusterConfig::worker_timeout).
     InvalidHeartbeatInterval,
+    /// A job whose default queue the worker serves needs a [`Job::Context`](crate::Job::Context)
+    /// that no registered [`JobMiddleware`](crate::JobMiddleware) provides.
+    MissingContext,
+    /// Two middleware registered on one worker provide the same type.
+    DuplicateContextProvider,
+    /// A middleware's [`check`](crate::JobMiddleware::check) failed while building a worker.
+    MiddlewareCheckFailed,
     /// [`cluster::update`](crate::cluster::update) was given a value outside its allowed range.
     InvalidConfigValue,
     /// The single row of the `config` table was deleted.

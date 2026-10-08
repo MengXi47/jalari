@@ -2,7 +2,10 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::punctuated::Punctuated;
-use syn::{Expr, ExprLit, ItemImpl, Lit, LitStr, MetaNameValue, Token, parse_macro_input};
+use syn::{
+    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitStr, MetaNameValue, Token, parse_macro_input,
+    parse_quote,
+};
 
 /// Registers an `impl Job for T` so workers can run `T`, optionally on a cron schedule.
 ///
@@ -19,6 +22,9 @@ use syn::{Expr, ExprLit, ItemImpl, Lit, LitStr, MetaNameValue, Token, parse_macr
 /// A schedule declared with `cron` follows the deployed code: workers sync it at startup, remove
 /// it when the declaration is gone, and it cannot be changed at runtime. Use
 /// `jalari::recurring::add_or_update` for schedules that change while running.
+///
+/// When the impl leaves out `type Context`, it is set to `()`. When `run` takes only `self`,
+/// the context parameter is added for it, so jobs that need no context stay short.
 ///
 /// # Examples
 ///
@@ -71,7 +77,7 @@ struct JobArguments {
 
 fn expand(
     arguments: Punctuated<MetaNameValue, Token![,]>,
-    item_impl: ItemImpl,
+    mut item_impl: ItemImpl,
 ) -> syn::Result<TokenStream2> {
     let arguments = parse_arguments(arguments)?;
 
@@ -92,6 +98,8 @@ fn expand(
             "#[jalari::job] does not support generic jobs",
         ));
     }
+
+    fill_in_context(&mut item_impl);
 
     let job_type = &item_impl.self_ty;
     let queue = match arguments.queue {
@@ -120,6 +128,29 @@ fn expand(
             ::jalari::__private::JobRegistration::new::<#job_type>(#queue, #cron)
         }
     })
+}
+
+fn fill_in_context(item_impl: &mut ItemImpl) {
+    let declares_context = item_impl
+        .items
+        .iter()
+        .any(|item| matches!(item, ImplItem::Type(declared) if declared.ident == "Context"));
+    if !declares_context {
+        item_impl.items.push(parse_quote!(
+            type Context = ();
+        ));
+    }
+    for item in &mut item_impl.items {
+        if let ImplItem::Fn(function) = item
+            && function.sig.ident == "run"
+            && function.sig.inputs.len() == 1
+        {
+            function
+                .sig
+                .inputs
+                .push(parse_quote!(_context: &Self::Context));
+        }
+    }
 }
 
 fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Result<JobArguments> {

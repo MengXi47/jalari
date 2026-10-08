@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::AssertSqlSafe;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +23,7 @@ struct DueRecurring {
     queue: String,
     max_attempts: i32,
     timeout_ms: Option<i32>,
+    context: Option<Value>,
     scheduled_at: DateTime<Utc>,
     now: DateTime<Utc>,
 }
@@ -92,6 +94,7 @@ impl Shared {
                      max_attempts = EXCLUDED.max_attempts, timeout_ms = EXCLUDED.timeout_ms,
                      cron = EXCLUDED.cron, timezone = EXCLUDED.timezone,
                      next_run_at = EXCLUDED.next_run_at,
+                     context = NULL,
                      enabled = TRUE,
                      managed = TRUE,
                      updated_at = now()",
@@ -131,7 +134,7 @@ impl Shared {
             let mut transaction = pool.begin().await?;
             let due: Option<DueRecurring> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT name, cron, timezone, task, payload, queue, max_attempts, timeout_ms,
-                     next_run_at AS scheduled_at, now() AS now
+                     context, next_run_at AS scheduled_at, now() AS now
                  FROM {recurring}
                  WHERE enabled AND next_run_at <= now() AND task = ANY($1)
                  ORDER BY next_run_at
@@ -157,6 +160,7 @@ impl Shared {
                         due.queue,
                         due.max_attempts,
                         due.timeout_ms,
+                        due.context,
                     )
                     .insert(&mut transaction, schema)
                     .await?;

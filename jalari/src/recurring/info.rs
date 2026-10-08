@@ -23,4 +23,7 @@ pub struct RecurringInfo {
     pub next_run_at: DateTime<Utc>,
     /// Scheduled time of the last run, not the moment it was enqueued; `None` before the first.
     pub last_run_at: Option<DateTime<Utc>>,
+    /// Context stored with every run, captured from the [`scope`](crate::scope) that created
+    /// the schedule; `None` for code-declared schedules.
+    pub context: Option<serde_json::Value>,
 }

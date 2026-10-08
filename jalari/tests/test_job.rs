@@ -1,6 +1,7 @@
 use std::io;
 use std::time::Duration;
 
+use jalari::__private::Provided;
 use jalari::{ErrorKind, Job, JobError, JobResult, Worker, WorkerConfig};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,24 @@ impl Job for Greet {
     async fn run(self) -> JobResult {
         if self.name.is_empty() {
             return Err(JobError::new("name is empty".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+struct UserName(String);
+
+#[derive(Serialize, Deserialize)]
+struct GreetUser;
+
+#[jalari::job]
+impl Job for GreetUser {
+    const NAME: &'static str = "test_greet_user";
+    type Context = UserName;
+
+    async fn run(self, user: &UserName) -> JobResult {
+        if user.0.is_empty() {
+            return Err(JobError::new("no user".to_owned()));
         }
         Ok(())
     }
@@ -53,15 +72,37 @@ fn test_cron_attribute_records_schedule_and_default_payload() {
 #[tokio::test]
 async fn test_registered_run_decodes_payload_and_reports_result() {
     let registration = jalari::__private::find("test_greet").unwrap();
+    let run = |payload: &[u8]| (registration.run)(Provided::new(), payload);
 
-    assert_eq!((registration.run)(br#"{"name":"a"}"#).await, Ok(()));
+    assert_eq!(run(br#"{"name":"a"}"#).await, Ok(()));
 
-    let failure = (registration.run)(br#"{"name":""}"#).await.unwrap_err();
+    let failure = run(br#"{"name":""}"#).await.unwrap_err();
     assert_eq!(failure.msg(), "name is empty");
     assert!(!failure.is_permanent());
 
-    let undecodable = (registration.run)(b"not json").await.unwrap_err();
+    let undecodable = run(b"not json").await.unwrap_err();
     assert!(undecodable.is_permanent());
+}
+
+#[test]
+fn test_job_attribute_defaults_context_to_unit() {
+    let greet = jalari::__private::find("test_greet").unwrap();
+    assert!((greet.context)().is_unit());
+
+    let greet_user = jalari::__private::find("test_greet_user").unwrap();
+    let key = (greet_user.context)();
+    assert!(!key.is_unit());
+    assert!(key.name.ends_with("UserName"));
+}
+
+#[tokio::test]
+async fn test_run_without_provided_context_is_retryable_error() {
+    let registration = jalari::__private::find("test_greet_user").unwrap();
+    let error = (registration.run)(Provided::new(), b"null")
+        .await
+        .unwrap_err();
+    assert!(!error.is_permanent());
+    assert!(error.msg().contains("UserName"), "{}", error.msg());
 }
 
 #[test]

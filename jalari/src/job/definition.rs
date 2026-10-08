@@ -72,10 +72,20 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// [`EnqueueOptions::timeout`](crate::EnqueueOptions::timeout) overrides it per job.
     const TIMEOUT: Option<Duration> = None;
 
+    /// Value the job receives in [`run`](Self::run), provided by the worker's
+    /// [`JobMiddleware`](crate::JobMiddleware).
+    ///
+    /// `#[jalari::job]` sets it to `()` when the impl leaves it out, which needs no middleware.
+    /// For any other type, [`WorkerBuilder::build`](crate::WorkerBuilder::build) checks that a
+    /// middleware whose [`Provides`](crate::JobMiddleware::Provides) is this type is registered.
+    type Context: Send + Sync + 'static;
+
     /// Runs the job.
     ///
     /// An `Err` is retried according to the worker's [`RetryPolicy`](crate::RetryPolicy) until
     /// [`MAX_ATTEMPTS`](Self::MAX_ATTEMPTS) is reached, unless it is [`JobError::permanent`].
     /// A panic or a timeout counts as a failed attempt and does not affect other jobs.
-    fn run(self) -> impl Future<Output = JobResult> + Send;
+    ///
+    /// Inside `#[jalari::job]` the `context` parameter may be left out when it is not needed.
+    fn run(self, context: &Self::Context) -> impl Future<Output = JobResult> + Send;
 }

@@ -1,10 +1,11 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::init::config;
-use crate::job::registry;
+use crate::job::{context, registry};
 use crate::storage::{JOB_CHANNEL, interval};
 use crate::{
     EnqueueOptions, EnqueueOutcome, Error, ErrorKind, Job, JobId, OnConflict, Result, Schema,
@@ -24,6 +25,8 @@ pub(crate) struct EnqueueRequest {
     job_key: Option<String>,
     queue_key: Option<String>,
     on_conflict: OnConflict,
+    context: Option<Value>,
+    inherit_when_submitted: bool,
 }
 
 pub(crate) fn encode_payload<T: Job>(job: &T) -> Result<Vec<u8>> {
@@ -59,7 +62,10 @@ impl EnqueueRequest {
         let queue = options
             .queue
             .unwrap_or_else(|| default_queue(T::NAME).to_owned());
+        let inherits = options.context.inherits();
+        let context = options.context.resolve().into_value(T::NAME)?;
         Ok(Self {
+            inherit_when_submitted: inherits && context.is_none(),
             task: T::NAME.to_owned(),
             payload,
             max_attempts: T::MAX_ATTEMPTS,
@@ -70,6 +76,7 @@ impl EnqueueRequest {
             job_key: options.job_key,
             queue_key: options.queue_key,
             on_conflict: options.on_conflict,
+            context,
         })
     }
 
@@ -80,6 +87,7 @@ impl EnqueueRequest {
         queue: String,
         max_attempts: i32,
         timeout_ms: Option<i32>,
+        context: Option<Value>,
     ) -> Self {
         Self {
             task,
@@ -92,20 +100,31 @@ impl EnqueueRequest {
             job_key: Some(format!("recurring:{name}")),
             queue_key: None,
             on_conflict: OnConflict::KeepExisting,
+            context,
+            inherit_when_submitted: false,
         }
     }
 
     pub(crate) async fn submit(self) -> Result<EnqueueOutcome> {
+        let request = self.inherit_context()?;
         let config = config()?;
         let mut transaction = config.pool.pool().begin().await?;
-        let outcome = self.insert(&mut transaction, &config.schema).await?;
+        let outcome = request.insert(&mut transaction, &config.schema).await?;
         transaction.commit().await?;
         Ok(outcome)
     }
 
     pub(crate) async fn submit_in(self, connection: &mut PgConnection) -> Result<EnqueueOutcome> {
+        let request = self.inherit_context()?;
         let config = config()?;
-        self.insert(connection, &config.schema).await
+        request.insert(connection, &config.schema).await
+    }
+
+    fn inherit_context(mut self) -> Result<Self> {
+        if self.inherit_when_submitted {
+            self.context = context::current().into_value(&self.task)?;
+        }
+        Ok(self)
     }
 
     pub(crate) async fn insert(
@@ -160,9 +179,9 @@ impl EnqueueRequest {
     ) -> Result<Option<JobId>> {
         let sql = format!(
             "INSERT INTO {job} (queue, task, payload, state, job_key, queue_key, max_attempts, \
-                 run_at, timeout_ms)
+                 run_at, timeout_ms, context)
              SELECT $1, $2, $3, CASE WHEN input.run_at > now() THEN 'scheduled' ELSE 'enqueued' END,
-                 $4, $5, $6, input.run_at, $7
+                 $4, $5, $6, input.run_at, $7, $10
              FROM (SELECT COALESCE($8::timestamptz, now() + COALESCE($9::interval, interval '0'))
                  AS run_at) AS input
              ON CONFLICT (job_key) WHERE job_key IS NOT NULL AND state IN ('scheduled', 'enqueued')
@@ -180,6 +199,7 @@ impl EnqueueRequest {
             .bind(self.timeout_ms)
             .bind(self.run_at)
             .bind(self.delay)
+            .bind(&self.context)
             .fetch_optional(connection)
             .await?;
         Ok(id.map(JobId))
@@ -196,7 +216,7 @@ impl EnqueueRequest {
              SET queue = $1, task = $2, payload = $3,
                  state = CASE WHEN input.run_at > now() THEN 'scheduled' ELSE 'enqueued' END,
                  queue_key = $4, attempts = 0, max_attempts = $5, run_at = input.run_at,
-                 timeout_ms = $6, last_error = NULL, updated_at = now()
+                 timeout_ms = $6, last_error = NULL, context = $10, updated_at = now()
              FROM (SELECT COALESCE($7::timestamptz, now() + COALESCE($8::interval, interval '0'))
                  AS run_at) AS input
              WHERE job.id = (
@@ -217,6 +237,7 @@ impl EnqueueRequest {
             .bind(self.run_at)
             .bind(self.delay)
             .bind(job_key)
+            .bind(&self.context)
             .fetch_optional(connection)
             .await?;
         Ok(id.map(JobId))
