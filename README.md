@@ -1,10 +1,6 @@
 <p align="center">
-  <img src="docs/logo.png" alt="jalari logo" width="160">
+  <img src="docs/banner.png" alt="jalari: background jobs for Rust that need nothing but PostgreSQL" width="640">
 </p>
-
-<h1 align="center">jalari</h1>
-
-<p align="center">Background jobs for Rust that need nothing but PostgreSQL.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/jalari"><img src="https://img.shields.io/crates/v/jalari.svg" alt="crates.io"></a>
