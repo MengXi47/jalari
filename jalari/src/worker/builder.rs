@@ -1,10 +1,16 @@
+use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
+use super::middleware::ErasedMiddleware;
 use super::runner::{DeclaredCron, QueueConfig, Shared, Worker};
 use crate::init::{Config, config};
 use crate::job::registry::{JobRegistration, registrations};
-use crate::{Cron, Error, ErrorKind, ExponentialBackoff, Result, RetryPolicy, WorkerConfig};
+use crate::{
+    Cron, Error, ErrorKind, ExponentialBackoff, JobMiddleware, Result, RetryPolicy, WorkerConfig,
+};
 
 const FIXED_CONNECTIONS: usize = 2;
 
@@ -15,6 +21,7 @@ pub struct WorkerBuilder {
     settings: WorkerConfig,
     retry_policy: Arc<dyn RetryPolicy>,
     scheduler: bool,
+    middlewares: Vec<Arc<dyn ErasedMiddleware>>,
 }
 
 impl WorkerBuilder {
@@ -24,7 +31,17 @@ impl WorkerBuilder {
             settings: WorkerConfig::default(),
             retry_policy: Arc::new(ExponentialBackoff::default()),
             scheduler: true,
+            middlewares: Vec::new(),
         }
+    }
+
+    /// Wraps every job attempt in `middleware`; the first one added is the outermost.
+    ///
+    /// Jobs whose [`Job::Context`](crate::Job::Context) is the middleware's
+    /// [`Provides`](JobMiddleware::Provides) receive the value it provides.
+    pub fn middleware<M: JobMiddleware>(mut self, middleware: M) -> Self {
+        self.middlewares.push(Arc::new(middleware));
+        self
     }
 
     /// Turns the recurring scheduler on or off for this worker; on by default.
@@ -63,11 +80,19 @@ impl WorkerBuilder {
     /// Validates the configuration and creates the worker.
     ///
     /// The worker runs every `#[jalari::job]` linked into the binary and skips jobs whose name
-    /// it does not know, leaving them to other workers.
+    /// it does not know, leaving them to other workers. It also skips jobs whose
+    /// [`Job::Context`](crate::Job::Context) no registered middleware provides, so workers with
+    /// different middleware can share a database.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - A job whose default queue this worker serves needs a context no middleware provides
+    ///   ([`MissingContext`](ErrorKind::MissingContext))
+    /// - Two middleware provide the same type
+    ///   ([`DuplicateContextProvider`](ErrorKind::DuplicateContextProvider))
+    /// - A middleware's [`check`](JobMiddleware::check) fails
+    ///   ([`MiddlewareCheckFailed`](ErrorKind::MiddlewareCheckFailed))
     /// - No queue is configured, one is configured twice or has a concurrency of zero
     ///   ([`NoQueueConfigured`](ErrorKind::NoQueueConfigured),
     ///   [`DuplicateQueue`](ErrorKind::DuplicateQueue),
@@ -88,9 +113,12 @@ impl WorkerBuilder {
         validate_heartbeat(&self.settings)?;
         let jobs = collect_jobs()?;
         let crons = parse_crons(&jobs)?;
+        let provided = collect_providers(&self.middlewares)?;
+        let jobs = select_jobs(jobs, &provided, &self.queues)?;
         let config = config()?;
         check_connections(config, &self.queues)?;
         check_worker_timeout(config, &self.settings).await?;
+        check_middlewares(&self.middlewares).await?;
         let task_names = jobs.keys().map(|name| (*name).to_owned()).collect();
         Ok(Worker {
             shared: Arc::new(Shared {
@@ -100,6 +128,8 @@ impl WorkerBuilder {
                 crons,
                 settings: self.settings,
                 retry_policy: self.retry_policy,
+                middlewares: self.middlewares.into(),
+                job_shutdown: CancellationToken::new(),
             }),
             queues: self.queues,
             scheduler: self.scheduler,
@@ -178,6 +208,67 @@ fn collect_jobs() -> Result<HashMap<&'static str, &'static JobRegistration>> {
         ));
     }
     Ok(jobs)
+}
+
+fn collect_providers(middlewares: &[Arc<dyn ErasedMiddleware>]) -> Result<HashSet<TypeId>> {
+    let mut provided = HashSet::new();
+    for middleware in middlewares {
+        let key = middleware.provides();
+        if !key.is_unit() && !provided.insert(key.id) {
+            return Err(Error::new(
+                ErrorKind::DuplicateContextProvider,
+                format!(
+                    "more than one middleware provides {}; wrap one of them in its own type",
+                    key.name
+                ),
+            ));
+        }
+    }
+    Ok(provided)
+}
+
+fn select_jobs(
+    jobs: HashMap<&'static str, &'static JobRegistration>,
+    provided: &HashSet<TypeId>,
+    queues: &[QueueConfig],
+) -> Result<HashMap<&'static str, &'static JobRegistration>> {
+    let mut selected = HashMap::new();
+    let mut missing = Vec::new();
+    for (name, registration) in jobs {
+        let key = (registration.context)();
+        if key.is_unit() || provided.contains(&key.id) {
+            selected.insert(name, registration);
+        } else if queues.iter().any(|queue| queue.name == registration.queue) {
+            missing.push(format!(
+                "{name} (queue {:?}) needs {}",
+                registration.queue, key.name
+            ));
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(Error::new(
+            ErrorKind::MissingContext,
+            format!(
+                "no middleware provides the context of: {}; register one with \
+                 WorkerBuilder::middleware",
+                missing.join(", ")
+            ),
+        ));
+    }
+    Ok(selected)
+}
+
+async fn check_middlewares(middlewares: &[Arc<dyn ErasedMiddleware>]) -> Result<()> {
+    for middleware in middlewares {
+        if let Err(e) = middleware.check().await {
+            return Err(Error::new(
+                ErrorKind::MiddlewareCheckFailed,
+                format!("{}: {}", middleware.name(), e.msg()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_crons(

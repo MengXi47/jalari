@@ -16,11 +16,14 @@ pub use enqueue::{EnqueueOptions, EnqueueOutcome, OnConflict, enqueue, enqueue_i
 pub use error::{Error, ErrorKind, Result};
 pub use init::{InitBuilder, PoolSource, init};
 pub use jalari_macros::job;
-pub use job::{Job, JobError, JobId, JobResult};
+pub use job::{Job, JobError, JobId, JobResult, JobRun, current_job, scope, shutdown_requested};
 pub use recurring::{Cron, RecurringInfo};
 pub use sqlx;
 pub use storage::{
     Migration, SCHEMA_VERSION, Schema, migrate, migrate_to, migrations, schema_version,
 };
 pub use tokio_util::sync::CancellationToken;
-pub use worker::{ExponentialBackoff, RetryPolicy, Worker, WorkerBuilder, WorkerConfig};
+pub use worker::{
+    ExponentialBackoff, JobMeta, JobMiddleware, Next, RetryPolicy, Worker, WorkerBuilder,
+    WorkerConfig,
+};

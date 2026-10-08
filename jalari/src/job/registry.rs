@@ -1,7 +1,9 @@
+use std::any::{TypeId, type_name};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use crate::worker::Provided;
 use crate::{Job, JobError, JobResult};
 
 #[doc(hidden)]
@@ -14,7 +16,8 @@ pub struct JobRegistration {
     pub max_attempts: i32,
     pub timeout: Option<Duration>,
     pub cron: Option<CronRegistration>,
-    pub run: fn(&[u8]) -> JobFuture,
+    pub context: fn() -> ContextKey,
+    pub run: fn(Provided, &[u8]) -> JobFuture,
 }
 
 #[doc(hidden)]
@@ -22,6 +25,26 @@ pub struct CronRegistration {
     pub expression: &'static str,
     pub timezone: &'static str,
     pub payload: fn() -> serde_json::Result<Vec<u8>>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ContextKey {
+    pub id: TypeId,
+    pub name: &'static str,
+}
+
+impl ContextKey {
+    pub fn of<T: 'static>() -> Self {
+        Self {
+            id: TypeId::of::<T>(),
+            name: type_name::<T>(),
+        }
+    }
+
+    pub fn is_unit(&self) -> bool {
+        self.id == TypeId::of::<()>()
+    }
 }
 
 impl JobRegistration {
@@ -32,6 +55,7 @@ impl JobRegistration {
             max_attempts: T::MAX_ATTEMPTS,
             timeout: T::TIMEOUT,
             cron,
+            context: ContextKey::of::<T::Context>,
             run: run_job::<T>,
         }
     }
@@ -59,9 +83,18 @@ pub fn find(name: &str) -> Option<&'static JobRegistration> {
     registrations().find(|registration| registration.name == name)
 }
 
-fn run_job<T: Job>(payload: &[u8]) -> JobFuture {
+fn run_job<T: Job>(provided: Provided, payload: &[u8]) -> JobFuture {
     match serde_json::from_slice::<T>(payload) {
-        Ok(job) => Box::pin(job.run()),
+        Ok(job) => Box::pin(async move {
+            let Some(context) = provided.get::<T::Context>() else {
+                return Err(JobError::new(format!(
+                    "no middleware provided {} for {}",
+                    type_name::<T::Context>(),
+                    T::NAME
+                )));
+            };
+            job.run(context).await
+        }),
         Err(e) => Box::pin(std::future::ready(Err(JobError::permanent(e)))),
     }
 }

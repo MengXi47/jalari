@@ -1,3 +1,4 @@
+use serde_json::Value;
 use sqlx::AssertSqlSafe;
 
 use super::store::{lock_schedule, managed_by_code, next_run, not_found, notify_change};
@@ -12,13 +13,15 @@ struct TriggerRow {
     queue: String,
     max_attempts: i32,
     timeout_ms: Option<i32>,
+    context: Option<Value>,
 }
 
 /// Creates a runtime schedule that enqueues `job` on every `cron` run, or updates the one named
 /// `name`.
 ///
-/// The job goes to `T`'s default queue. Updating keeps a paused schedule paused and never
-/// repeats a run that already fired. Runs are enqueued by workers with the scheduler enabled;
+/// The job goes to `T`'s default queue. Every run carries the context of the surrounding
+/// [`scope`](crate::scope), if any. Updating keeps a paused schedule paused and never repeats a
+/// run that already fired. Runs are enqueued by workers with the scheduler enabled;
 /// they all wake up as soon as this commits.
 ///
 /// # Errors
@@ -53,6 +56,7 @@ pub async fn add_or_update<T: Job>(name: &str, cron: Cron, job: &T) -> Result<()
     let schema = &config.schema;
     let payload = encode_payload(job)?;
     let timeout_ms = timeout_ms(T::NAME, T::TIMEOUT)?;
+    let context = crate::job::context::current().into_value(T::NAME)?;
 
     let mut transaction = config.pool.pool().begin().await?;
     let existing = lock_schedule(&mut transaction, schema, name).await?;
@@ -63,13 +67,14 @@ pub async fn add_or_update<T: Job>(name: &str, cron: Cron, job: &T) -> Result<()
     let next_run_at = next_run(&mut transaction, &cron, last_run_at).await?;
     let saved: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
         "INSERT INTO {recurring} AS existing (name, cron, timezone, task, payload, queue,
-             max_attempts, timeout_ms, managed, next_run_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9)
+             max_attempts, timeout_ms, managed, next_run_at, context)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10)
          ON CONFLICT (name) DO UPDATE SET
              cron = EXCLUDED.cron, timezone = EXCLUDED.timezone, task = EXCLUDED.task,
              payload = EXCLUDED.payload, queue = EXCLUDED.queue,
              max_attempts = EXCLUDED.max_attempts, timeout_ms = EXCLUDED.timeout_ms,
-             next_run_at = EXCLUDED.next_run_at, updated_at = now()
+             next_run_at = EXCLUDED.next_run_at, context = EXCLUDED.context,
+             updated_at = now()
          WHERE NOT existing.managed
          RETURNING name",
         recurring = schema.table("recurring"),
@@ -83,6 +88,7 @@ pub async fn add_or_update<T: Job>(name: &str, cron: Cron, job: &T) -> Result<()
     .bind(T::MAX_ATTEMPTS)
     .bind(timeout_ms)
     .bind(next_run_at)
+    .bind(&context)
     .fetch_optional(&mut *transaction)
     .await?;
     if saved.is_none() {
@@ -148,7 +154,7 @@ pub async fn trigger(name: &str) -> Result<EnqueueOutcome> {
     let schema = &config.schema;
     let mut transaction = config.pool.pool().begin().await?;
     let row: Option<TriggerRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT task, payload, queue, max_attempts, timeout_ms FROM {recurring}
+        "SELECT task, payload, queue, max_attempts, timeout_ms, context FROM {recurring}
          WHERE name = $1",
         recurring = schema.table("recurring"),
     )))
@@ -163,6 +169,7 @@ pub async fn trigger(name: &str) -> Result<EnqueueOutcome> {
         row.queue,
         row.max_attempts,
         row.timeout_ms,
+        row.context,
     )
     .insert(&mut transaction, schema)
     .await?;
@@ -234,7 +241,7 @@ pub async fn list() -> Result<Vec<RecurringInfo>> {
     let config = config()?;
     let rows = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT name, cron, timezone, task, queue, enabled, managed, next_run_at,
-             last_run_at
+             last_run_at, context
          FROM {recurring}
          ORDER BY name",
         recurring = config.schema.table("recurring"),

@@ -9,6 +9,7 @@ use tracing::warn;
 
 use super::builder::WorkerBuilder;
 use super::heartbeat::{self, WorkerRegistration};
+use super::middleware::ErasedMiddleware;
 use super::{housekeeping, listener, scheduler};
 use crate::init::Config;
 use crate::job::registry::{CronRegistration, JobRegistration};
@@ -62,6 +63,8 @@ pub(super) struct Shared {
     pub(super) crons: Vec<DeclaredCron>,
     pub(super) settings: WorkerConfig,
     pub(super) retry_policy: Arc<dyn RetryPolicy>,
+    pub(super) middlewares: Arc<[Arc<dyn ErasedMiddleware>]>,
+    pub(super) job_shutdown: CancellationToken,
 }
 
 pub(super) struct DeclaredCron {
@@ -93,7 +96,8 @@ impl Worker {
     /// scheduler when enabled and performs housekeeping when the cluster turns it on. Database
     /// outages are logged with `tracing` and retried; they never end the loop.
     ///
-    /// After cancellation it stops claiming jobs and waits for running ones to finish. Jobs still
+    /// After cancellation it stops claiming jobs, signals running ones through
+    /// [`shutdown_requested`](crate::shutdown_requested) and waits for them to finish. Jobs still
     /// running after [`WorkerConfig::shutdown_timeout`] are aborted, which counts as an attempt,
     /// and another worker runs them again.
     pub async fn run(self, shutdown: CancellationToken) {
@@ -143,6 +147,7 @@ impl Worker {
         }
 
         shutdown.cancelled().await;
+        self.shared.job_shutdown.cancel();
         let timeout = self.shared.settings.shutdown_timeout;
         if tokio::time::timeout(timeout, drain(&mut tasks))
             .await

@@ -124,6 +124,7 @@ impl Job for SendEmail {
 | `NAME` | Stable name stored with every job; must be unique in the binary | required |
 | `MAX_ATTEMPTS` | Attempts before the job is marked failed, including the first and any interrupted by a crash | 10 |
 | `TIMEOUT` | Longest time one attempt may run | none |
+| `type Context` | Value `run` receives from the worker's middleware; see [Context and middleware](#context-and-middleware) | `()` |
 | `queue = "..."` | Queue the job goes to unless the enqueue says otherwise | `default` |
 
 `run` returns `Ok(())` on success. Any error converts into a retryable `jalari::JobError`
@@ -295,6 +296,23 @@ Cancelling the token stops the worker from claiming new jobs and waits for runni
 Jobs still running after `shutdown_timeout` are aborted and count as an attempt; another
 worker runs them again.
 
+A long job can notice the shutdown and stop early, for example after saving its progress:
+
+```rust
+for id in ids {
+    tokio::select! {
+        () = jalari::shutdown_requested() => {
+            return Err(jalari::JobError::new("stopped for shutdown".to_owned()));
+        }
+        result = export(id) => result?,
+    }
+}
+```
+
+`jalari::current_job()` returns the running attempt's id, name, queue and attempt number. The
+id stays the same across retries, so it works as an idempotency key. Both functions only work
+in the job's own task, not in tasks it spawns.
+
 ### Crashes and lost connections
 
 When a worker process dies, PostgreSQL releases its jobs. The next worker that finds one
@@ -314,6 +332,164 @@ job's own transaction, overriding the server default: if a worker freezes or the
 without closing the connection, PostgreSQL ends the session after 10 seconds without a check,
 and another worker takes the job over about 16 seconds after the failure instead of waiting
 for TCP keepalives.
+
+## Context and middleware
+
+A worker is a separate process, so the request that enqueued a job cannot hand it its
+connections or caller directly. jalari carries a small context instead: it is captured when the
+job is enqueued, stored with the job, and given to middleware that rebuilds whatever the job
+needs on the worker. jalari attaches no meaning to it; tenants, users, databases and tracing are
+all up to your middleware.
+
+```
+ enqueue   jalari::scope(&caller, ..) or EnqueueOptions::context(&caller)
+           -> stored once in the job's context column, kept across retries
+ worker    middleware reads job.context::<Caller>(), rebuilds, next.provide(value)
+           -> the job receives &value as its Context
+```
+
+### Capturing a context
+
+Wrap the code that enqueues in `jalari::scope`, typically once in your request middleware:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct Caller {
+    tenant_id: String,
+    user_id: i64,
+}
+
+jalari::scope(&caller, async {
+    jalari::enqueue_in(&mut transaction, &BuildReport { request_id }, jalari::EnqueueOptions::new())
+        .await
+})
+.await?;
+```
+
+| Source | Used when |
+|---|---|
+| `EnqueueOptions::context(&value)` | Set on the enqueue |
+| `EnqueueOptions::no_context()` | Set on the enqueue; stores nothing |
+| The surrounding `jalari::scope` | Neither option is set |
+| The running job's context | Enqueued from inside a job, which therefore passes its context on |
+
+The context is serialized as JSON next to the job, so store identifiers only, never tokens or
+passwords. Whoever can insert into the job table can write any context, so middleware should
+look identifiers up again rather than trust them. Runtime schedules from
+`jalari::recurring::add_or_update` keep the context of the scope they were created in.
+
+### Writing middleware
+
+```rust
+use jalari::{JobError, JobMeta, JobMiddleware, JobResult, Next};
+
+struct TenantMiddleware {
+    db_router: DbRouter,
+}
+
+impl JobMiddleware for TenantMiddleware {
+    type Provides = RequestContext;
+
+    async fn check(&self) -> Result<(), JobError> {
+        self.db_router.load_catalog().await?;
+        Ok(())
+    }
+
+    async fn call(&self, job: &JobMeta, next: Next<'_>) -> JobResult {
+        let Some(caller) = job.context::<Caller>()? else {
+            return Err(JobError::permanent(MissingCaller));
+        };
+        let context = self.db_router.request_context(caller).await?;
+        next.provide(context).run().await
+    }
+}
+
+#[jalari::job(queue = "reports")]
+impl Job for BuildReport {
+    const NAME: &'static str = "build_report";
+    type Context = RequestContext;
+
+    async fn run(self, context: &RequestContext) -> JobResult {
+        let mut transaction = context.db.begin().await?;
+        // ...
+        Ok(())
+    }
+}
+
+let worker = jalari::Worker::builder()
+    .middleware(TracingMiddleware)
+    .middleware(TenantMiddleware { db_router })
+    .queue("reports", 4)
+    .build()
+    .await?;
+```
+
+- The first middleware added is the outermost.
+- A middleware with `type Provides = ()` wraps every job. Any other middleware only wraps jobs
+  whose `Context` is its `Provides`, so jobs that need no tenant are never rejected by it.
+- Returning an error instead of calling `next.run()` rejects the attempt. A permanent error
+  fails the job; any other error is retried like a failed run. `job.context::<T>()` returns a
+  permanent error when the stored context does not decode as `T`.
+- `build()` fails with `MissingContext` when a job whose default queue the worker serves needs a
+  context no middleware provides, with `DuplicateContextProvider` when two middleware provide the
+  same type, and with `MiddlewareCheckFailed` when a `check` fails. Jobs on other queues whose
+  context is missing are simply not taken, so workers with different middleware can share the
+  database.
+
+### Choosing a database per job
+
+The type decides which kind of resource a job gets; the stored context can decide which one.
+Wrap each resource in its own type so a job cannot reach the wrong one:
+
+```rust
+struct ReportDb(PgPool);
+
+struct TargetDb {
+    name: String,
+    pool: PgPool,
+}
+
+impl JobMiddleware for DatabaseMiddleware {
+    type Provides = TargetDb;
+
+    async fn call(&self, job: &JobMeta, next: Next<'_>) -> JobResult {
+        let Some(target) = job.context::<Target>()? else {
+            return Err(JobError::permanent(MissingTarget));
+        };
+        let pool = self.databases.get(&target.database).await?;
+        next.provide(TargetDb { name: target.database, pool }).run().await
+    }
+}
+```
+
+Because the context is stored once, every retry of a job reaches the same database.
+
+### Pools and connections
+
+Create the pools your middleware uses when the worker starts and keep them in the middleware;
+jalari only uses the pool given to `jalari::init`. Connect eagerly so a wrong address fails at
+startup, and use `check` to verify each database. Give job pools a connection per concurrent job
+and an `idle_in_transaction_session_timeout`, so a frozen or disconnected worker cannot hold
+locks on your tables:
+
+```rust
+let pool = PgPoolOptions::new()
+    .max_connections(8)
+    .acquire_timeout(Duration::from_secs(5))
+    .after_connect(|connection, _| Box::pin(async move {
+        sqlx::query("SET idle_in_transaction_session_timeout = '30s'")
+            .execute(&mut *connection)
+            .await?;
+        Ok(())
+    }))
+    .connect(&url)
+    .await?;
+```
+
+A job's writes to your own tables commit separately from jalari marking it done. If the worker
+dies in between, the job runs again, so make those writes idempotent, for example with a table
+keyed by `jalari::current_job()` id in the same transaction. When the job tables and your data
+live in different databases, enqueueing inside your transaction is no longer possible either.
 
 ## Deployment
 
