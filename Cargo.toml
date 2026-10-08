@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["jalari", "jalari-macros"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+homepage = "https://github.com/MengXi47/jalari"
+repository = "https://github.com/MengXi47/jalari"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+croner = "4"
+gethostname = "1"
+inventory = "0.3"
+jalari-macros = { path = "jalari-macros", version = "=0.1.0" }
+proc-macro2 = "1"
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "chrono", "json", "derive"] }
+syn = { version = "2", features = ["full"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

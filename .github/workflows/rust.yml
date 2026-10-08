@@ -1,0 +1,73 @@
+name: Rust
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and test (PostgreSQL ${{ matrix.postgres }})
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "18"]
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Configure
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+        echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt,clippy
+
+    - name: Run checks
+      run: |
+        cargo fmt --all -- --check
+        cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo test --workspace --all-features
+        RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+
+  msrv:
+    name: Check MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust 1.94
+      uses: dtolnay/rust-toolchain@1.94.0
+
+    - name: Check
+      run: cargo check --workspace --all-targets --all-features --locked

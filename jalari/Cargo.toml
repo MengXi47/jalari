@@ -1,0 +1,41 @@
+[package]
+name = "jalari"
+description = "A PostgreSQL-only background job framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "../README.md"
+keywords = ["job", "queue", "background", "postgres", "cron"]
+categories = ["asynchronous", "database"]
+
+[features]
+cli = ["dep:clap", "sqlx/tls-rustls"]
+
+[[bin]]
+name = "jalari"
+path = "src/bin/jalari/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+clap = { workspace = true, optional = true }
+croner.workspace = true
+gethostname.workspace = true
+inventory.workspace = true
+jalari-macros.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["signal", "rt-multi-thread"] }
+
+[lints]
+workspace = true
