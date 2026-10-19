@@ -566,11 +566,19 @@ pub(crate) async fn mark_interrupted(
              INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
              SELECT id, state, attempts, $2, statement_timestamp() FROM marked
          ),
+         failed AS (
+             SELECT id FROM marked WHERE state = 'failed'
+         ),
          fenced AS (
              INSERT INTO {job_control} AS control (job_id, lease)
              SELECT id, 1 FROM marked ORDER BY id
              ON CONFLICT (job_id) DO UPDATE
-             SET lease = control.lease + 1, updated_at = statement_timestamp()
+             SET lease = control.lease + 1,
+                 command = CASE WHEN control.job_id IN (SELECT id FROM failed) THEN NULL
+                     ELSE control.command END,
+                 progress = CASE WHEN control.job_id IN (SELECT id FROM failed) THEN NULL
+                     ELSE control.progress END,
+                 updated_at = statement_timestamp()
          )
          SELECT id, task, state, attempts, commanded FROM marked",
         job = schema.table("job"),

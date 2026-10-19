@@ -294,6 +294,7 @@ async fn test_stop_restart_and_cancel() {
         check_progress_survives_stop_and_restart(&database),
         check_progress_survives_a_retry(),
         check_progress_survives_a_crash_minus_a_few_seconds(),
+        check_crash_on_the_last_attempt_fails_and_discards_progress(&database),
         check_shutdown_releases_the_job_without_counting_an_attempt(&database),
         check_replace_discards_saved_progress(&database),
     );
@@ -384,6 +385,46 @@ async fn check_progress_survives_a_crash_minus_a_few_seconds() {
         crashed_at.duration_since(saved_at) <= Duration::from_secs(7),
         "the crash lost {:?} of progress",
         crashed_at.duration_since(saved_at)
+    );
+    worker.stop().await;
+}
+
+async fn check_crash_on_the_last_attempt_fails_and_discards_progress(database: &Database) {
+    let id = count(
+        "exhausted_progress",
+        Counting::Forever,
+        "progress_exhausted",
+        EnqueueOptions::new(),
+    )
+    .await;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET max_attempts = 1 WHERE id = $1",
+        database.table("job")
+    )))
+    .bind(id.0)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let crashed = spawn("progress_exhausted", 1, LONG).await;
+    wait_for_resume("exhausted_progress", 1).await;
+    let stored = || async {
+        sqlx::query_scalar::<_, bool>(AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {} WHERE job_id = $1 AND progress IS NOT NULL)",
+            database.table("job_control")
+        )))
+        .bind(id.0)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+    };
+    wait_until("a flush to store progress", SETTLE, stored).await;
+    crashed.crash().await;
+
+    let worker = spawn("progress_exhausted", 1, LONG).await;
+    wait_for_state(database, id, "failed").await;
+    assert!(
+        !stored().await,
+        "a job failed by an interrupted last attempt still stores progress"
     );
     worker.stop().await;
 }
