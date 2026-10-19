@@ -9,6 +9,7 @@ reference with every option is on docs.rs; this guide shows how the pieces fit t
 - [Enqueueing](#enqueueing)
 - [Recurring jobs](#recurring-jobs)
 - [Running workers](#running-workers)
+- [Stopping, restarting and cancelling](#stopping-restarting-and-cancelling)
 - [Deployment](#deployment)
 - [Cluster settings and cleanup](#cluster-settings-and-cleanup)
 - [Monitoring](#monitoring)
@@ -87,6 +88,11 @@ builds them without `CONCURRENTLY`, so writes to the job table wait for the buil
 upgrade runs, and dropping the old index waits for every running job to finish while blocking
 other access to the table. Stop the workers before upgrading. Workers of an older release that
 start after the upgrade fail `init`, because it requires the exact table version.
+
+Version 4 adds the `job_control` table and the `stopped` state, and replaces the unique
+`job_key` index with one that also covers stopped jobs. Changing the state checks scans the job
+table and blocks all access to it until the upgrade commits, and it waits for every running
+job to finish first. Stop the workers before upgrading, as for version 3.
 
 ## Defining jobs
 
@@ -292,6 +298,7 @@ the sum of all concurrencies plus two; `build()` checks this.
 | `shutdown_timeout` | How long shutdown waits for running jobs before aborting them | 30 s |
 | `max_claim_tries` | Jobs skipped per pass while their `queue_key` is busy | 10 |
 | `heartbeat_interval` | How often the worker reports that it is alive | 30 s |
+| `stop_timeout` | How long a stopped or cancelled job may take to reach a checkpoint before it is aborted | 30 s |
 
 ### Retries
 
@@ -299,7 +306,8 @@ The default `jalari::ExponentialBackoff` waits 5 s, 10 s, 20 s... up to 1 hour, 
 jitter. Implement `jalari::RetryPolicy` for a different strategy. A job is marked failed when it reaches
 `MAX_ATTEMPTS` or returns a permanent error.
 
-An attempt is counted when it starts, so an attempt cut short by a crash counts too. When a
+An attempt is counted when it starts, so an attempt cut short by a crash counts too, unless it
+ends in a [stop or cancel](#stopping-restarting-and-cancelling). When a
 crashed worker's job is picked up again with no attempts left, it is marked failed with
 `the worker stopped during the last attempt` instead of running once more. This keeps a job
 that brings down its process from crashing workers forever.
@@ -308,7 +316,9 @@ that brings down its process from crashing workers forever.
 
 Cancelling the token stops the worker from claiming new jobs and waits for running ones.
 Jobs still running after `shutdown_timeout` are aborted and count as an attempt; another
-worker runs them again.
+worker runs them again. A job that reaches a [checkpoint](#checkpoints) during the shutdown
+gets an error from it; when it returns that error, the job goes back to its queue without
+counting the attempt and keeps its saved progress.
 
 A long job can notice the shutdown and stop early, for example after saving its progress:
 
@@ -348,6 +358,100 @@ job's own transaction, overriding the server default: if a worker freezes or the
 without closing the connection, PostgreSQL ends the session after 10 seconds without a check,
 and another worker takes the job over about 16 seconds after the failure instead of waiting
 for TCP keepalives.
+
+## Stopping, restarting and cancelling
+
+A stop frees everything a job holds: its task, its pooled connection, the row lock and the
+`queue_key` its worker holds, and the worker's slot, plus whatever the job's own code holds as it
+returns. The job stays in the database as `stopped` until you restart or cancel it, also
+across worker restarts.
+
+```rust
+match jalari::stop(id).await? {
+    jalari::StopOutcome::Stopped => println!("stopped"),
+    jalari::StopOutcome::Requested => println!("a worker holds it; call stop again to see"),
+    jalari::StopOutcome::Finished | jalari::StopOutcome::NotFound => {}
+}
+
+jalari::restart(id).await?;
+jalari::cancel(id).await?;
+```
+
+### Checkpoints
+
+A job learns about a stop at its checkpoints. A checkpoint can also save progress, so a
+restart, a retry or a takeover after a crash continues where the job left off:
+
+```rust
+#[derive(Serialize, Deserialize, Default)]
+struct Cursor {
+    last_id: i64,
+}
+
+async fn run(self) -> JobResult {
+    let (saved, checkpoint) = jalari::resume::<Cursor>()?;
+    let mut cursor = saved.unwrap_or_default();
+    while let Some(batch) = fetch(cursor.last_id).await? {
+        upload(&batch).await?;
+        cursor.last_id = batch.last_id;
+        checkpoint.save(&cursor).await?;
+    }
+    Ok(())
+}
+```
+
+`jalari::resume::<P>()` returns the progress saved by an earlier run, `None` on the first
+run, and the `Checkpoint<P>` that saves the same type. `checkpoint.save(&progress)` never
+touches the database: it keeps a JSON copy at most once a second, and the worker writes the
+latest copies every 5 seconds. It returns an error once the job should stop, and `?` unwinds
+the job. Jobs without progress call `jalari::checkpoint().await?` instead. Both do nothing
+outside a job. A job that finishes discards its progress, and so does a `Replace`.
+
+### What each call does
+
+| Call | Waiting job | Running job | Stopped job | Finished job |
+|---|---|---|---|---|
+| `stop` | `Stopped` at once | `Requested` | `Stopped` | `Finished` |
+| `cancel` | `Cancelled` at once | `Requested` | `Cancelled` | `Finished` |
+| `restart` | `NotStopped` | `NotStopped` | `Restarted` | `NotStopped` |
+
+An id with no job returns `NotFound`. A job whose worker crashed less than 6 seconds ago
+counts as running.
+
+A running job sees a request within about a second. How it ends:
+
+| The job | It ends as |
+|---|---|
+| Returns the checkpoint's error | `stopped` (or `deleted` for a cancel) with the progress that checkpoint saved |
+| Reaches no checkpoint within `stop_timeout` | aborted at its current `.await`, then `stopped` with the last saved progress |
+| Returns any other error, panics or times out | `stopped` (or `deleted`), not retried |
+| Returns `Ok` first | `succeeded`; a later `stop` returns `Finished` |
+| Its worker crashes | `stopped` (or `deleted`) by the next worker, after the usual 6 second delay; it never runs again |
+
+`stop` and `cancel` are safe to repeat and report the current state, so call them again until
+they stop returning `Requested`. A cancel wins over a stop that is still pending.
+
+### What a stop keeps and releases
+
+- A stop or cancel never counts as an attempt. A restarted job has the attempts it had before
+  the stop and continues from its saved progress.
+- A stopped job keeps its `job_key`: enqueueing the same key returns `Kept`, even with
+  `Replace`, and a recurring schedule skips its runs until the job is restarted or cancelled.
+- A stopped job releases its `queue_key`, so other jobs with the key can run.
+- Housekeeping never deletes stopped jobs. A cancelled job is `deleted` and frees its
+  `job_key`; housekeeping removes it after `deleted_retention`.
+
+### Limits
+
+- The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
+  work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
+  outlive the stop, as with `TIMEOUT` and shutdown aborts.
+- `stop` on a crashed job in a queue no worker serves returns `Requested` until a worker
+  takes the queue, or until a later `stop` after the 6 second delay settles it.
+- A crash loses at most about 6 seconds of progress: one second before a copy is kept, and
+  five before it is written.
+- During a rolling upgrade, workers of 0.3 fail `init` against the new tables, as with every
+  migration.
 
 ## Context and middleware
 

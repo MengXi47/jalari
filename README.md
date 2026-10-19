@@ -31,6 +31,8 @@ jalari = "0.3"
 - **Named queues** — each worker chooses its queues and how many jobs run at once.
 - **Context and middleware** — capture a tenant or user when enqueuing and rebuild it on the
   worker with your own middleware; jobs declare what they need and workers check it at startup.
+- **Stop, restart and cancel** — stop a job to free everything it holds, restart it later from
+  the progress it saved at its last checkpoint, or cancel it for good.
 - **Graceful shutdown** — running jobs finish before a worker exits.
 - **Monitoring and cleanup** — a live list of workers, and optional deletion of finished jobs.
 - **Table setup your way** — from code, with the `jalari` CLI, or as SQL for your own
