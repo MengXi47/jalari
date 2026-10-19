@@ -44,6 +44,10 @@ struct ClaimedJob {
     timeout_ms: Option<i32>,
     queue_key: Option<String>,
     context: Option<Value>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ClaimedControl {
     command: Option<String>,
     lease: i64,
     progress: Option<Value>,
@@ -117,8 +121,9 @@ impl Shared {
                 transaction.rollback().await?;
                 return Ok(false);
             };
-            if let Some(command) = job.command() {
-                if job.unfinished {
+            let control = job.load_control(&mut transaction, schema).await?;
+            if let Some(command) = control.command() {
+                if control.unfinished {
                     mark_interrupted(&mut transaction, schema, &[job.id], false).await?;
                 } else {
                     let closing = Closing::idle(job.id, job.attempts, command);
@@ -166,7 +171,7 @@ impl Shared {
                 return Ok(true);
             };
             waker.notify_one();
-            self.execute(transaction, queue, job, attempt.number, command)
+            self.execute(transaction, queue, job, control, attempt.number, command)
                 .await?;
             return Ok(true);
         }
@@ -181,24 +186,17 @@ impl Shared {
     ) -> Result<Option<ClaimedJob>> {
         let schema = &self.config.schema;
         let sql = format!(
-            "SELECT job.id, job.task, job.payload, job.attempts, job.max_attempts,
-                 job.timeout_ms, job.queue_key, job.context, control.command,
-                 coalesce(control.lease, 0) AS lease, control.progress,
-                 CASE WHEN control.command IS NULL THEN FALSE ELSE {unfinished} END
-                     AS unfinished
-             FROM {job} AS job
-             LEFT JOIN {job_control} AS control ON control.job_id = job.id
-             WHERE job.queue = $1
-                 AND job.state IN ('scheduled', 'enqueued')
-                 AND job.run_at <= now()
-                 AND job.task = ANY($2)
-                 AND (job.queue_key IS NULL OR job.queue_key <> ALL($3))
-             ORDER BY job.priority DESC, job.run_at, job.id
+            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, context
+             FROM {job}
+             WHERE queue = $1
+                 AND state IN ('scheduled', 'enqueued')
+                 AND run_at <= now()
+                 AND task = ANY($2)
+                 AND (queue_key IS NULL OR queue_key <> ALL($3))
+             ORDER BY priority DESC, run_at, id
              LIMIT 1
-             FOR UPDATE OF job SKIP LOCKED",
+             FOR UPDATE SKIP LOCKED",
             job = schema.table("job"),
-            job_control = schema.table("job_control"),
-            unfinished = schema.unfinished_attempt("job"),
         );
         let job = sqlx::query_as(AssertSqlSafe(sql))
             .bind(queue)
@@ -214,6 +212,7 @@ impl Shared {
         mut transaction: Transaction<'_, Postgres>,
         queue: &str,
         job: ClaimedJob,
+        claimed: ClaimedControl,
         attempt: i32,
         command: Option<Command>,
     ) -> Result<()> {
@@ -223,8 +222,8 @@ impl Shared {
             let started = Instant::now();
             let control = Arc::new(RunControl::new(
                 job.id,
-                job.lease,
-                job.progress.clone(),
+                claimed.lease,
+                claimed.progress,
                 self.job_shutdown.child_token(),
             ));
             let registration = self.runs.register(&control);
@@ -314,9 +313,33 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-impl ClaimedJob {
+impl ClaimedControl {
     fn command(&self) -> Option<Command> {
         self.command.as_deref().and_then(Command::parse)
+    }
+}
+
+impl ClaimedJob {
+    async fn load_control(
+        &self,
+        connection: &mut PgConnection,
+        schema: &Schema,
+    ) -> Result<ClaimedControl> {
+        let control = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT control.command, coalesce(control.lease, 0) AS lease, control.progress,
+                 CASE WHEN control.command IS NULL THEN FALSE ELSE {unfinished} END
+                     AS unfinished
+             FROM {job} AS job
+             LEFT JOIN {job_control} AS control ON control.job_id = job.id
+             WHERE job.id = $1",
+            job = schema.table("job"),
+            job_control = schema.table("job_control"),
+            unfinished = schema.unfinished_attempt("job"),
+        )))
+        .bind(self.id)
+        .fetch_one(connection)
+        .await?;
+        Ok(control)
     }
 
     async fn start_attempt(
