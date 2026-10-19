@@ -24,9 +24,10 @@ pub enum OnConflict {
     /// interruption was noticed, like any interrupted job; jobs sharing its `queue_key` wait as
     /// long. A dropped claim counts as such an interruption, so its new payload waits as well.
     ///
-    /// A [stopped](crate::stop) job is never replaced; the enqueue returns
-    /// [`EnqueueOutcome::Kept`]. Replacing a job discards the progress its earlier attempts
-    /// saved.
+    /// A [stopped](crate::stop) job, or one with a pending [`stop`](crate::stop) or
+    /// [`cancel`](crate::cancel), is never replaced; the enqueue returns
+    /// [`EnqueueOutcome::Kept`] and the pending request still applies. Replacing a job discards
+    /// the progress its earlier attempts saved.
     Replace,
 }
 

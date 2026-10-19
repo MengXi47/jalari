@@ -181,7 +181,9 @@ returning `Running`, so a worker that is only inspecting the job is not mistaken
 runs it. If the job's last attempt was interrupted (see
 [Crashes and lost connections](#crashes-and-lost-connections)), the replace records the
 interruption, and the new payload waits the same 6 seconds as any interrupted job, together
-with the jobs sharing its `queue_key`. A dropped claim counts as an interrupted attempt.
+with the jobs sharing its `queue_key`. A dropped claim counts as an interrupted attempt. A job
+that is stopped, or has a pending stop or cancel, is never replaced and returns `Kept` (see
+[What a stop keeps and releases](#what-a-stop-keeps-and-releases)).
 
 ### Inside your transaction
 
@@ -437,6 +439,8 @@ they stop returning `Requested`. A cancel wins over a stop that is still pending
   the stop and continues from its saved progress.
 - A stopped job keeps its `job_key`: enqueueing the same key returns `Kept`, even with
   `Replace`, and a recurring schedule skips its runs until the job is restarted or cancelled.
+- A pending stop or cancel beats `Replace` too: while `stop` or `cancel` returns `Requested`,
+  enqueueing the same key with `Replace` returns `Kept`, and the request still applies.
 - A stopped job releases its `queue_key`, so other jobs with the key can run.
 - Housekeeping never deletes stopped jobs. A cancelled job is `deleted` and frees its
   `job_key`; housekeeping removes it after `deleted_retention`.

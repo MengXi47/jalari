@@ -28,7 +28,7 @@ enum Replacement {
 #[derive(sqlx::FromRow)]
 struct ReplaceRow {
     id: i64,
-    stopped: bool,
+    kept: bool,
     started: bool,
     replaced: bool,
     interrupted: bool,
@@ -233,7 +233,8 @@ impl EnqueueRequest {
     ) -> Result<Replacement> {
         let sql = format!(
             "WITH target AS (
-                 SELECT job.id, job.state = 'stopped' AS stopped, {unfinished} AS started
+                 SELECT job.id, job.state = 'stopped' OR {commanded} AS kept,
+                     {unfinished} AS started
                  FROM {job} AS job
                  WHERE job.job_key = $9 AND job.state IN {JOB_KEY_STATES}
              ),
@@ -241,8 +242,8 @@ impl EnqueueRequest {
                  SELECT id,
                      CASE WHEN last_error = $11 AND run_at > statement_timestamp() THEN run_at END
                          AS takeover_at
-                 FROM {job}
-                 WHERE job_key = $9 AND state IN ('scheduled', 'enqueued')
+                 FROM {job} AS job
+                 WHERE job_key = $9 AND state IN ('scheduled', 'enqueued') AND NOT {commanded}
                  FOR UPDATE SKIP LOCKED
              ),
              replaced AS (
@@ -267,7 +268,7 @@ impl EnqueueRequest {
                  SET progress = NULL, lease = lease + 1, updated_at = statement_timestamp()
                  WHERE job_id IN (SELECT id FROM replaced)
              )
-             SELECT target.id, target.stopped, target.started,
+             SELECT target.id, target.kept, target.started,
                  EXISTS (SELECT 1 FROM replaced) AS replaced,
                  EXISTS (SELECT 1 FROM locked) AND NOT EXISTS (SELECT 1 FROM replaced)
                      AS interrupted
@@ -275,6 +276,11 @@ impl EnqueueRequest {
             job = schema.table("job"),
             job_control = schema.table("job_control"),
             unfinished = schema.unfinished_attempt("job"),
+            commanded = format!(
+                "EXISTS (SELECT 1 FROM {job_control} AS control
+                     WHERE control.job_id = job.id AND control.command IS NOT NULL)",
+                job_control = schema.table("job_control"),
+            ),
         );
         let polling_since = Instant::now();
         loop {
@@ -294,7 +300,7 @@ impl EnqueueRequest {
                 .await?;
             match row {
                 None => return Ok(Replacement::Missing),
-                Some(row) if row.stopped => return Ok(Replacement::Kept(JobId(row.id))),
+                Some(row) if row.kept => return Ok(Replacement::Kept(JobId(row.id))),
                 Some(row) if row.replaced => return Ok(Replacement::Replaced(JobId(row.id))),
                 Some(row) if row.interrupted => {
                     if !mark_interrupted(connection, schema, &[row.id], false).await?
