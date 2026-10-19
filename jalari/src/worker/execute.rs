@@ -45,6 +45,8 @@ struct ClaimedJob {
     queue_key: Option<String>,
     context: Option<Value>,
     command: Option<String>,
+    lease: i64,
+    progress: Option<Value>,
     unfinished: bool,
 }
 
@@ -181,6 +183,7 @@ impl Shared {
         let sql = format!(
             "SELECT job.id, job.task, job.payload, job.attempts, job.max_attempts,
                  job.timeout_ms, job.queue_key, job.context, control.command,
+                 coalesce(control.lease, 0) AS lease, control.progress,
                  CASE WHEN control.command IS NULL THEN FALSE ELSE {unfinished} END
                      AS unfinished
              FROM {job} AS job
@@ -218,7 +221,13 @@ impl Shared {
         async move {
             let schema = &self.config.schema;
             let started = Instant::now();
-            let control = Arc::new(RunControl::default());
+            let control = Arc::new(RunControl::new(
+                job.id,
+                job.lease,
+                job.progress.clone(),
+                self.job_shutdown.child_token(),
+            ));
+            let registration = self.runs.register(&control);
             let mut command = command;
             let ending = match (self.jobs.get(job.task.as_str()), command) {
                 (_, Some(_)) => Ending::NotStarted,
@@ -265,10 +274,17 @@ impl Shared {
                 job.max_attempts,
                 &*self.retry_policy,
             );
-            let closing =
-                Closing::after_run(job.id, attempt, outcome, started.elapsed(), command.is_some());
+            let closing = Closing::after_run(
+                job.id,
+                attempt,
+                outcome,
+                started.elapsed(),
+                command.is_some(),
+                control.latest(),
+            );
             close(&mut transaction, schema, &closing).await?;
             transaction.commit().await?;
+            registration.close();
             log_outcome(job.id, &closing);
             Ok(())
         }
@@ -285,6 +301,7 @@ fn log_outcome(job_id: i64, closing: &Closing) {
             warn!(error = %error, ?delay, "job failed, retrying");
         }
         Outcome::Failed { error } => warn!(error = %error, "job failed"),
+        Outcome::Released { note } => info!(job_id, note = %note, "job released"),
         Outcome::Stopped { note } => info!(job_id, note = %note, "job stopped"),
         Outcome::Cancelled { note } => info!(job_id, note = %note, "job cancelled"),
     }
@@ -411,7 +428,7 @@ impl ClaimedJob {
             Arc::from(queue),
             attempt,
             self.max_attempts,
-            shared.job_shutdown.child_token(),
+            control.shutdown().clone(),
             control,
         );
         let meta = JobMeta::new(job_run.clone(), self.context.clone());

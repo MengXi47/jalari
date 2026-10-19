@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use super::flusher::RunBook;
 use super::middleware::ErasedMiddleware;
 use super::runner::{DeclaredCron, QueueConfig, Shared, Worker};
 use crate::init::{Config, config};
@@ -130,6 +131,7 @@ impl WorkerBuilder {
                 retry_policy: self.retry_policy,
                 middlewares: self.middlewares.into(),
                 job_shutdown: CancellationToken::new(),
+                runs: RunBook::default(),
             }),
             queues: self.queues,
             scheduler: self.scheduler,

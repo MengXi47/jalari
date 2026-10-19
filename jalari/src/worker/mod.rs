@@ -2,6 +2,7 @@ mod builder;
 mod close;
 mod config;
 mod execute;
+mod flusher;
 mod heartbeat;
 mod housekeeping;
 mod listener;

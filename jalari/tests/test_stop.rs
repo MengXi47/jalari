@@ -1,17 +1,126 @@
 mod common;
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Database, LEDGER, RunningWorker, fast_retry, wait_until, worker_config};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{
-    CancelOutcome, EnqueueOptions, EnqueueOutcome, Job, JobError, JobId, JobResult, OnConflict,
-    RestartOutcome, StopOutcome, Worker,
+    CancelOutcome, EnqueueOptions, EnqueueOutcome, ExponentialBackoff, Job, JobError, JobId,
+    JobResult, OnConflict, RestartOutcome, RetryPolicy, StopOutcome, Worker,
 };
 use serde::{Deserialize, Serialize};
 
 const LONG: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_secs(20);
+const SAVE_EVERY: Duration = Duration::from_millis(20);
+
+static PROGRESS: LazyLock<Mutex<HashMap<String, Progress>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, Default)]
+struct Progress {
+    resumed: Vec<Option<u64>>,
+    saved: Vec<(u64, Instant)>,
+    halted_at: Option<u64>,
+}
+
+fn progress(label: &str) -> Progress {
+    PROGRESS
+        .lock()
+        .unwrap()
+        .get(label)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn track(label: &str, update: impl FnOnce(&mut Progress)) {
+    update(
+        PROGRESS
+            .lock()
+            .unwrap()
+            .entry(label.to_owned())
+            .or_default(),
+    );
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum Counting {
+    Forever,
+    SavesThenFails(u64),
+    ReportsOnly,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Cursor {
+    next: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Counter {
+    label: String,
+    counting: Counting,
+}
+
+#[jalari::job(queue = "stop_default")]
+impl Job for Counter {
+    const NAME: &'static str = "stop_counter";
+    const MAX_ATTEMPTS: i32 = 3;
+
+    async fn run(self) -> JobResult {
+        let (saved, checkpoint) = jalari::resume::<Cursor>()?;
+        track(&self.label, |progress| {
+            progress
+                .resumed
+                .push(saved.as_ref().map(|cursor| cursor.next));
+        });
+        let mut cursor = saved.unwrap_or_default();
+        match self.counting {
+            Counting::ReportsOnly => Ok(()),
+            Counting::SavesThenFails(next) if cursor.next == 0 => {
+                checkpoint.save(&Cursor { next }).await?;
+                Err(JobError::new("saved, then failed".to_owned()))
+            }
+            Counting::SavesThenFails(_) => Ok(()),
+            Counting::Forever => loop {
+                cursor.next += 1;
+                track(&self.label, |progress| {
+                    progress.saved.push((cursor.next, Instant::now()));
+                });
+                if let Err(e) = checkpoint.save(&cursor).await {
+                    track(&self.label, |progress| {
+                        progress.halted_at = Some(cursor.next)
+                    });
+                    return Err(e);
+                }
+                tokio::time::sleep(SAVE_EVERY).await;
+            },
+        }
+    }
+}
+
+async fn count(label: &str, counting: Counting, queue: &str, options: EnqueueOptions) -> JobId {
+    jalari::enqueue_with(
+        &Counter {
+            label: label.to_owned(),
+            counting,
+        },
+        options.queue(queue),
+    )
+    .await
+    .unwrap()
+    .id()
+}
+
+async fn wait_for_resume(label: &str, count: usize) {
+    wait_until(
+        &format!("{label} to resume {count} times"),
+        SETTLE,
+        || async { progress(label).resumed.len() >= count },
+    )
+    .await;
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum Mode {
@@ -71,13 +180,22 @@ async fn checkpoint_forever() -> JobResult {
 }
 
 async fn spawn(queue: &str, concurrency: usize, stop_timeout: Duration) -> RunningWorker {
+    spawn_with(queue, concurrency, stop_timeout, fast_retry()).await
+}
+
+async fn spawn_with<R: RetryPolicy>(
+    queue: &str,
+    concurrency: usize,
+    stop_timeout: Duration,
+    retry_policy: R,
+) -> RunningWorker {
     let mut config = worker_config(Duration::from_millis(50));
     config.stop_timeout = stop_timeout;
     RunningWorker::spawn(
         Worker::builder()
             .queue(queue, concurrency)
             .config(config)
-            .retry_policy(fast_retry())
+            .retry_policy(retry_policy)
             .scheduler(false)
             .build()
             .await
@@ -173,9 +291,219 @@ async fn test_stop_restart_and_cancel() {
         check_stopped_job_holds_its_job_key(&database),
         check_stopped_job_releases_its_queue_key(&database),
         check_crashed_job_with_pending_stop_ends_stopped(&database),
+        check_progress_survives_stop_and_restart(&database),
+        check_progress_survives_a_retry(),
+        check_progress_survives_a_crash_minus_a_few_seconds(),
+        check_shutdown_releases_the_job_without_counting_an_attempt(&database),
+        check_replace_discards_saved_progress(&database),
     );
+    check_flush_from_a_run_taken_over_by_replace_does_not_land(&database).await;
 
     database.finish().await;
+}
+
+#[tokio::test]
+async fn test_resume_outside_a_job_returns_nothing_and_saving_does_nothing() {
+    let (saved, checkpoint) = jalari::resume::<Cursor>().unwrap();
+    assert!(saved.is_none());
+    checkpoint.save(&Cursor { next: 1 }).await.unwrap();
+    jalari::checkpoint().await.unwrap();
+}
+
+async fn check_progress_survives_stop_and_restart(database: &Database) {
+    let worker = spawn("progress_restart", 1, LONG).await;
+    let id = count(
+        "restart_progress",
+        Counting::Forever,
+        "progress_restart",
+        EnqueueOptions::new(),
+    )
+    .await;
+    wait_for_resume("restart_progress", 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(settle_stop(id).await, StopOutcome::Stopped);
+    let halted_at = progress("restart_progress")
+        .halted_at
+        .expect("the stop reached a checkpoint");
+    assert_eq!(
+        jalari::restart(id).await.unwrap(),
+        RestartOutcome::Restarted
+    );
+    wait_for_resume("restart_progress", 2).await;
+    assert_eq!(
+        progress("restart_progress").resumed[..2],
+        [None, Some(halted_at)],
+        "the restarted run must continue from the checkpoint that stopped"
+    );
+    assert_eq!(jalari::cancel(id).await.unwrap(), CancelOutcome::Requested);
+    assert_eq!(settle_cancel(id).await, CancelOutcome::Finished);
+    assert_eq!(row(database, id).await, ("deleted".to_owned(), 0));
+    worker.stop().await;
+}
+
+async fn check_progress_survives_a_retry() {
+    let worker = spawn("progress_retry", 1, LONG).await;
+    count(
+        "retry_progress",
+        Counting::SavesThenFails(7),
+        "progress_retry",
+        EnqueueOptions::new(),
+    )
+    .await;
+    wait_for_resume("retry_progress", 2).await;
+    assert_eq!(progress("retry_progress").resumed, [None, Some(7)]);
+    worker.stop().await;
+}
+
+async fn check_progress_survives_a_crash_minus_a_few_seconds() {
+    let crashed = spawn("progress_crash", 1, LONG).await;
+    count(
+        "crash_progress",
+        Counting::Forever,
+        "progress_crash",
+        EnqueueOptions::new(),
+    )
+    .await;
+    wait_for_resume("crash_progress", 1).await;
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    crashed.crash().await;
+    let crashed_at = Instant::now();
+
+    let worker = spawn("progress_crash", 1, LONG).await;
+    wait_for_resume("crash_progress", 2).await;
+    let tracked = progress("crash_progress");
+    let resumed = tracked.resumed[1].expect("a flush saved progress before the crash");
+    let saved_at = tracked
+        .saved
+        .iter()
+        .find(|(next, _)| *next == resumed)
+        .map(|(_, at)| *at)
+        .expect("the resumed progress was saved by the crashed run");
+    assert!(
+        crashed_at.duration_since(saved_at) <= Duration::from_secs(7),
+        "the crash lost {:?} of progress",
+        crashed_at.duration_since(saved_at)
+    );
+    worker.stop().await;
+}
+
+async fn check_shutdown_releases_the_job_without_counting_an_attempt(database: &Database) {
+    let first = spawn("progress_shutdown", 1, LONG).await;
+    let id = count(
+        "shutdown_progress",
+        Counting::Forever,
+        "progress_shutdown",
+        EnqueueOptions::new(),
+    )
+    .await;
+    wait_for_resume("shutdown_progress", 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    first.stop().await;
+
+    assert_eq!(row(database, id).await, ("enqueued".to_owned(), 0));
+    assert_eq!(
+        history(database, id).await,
+        [("enqueued".to_owned(), 0)],
+        "a released attempt must not count"
+    );
+    let halted_at = progress("shutdown_progress")
+        .halted_at
+        .expect("the shutdown reached a checkpoint");
+
+    let second = spawn("progress_shutdown", 1, LONG).await;
+    wait_for_resume("shutdown_progress", 2).await;
+    assert_eq!(progress("shutdown_progress").resumed[1], Some(halted_at));
+    assert_eq!(settle_stop(id).await, StopOutcome::Stopped);
+    second.stop().await;
+}
+
+async fn check_replace_discards_saved_progress(database: &Database) {
+    let hour = Duration::from_secs(3600);
+    let worker = spawn_with(
+        "progress_replace",
+        1,
+        LONG,
+        ExponentialBackoff {
+            base: hour,
+            max: hour,
+            jitter: 0.0,
+        },
+    )
+    .await;
+    let options = || EnqueueOptions::new().job_key("progress-replace");
+    let id = count(
+        "replace_old",
+        Counting::SavesThenFails(5),
+        "progress_replace",
+        options(),
+    )
+    .await;
+    wait_until("the first attempt to fail", SETTLE, || async {
+        row(database, id).await == ("scheduled".to_owned(), 1)
+    })
+    .await;
+
+    let replaced = jalari::enqueue_with(
+        &Counter {
+            label: "replace_new".to_owned(),
+            counting: Counting::ReportsOnly,
+        },
+        options()
+            .queue("progress_replace")
+            .on_conflict(OnConflict::Replace),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced, EnqueueOutcome::Replaced(id));
+    wait_for_state(database, id, "succeeded").await;
+    assert_eq!(progress("replace_new").resumed, [None]);
+    worker.stop().await;
+}
+
+async fn check_flush_from_a_run_taken_over_by_replace_does_not_land(database: &Database) {
+    let worker = spawn("progress_zombie", 1, LONG).await;
+    let options = || EnqueueOptions::new().job_key("progress-zombie");
+    let id = count("zombie", Counting::Forever, "progress_zombie", options()).await;
+    wait_for_resume("zombie", 1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        database
+            .terminate_job_sessions(1, Duration::from_millis(200))
+            .await,
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let replaced = jalari::enqueue_with(
+        &Counter {
+            label: "zombie_replacement".to_owned(),
+            counting: Counting::ReportsOnly,
+        },
+        options()
+            .queue("progress_zombie")
+            .on_conflict(OnConflict::Replace)
+            .delay(Duration::from_secs(12)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced, EnqueueOutcome::Replaced(id));
+    wait_until(
+        "the replacement to run",
+        Duration::from_secs(30),
+        || async { !progress("zombie_replacement").resumed.is_empty() },
+    )
+    .await;
+    assert_eq!(
+        progress("zombie_replacement").resumed,
+        [None],
+        "progress of the interrupted run landed after the replace"
+    );
+    assert!(
+        progress("zombie").saved.len() > 1,
+        "the interrupted run kept saving"
+    );
+    worker.stop().await;
 }
 
 async fn check_stop_on_waiting_job_keeps_it_from_running_until_restart(database: &Database) {

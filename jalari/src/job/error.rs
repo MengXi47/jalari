@@ -1,5 +1,7 @@
 use std::fmt;
 
+use super::checkpoint::Halt;
+
 /// Failure of one attempt of [`Job::run`](crate::Job::run).
 ///
 /// Any `std::error::Error` converts into a retryable `JobError`, so `?` works inside `run`. Use
@@ -20,6 +22,7 @@ use std::fmt;
 pub struct JobError {
     msg: String,
     permanent: bool,
+    halt: Option<Halt>,
 }
 
 impl JobError {
@@ -28,6 +31,7 @@ impl JobError {
         Self {
             msg,
             permanent: false,
+            halt: None,
         }
     }
 
@@ -36,7 +40,20 @@ impl JobError {
         Self {
             msg: e.to_string(),
             permanent: true,
+            halt: None,
         }
+    }
+
+    pub(crate) fn halted(halt: Halt) -> Self {
+        Self {
+            msg: halt.message().to_owned(),
+            permanent: false,
+            halt: Some(halt),
+        }
+    }
+
+    pub(crate) fn halt(&self) -> Option<Halt> {
+        self.halt
     }
 
     /// The message stored in `last_error` and in the job history.

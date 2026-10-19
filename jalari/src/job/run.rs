@@ -47,7 +47,7 @@ impl JobRun {
         }
     }
 
-    pub(crate) fn control(&self) -> &RunControl {
+    pub(crate) fn control(&self) -> &Arc<RunControl> {
         &self.control
     }
 

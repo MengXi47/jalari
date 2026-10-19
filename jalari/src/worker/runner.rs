@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::builder::WorkerBuilder;
+use super::flusher::{self, RunBook};
 use super::heartbeat::{self, WorkerRegistration};
 use super::middleware::ErasedMiddleware;
 use super::{housekeeping, listener, scheduler};
@@ -65,6 +66,7 @@ pub(super) struct Shared {
     pub(super) retry_policy: Arc<dyn RetryPolicy>,
     pub(super) middlewares: Arc<[Arc<dyn ErasedMiddleware>]>,
     pub(super) job_shutdown: CancellationToken,
+    pub(super) runs: RunBook,
 }
 
 pub(super) struct DeclaredCron {
@@ -97,9 +99,11 @@ impl Worker {
     /// outages are logged with `tracing` and retried; they never end the loop.
     ///
     /// After cancellation it stops claiming jobs, signals running ones through
-    /// [`shutdown_requested`](crate::shutdown_requested) and waits for them to finish. Jobs still
-    /// running after [`WorkerConfig::shutdown_timeout`] are aborted, which counts as an attempt,
-    /// and another worker runs them again.
+    /// [`shutdown_requested`](crate::shutdown_requested) and waits for them to finish. A job that
+    /// returns the error of a [`checkpoint`](crate::checkpoint) or [`Checkpoint`](crate::Checkpoint)
+    /// then is put back in its queue without counting the attempt, keeping its saved progress.
+    /// Jobs still running after [`WorkerConfig::shutdown_timeout`] are aborted, which counts as
+    /// an attempt, and another worker runs them again.
     pub async fn run(self, shutdown: CancellationToken) {
         let wakers = Arc::new(Wakers {
             queues: self
@@ -135,6 +139,11 @@ impl Worker {
             WorkerRegistration::new(&self.queues, self.scheduler),
             heartbeat_shutdown.clone(),
         ));
+        let flusher_shutdown = CancellationToken::new();
+        let mut flusher = AbortOnDrop(tokio::spawn(flusher::flush_progress(
+            Arc::clone(&self.shared),
+            flusher_shutdown.clone(),
+        )));
         for queue in &self.queues {
             for _ in 0..queue.concurrency {
                 tasks.spawn(work_loop(
@@ -159,6 +168,10 @@ impl Worker {
             );
             tasks.abort_all();
             drain(&mut tasks).await;
+        }
+        flusher_shutdown.cancel();
+        if let Err(e) = (&mut flusher.0).await {
+            warn!(error = %e, "the progress flusher ended unexpectedly");
         }
         heartbeat_shutdown.cancel();
         if let Err(e) = heartbeat.await {
@@ -190,6 +203,14 @@ pub(super) async fn wait(waker: &Notify, shutdown: &CancellationToken, duration:
         () = waker.notified() => {}
         () = tokio::time::sleep(duration) => {}
         () = shutdown.cancelled() => {}
+    }
+}
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
