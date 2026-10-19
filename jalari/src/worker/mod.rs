@@ -9,6 +9,8 @@ mod retry;
 mod runner;
 mod scheduler;
 
+pub(crate) use execute::{INTERRUPTED, mark_interrupted};
+
 pub use builder::WorkerBuilder;
 pub use config::WorkerConfig;
 pub use middleware::{JobMeta, JobMiddleware, Next, Provided};

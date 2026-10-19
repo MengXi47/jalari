@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sqlx::pool::PoolConnection;
 use sqlx::{AssertSqlSafe, Connection, PgConnection, Postgres, Transaction};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, info_span, warn};
 
@@ -19,9 +21,9 @@ use crate::{Error, ErrorKind, JobError, JobId, JobResult, JobRun, Result, Schema
 const CLAIM_LEASE: Duration = Duration::from_secs(2);
 const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECTION_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-const TAKEOVER_DELAY: Duration = Duration::from_secs(6);
+pub(super) const TAKEOVER_DELAY: Duration = Duration::from_secs(6);
 const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
-const INTERRUPTED: &str = "the worker stopped during the last attempt";
+pub(crate) const INTERRUPTED: &str = "the worker stopped during the last attempt";
 
 const _: () = assert!(
     TAKEOVER_DELAY.as_millis()
@@ -41,8 +43,23 @@ struct ClaimedJob {
     max_attempts: i32,
     timeout_ms: Option<i32>,
     queue_key: Option<String>,
-    updated_at: DateTime<Utc>,
     context: Option<Value>,
+}
+
+struct QueueKeyLock(i64);
+
+struct StartedAttempt {
+    job_id: i64,
+    number: i32,
+    token: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MarkedJob {
+    id: i64,
+    task: String,
+    state: String,
+    attempts: i32,
 }
 
 struct AbortOnDrop(JoinHandle<JobResult>);
@@ -53,31 +70,64 @@ impl Drop for AbortOnDrop {
     }
 }
 
+struct CloseUnlessFinished {
+    connection: PoolConnection<Postgres>,
+    finished: bool,
+}
+
+impl Drop for CloseUnlessFinished {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
 impl Shared {
-    pub(super) async fn process_next(&self, queue: &str) -> Result<bool> {
+    pub(super) async fn process_next(&self, queue: &str, waker: &Notify) -> Result<bool> {
+        let mut pooled = CloseUnlessFinished {
+            connection: self.config.pool.pool().acquire().await?,
+            finished: false,
+        };
+        let processed = self
+            .claim_and_run(&mut pooled.connection, queue, waker)
+            .await?;
+        pooled.finished = true;
+        Ok(processed)
+    }
+
+    async fn claim_and_run(
+        &self,
+        connection: &mut PgConnection,
+        queue: &str,
+        waker: &Notify,
+    ) -> Result<bool> {
         let schema = &self.config.schema;
-        let mut connection = self.config.pool.pool().acquire().await?;
         let mut excluded_keys: Vec<String> = Vec::new();
         for _ in 0..self.settings.max_claim_tries {
-            let mut transaction = connection.begin().await?;
+            let mut transaction = connection
+                .begin_with(AssertSqlSafe(begin_with_idle_timeout()))
+                .await?;
             let Some(job) = self.claim(&mut transaction, queue, &excluded_keys).await? else {
                 transaction.rollback().await?;
                 return Ok(false);
             };
-            if let Some(queue_key) = &job.queue_key
-                && !try_lock_queue_key(&mut transaction, schema, queue_key).await?
+            let key = match &job.queue_key {
+                Some(queue_key) => {
+                    match try_lock_queue_key(&mut transaction, schema, queue_key).await? {
+                        Some(key) => Some(key),
+                        None => {
+                            transaction.rollback().await?;
+                            excluded_keys.push(queue_key.clone());
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+            if job.attempts > 0
+                && mark_interrupted(&mut transaction, schema, &[job.id], true).await?
             {
-                transaction.rollback().await?;
-                excluded_keys.push(queue_key.clone());
-                continue;
-            }
-            if job.attempts > 0 && job.attempts >= job.max_attempts {
-                job.fail_interrupted(&mut transaction, schema).await?;
-                transaction.commit().await?;
-                return Ok(true);
-            }
-            if job.attempts > 0 && job.was_interrupted(&mut transaction, schema).await? {
-                job.delay_takeover(&mut transaction, schema).await?;
                 transaction.commit().await?;
                 return Ok(true);
             }
@@ -88,34 +138,20 @@ impl Shared {
                     .queue_key_fence(&mut transaction, schema, queue_key)
                     .await?
                 {
-                    job.postpone(&mut transaction, schema, until, job.attempts)
-                        .await?;
+                    job.postpone(&mut transaction, schema, until).await?;
                     transaction.commit().await?;
                     return Ok(true);
                 }
             }
             let attempt = job.start_attempt(&mut transaction, schema).await?;
-            transaction.commit().await?;
-
-            let mut transaction = connection.begin().await?;
-            if !job.relock(&mut transaction, schema, attempt).await? {
+            attempt.hand_over(&mut transaction, key.as_ref()).await?;
+            if !attempt.relock(&mut transaction, schema).await? {
                 transaction.rollback().await?;
                 return Ok(true);
             }
-            limit_idle_time(&mut transaction).await?;
-            if let Some(queue_key) = &job.queue_key {
-                lock_queue_key(&mut transaction, schema, queue_key).await?;
-                if let Some(until) = job
-                    .queue_key_fence(&mut transaction, schema, queue_key)
-                    .await?
-                {
-                    job.postpone(&mut transaction, schema, until, attempt - 1)
-                        .await?;
-                    transaction.commit().await?;
-                    return Ok(true);
-                }
-            }
-            self.execute(transaction, queue, job, attempt).await?;
+            waker.notify_one();
+            self.execute(transaction, queue, job, attempt.number)
+                .await?;
             return Ok(true);
         }
         Ok(false)
@@ -128,8 +164,7 @@ impl Shared {
         excluded_keys: &[String],
     ) -> Result<Option<ClaimedJob>> {
         let sql = format!(
-            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, updated_at,
-                 context
+            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, context
              FROM {job}
              WHERE queue = $1
                  AND state IN ('scheduled', 'enqueued')
@@ -250,89 +285,26 @@ impl Shared {
 }
 
 impl ClaimedJob {
-    async fn start_attempt(&self, connection: &mut PgConnection, schema: &Schema) -> Result<i32> {
-        let attempt = sqlx::query_scalar(AssertSqlSafe(format!(
+    async fn start_attempt(
+        &self,
+        connection: &mut PgConnection,
+        schema: &Schema,
+    ) -> Result<StartedAttempt> {
+        let (number, token) = sqlx::query_as(AssertSqlSafe(format!(
             "UPDATE {job} SET attempts = attempts + 1, run_at = now() + $2
              WHERE id = $1
-             RETURNING attempts",
+             RETURNING attempts, xmin::text",
             job = schema.table("job"),
         )))
         .bind(self.id)
         .bind(CLAIM_LEASE)
         .fetch_one(connection)
         .await?;
-        Ok(attempt)
-    }
-
-    async fn relock(
-        &self,
-        connection: &mut PgConnection,
-        schema: &Schema,
-        attempt: i32,
-    ) -> Result<bool> {
-        let attempts: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT attempts FROM {job}
-             WHERE id = $1 AND state IN ('scheduled', 'enqueued')
-             FOR UPDATE",
-            job = schema.table("job"),
-        )))
-        .bind(self.id)
-        .fetch_optional(connection)
-        .await?;
-        Ok(attempts == Some(attempt))
-    }
-
-    async fn was_interrupted(
-        &self,
-        connection: &mut PgConnection,
-        schema: &Schema,
-    ) -> Result<bool> {
-        let recorded: bool = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT EXISTS (
-                 SELECT 1 FROM {job_history}
-                 WHERE job_id = $1 AND attempt = $2 AND created_at >= $3
-             )",
-            job_history = schema.table("job_history"),
-        )))
-        .bind(self.id)
-        .bind(self.attempts)
-        .bind(self.updated_at)
-        .fetch_one(connection)
-        .await?;
-        Ok(!recorded)
-    }
-
-    async fn delay_takeover(&self, connection: &mut PgConnection, schema: &Schema) -> Result<()> {
-        let state = JobState::Scheduled.as_str();
-        sqlx::query(AssertSqlSafe(format!(
-            "UPDATE {job} SET state = $2, last_error = $3, run_at = now() + $4, updated_at = now()
-             WHERE id = $1",
-            job = schema.table("job"),
-        )))
-        .bind(self.id)
-        .bind(state)
-        .bind(INTERRUPTED)
-        .bind(TAKEOVER_DELAY)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {job_history} (job_id, state, attempt, error) VALUES ($1, $2, $3, $4)",
-            job_history = schema.table("job_history"),
-        )))
-        .bind(self.id)
-        .bind(state)
-        .bind(self.attempts)
-        .bind(INTERRUPTED)
-        .execute(connection)
-        .await?;
-        warn!(
-            job_id = self.id,
-            task = %self.task,
-            attempts = self.attempts,
-            delay = ?TAKEOVER_DELAY,
-            "job was interrupted, running it again after a delay"
-        );
-        Ok(())
+        Ok(StartedAttempt {
+            job_id: self.id,
+            number,
+            token,
+        })
     }
 
     async fn mark_interrupted_siblings(
@@ -341,24 +313,19 @@ impl ClaimedJob {
         schema: &Schema,
         queue_key: &str,
     ) -> Result<()> {
-        let siblings: Vec<ClaimedJob> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, updated_at,
-                 context
-             FROM {job}
+        let siblings: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT id FROM {job} AS job
              WHERE queue_key = $1 AND id <> $2 AND state IN ('scheduled', 'enqueued')
-                 AND attempts > 0
+                 AND {unfinished}
              FOR UPDATE SKIP LOCKED",
             job = schema.table("job"),
+            unfinished = schema.unfinished_attempt("job"),
         )))
         .bind(queue_key)
         .bind(self.id)
         .fetch_all(&mut *connection)
         .await?;
-        for sibling in siblings {
-            if sibling.was_interrupted(connection, schema).await? {
-                sibling.delay_takeover(connection, schema).await?;
-            }
-        }
+        mark_interrupted(connection, schema, &siblings, true).await?;
         Ok(())
     }
 
@@ -370,24 +337,21 @@ impl ClaimedJob {
     ) -> Result<Option<DateTime<Utc>>> {
         let until = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT max(until) FROM (
-                 SELECT CASE WHEN state = 'failed' THEN updated_at + $3 ELSE run_at END AS until
+                 SELECT CASE WHEN state = 'failed' THEN updated_at + $3
+                         ELSE least(run_at, updated_at + $3) END AS until
                  FROM {job}
                  WHERE queue_key = $1 AND id <> $2 AND last_error = $4
-                     AND ((state IN ('scheduled', 'enqueued') AND run_at > now())
+                     AND ((state IN ('scheduled', 'enqueued') AND run_at > now()
+                             AND updated_at > now() - $3)
                          OR (state = 'failed' AND updated_at > now() - $3))
                  UNION ALL
                  SELECT now() + $3 AS until
                  FROM {job} AS job
                  WHERE queue_key = $1 AND id <> $2 AND state IN ('scheduled', 'enqueued')
-                     AND attempts > 0
-                     AND NOT EXISTS (
-                         SELECT 1 FROM {job_history} AS history
-                         WHERE history.job_id = job.id AND history.attempt = job.attempts
-                             AND history.created_at >= job.updated_at
-                     )
+                     AND run_at <= now() AND {unfinished}
              ) AS fences",
             job = schema.table("job"),
-            job_history = schema.table("job_history"),
+            unfinished = schema.unfinished_attempt("job"),
         )))
         .bind(queue_key)
         .bind(self.id)
@@ -403,49 +367,16 @@ impl ClaimedJob {
         connection: &mut PgConnection,
         schema: &Schema,
         until: DateTime<Utc>,
-        attempts: i32,
     ) -> Result<()> {
         sqlx::query(AssertSqlSafe(format!(
-            "UPDATE {job} SET run_at = $2, attempts = $3 WHERE id = $1",
+            "UPDATE {job} SET run_at = $2 WHERE id = $1",
             job = schema.table("job"),
         )))
         .bind(self.id)
         .bind(until)
-        .bind(attempts)
         .execute(connection)
         .await?;
         debug!(job_id = self.id, %until, "waiting for an interrupted job with the same queue_key");
-        Ok(())
-    }
-
-    async fn fail_interrupted(&self, connection: &mut PgConnection, schema: &Schema) -> Result<()> {
-        let state = JobState::Failed.as_str();
-        sqlx::query(AssertSqlSafe(format!(
-            "UPDATE {job} SET state = $2, last_error = $3, updated_at = now()
-             WHERE id = $1",
-            job = schema.table("job"),
-        )))
-        .bind(self.id)
-        .bind(state)
-        .bind(INTERRUPTED)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {job_history} (job_id, state, attempt, error) VALUES ($1, $2, $3, $4)",
-            job_history = schema.table("job_history"),
-        )))
-        .bind(self.id)
-        .bind(state)
-        .bind(self.attempts)
-        .bind(INTERRUPTED)
-        .execute(connection)
-        .await?;
-        warn!(
-            job_id = self.id,
-            task = %self.task,
-            attempts = self.attempts,
-            "job failed because its last attempt was interrupted"
-        );
         Ok(())
     }
 
@@ -502,12 +433,105 @@ impl ClaimedJob {
     }
 }
 
-async fn limit_idle_time(connection: &mut PgConnection) -> Result<()> {
-    sqlx::query("SELECT set_config('idle_in_transaction_session_timeout', $1, true)")
-        .bind(IDLE_SESSION_TIMEOUT.as_millis().to_string())
-        .execute(connection)
+impl StartedAttempt {
+    async fn hand_over(
+        &self,
+        connection: &mut PgConnection,
+        key: Option<&QueueKeyLock>,
+    ) -> Result<()> {
+        let commit = format!("COMMIT; {}", begin_with_idle_timeout());
+        let sql = match key {
+            Some(QueueKeyLock(lock_id)) => format!(
+                "SELECT pg_advisory_lock('{lock_id}'::bigint);
+                 {commit};
+                 SELECT pg_advisory_xact_lock('{lock_id}'::bigint);
+                 SELECT pg_advisory_unlock('{lock_id}'::bigint)"
+            ),
+            None => commit,
+        };
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(connection)
+            .await?;
+        Ok(())
+    }
+
+    async fn relock(&self, connection: &mut PgConnection, schema: &Schema) -> Result<bool> {
+        let locked: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT 1 FROM {job} WHERE id = $1 AND xmin = $2::text::xid FOR UPDATE",
+            job = schema.table("job"),
+        )))
+        .bind(self.job_id)
+        .bind(&self.token)
+        .fetch_optional(connection)
         .await?;
-    Ok(())
+        Ok(locked.is_some())
+    }
+}
+
+pub(crate) async fn mark_interrupted(
+    connection: &mut PgConnection,
+    schema: &Schema,
+    ids: &[i64],
+    fail_exhausted: bool,
+) -> Result<bool> {
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    let marked: Vec<MarkedJob> = sqlx::query_as(AssertSqlSafe(format!(
+        "WITH marked AS (
+             UPDATE {job} AS job
+             SET state = CASE WHEN $4 AND job.attempts >= job.max_attempts THEN 'failed'
+                     ELSE 'scheduled' END,
+                 last_error = $2,
+                 run_at = CASE WHEN $4 AND job.attempts >= job.max_attempts THEN job.run_at
+                     ELSE statement_timestamp() + $3 END,
+                 updated_at = statement_timestamp()
+             WHERE job.id = ANY($1) AND job.state IN ('scheduled', 'enqueued')
+                 AND job.attempts > 0
+                 AND (($4 AND job.attempts >= job.max_attempts) OR {unfinished})
+             RETURNING job.id, job.task, job.state, job.attempts
+         ),
+         logged AS (
+             INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
+             SELECT id, state, attempts, $2, statement_timestamp() FROM marked
+         )
+         SELECT id, task, state, attempts FROM marked",
+        job = schema.table("job"),
+        job_history = schema.table("job_history"),
+        unfinished = schema.unfinished_attempt("job"),
+    )))
+    .bind(ids)
+    .bind(INTERRUPTED)
+    .bind(TAKEOVER_DELAY)
+    .bind(fail_exhausted)
+    .fetch_all(connection)
+    .await?;
+    for job in &marked {
+        if job.state == JobState::Failed.as_str() {
+            warn!(
+                job_id = job.id,
+                task = %job.task,
+                attempts = job.attempts,
+                "job failed because its last attempt was interrupted"
+            );
+        } else {
+            warn!(
+                job_id = job.id,
+                task = %job.task,
+                attempts = job.attempts,
+                delay = ?TAKEOVER_DELAY,
+                "job was interrupted, running it again after a delay"
+            );
+        }
+    }
+    Ok(!marked.is_empty())
+}
+
+fn begin_with_idle_timeout() -> String {
+    format!(
+        "BEGIN; SET LOCAL idle_in_transaction_session_timeout = {}",
+        IDLE_SESSION_TIMEOUT.as_millis()
+    )
 }
 
 async fn check_connection(connection: &mut PgConnection) -> Result<()> {
@@ -528,24 +552,15 @@ async fn try_lock_queue_key(
     connection: &mut PgConnection,
     schema: &Schema,
     queue_key: &str,
-) -> Result<bool> {
-    let locked = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(queue_key_lock(schema, queue_key))
-        .fetch_one(connection)
-        .await?;
-    Ok(locked)
-}
-
-async fn lock_queue_key(
-    connection: &mut PgConnection,
-    schema: &Schema,
-    queue_key: &str,
-) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(queue_key_lock(schema, queue_key))
-        .execute(connection)
-        .await?;
-    Ok(())
+) -> Result<Option<QueueKeyLock>> {
+    let (lock_id, locked): (i64, bool) = sqlx::query_as(
+        "SELECT lock_id, pg_try_advisory_xact_lock(lock_id)
+         FROM (SELECT hashtextextended($1, 0) AS lock_id) AS queue_key",
+    )
+    .bind(queue_key_lock(schema, queue_key))
+    .fetch_one(connection)
+    .await?;
+    Ok(locked.then_some(QueueKeyLock(lock_id)))
 }
 
 fn queue_key_lock(schema: &Schema, queue_key: &str) -> String {

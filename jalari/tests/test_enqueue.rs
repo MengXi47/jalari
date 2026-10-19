@@ -234,6 +234,15 @@ async fn check_replace_reports_running_job(fixture: &Fixture) {
         .await
         .unwrap();
 
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE \"{}\".job SET attempts = 1 WHERE id = $1",
+        fixture.schema_name
+    )))
+    .bind(first.id().0)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
     let mut holder = fixture.pool.begin().await.unwrap();
     sqlx::query(AssertSqlSafe(format!(
         "SELECT id FROM \"{}\".job WHERE id = $1 FOR UPDATE",

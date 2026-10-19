@@ -174,7 +174,7 @@ async fn work_loop(
     shutdown: CancellationToken,
 ) {
     while !shutdown.is_cancelled() {
-        match shared.process_next(&queue).await {
+        match shared.process_next(&queue, &waker).await {
             Ok(true) => {}
             Ok(false) => wait(&waker, &shutdown, shared.settings.poll_interval).await,
             Err(e) => {

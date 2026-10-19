@@ -72,7 +72,8 @@ pub enum ErrorKind {
     /// A timeout does not fit in an `i32` of milliseconds (about 24 days).
     TimeoutTooLong,
     /// An enqueue with [`OnConflict::Replace`](crate::OnConflict::Replace) kept racing with
-    /// other writers for the same `job_key` and gave up after several attempts.
+    /// other writers for the same `job_key` and gave up after several attempts, or the waiting
+    /// job stayed locked by another transaction for about a second without starting to run.
     JobKeyContention,
     /// Two `#[jalari::job]` types in the same binary use the same [`Job::NAME`](crate::Job::NAME).
     DuplicateJobName,

@@ -82,6 +82,12 @@ cargo install jalari --features cli
 `--database-url` falls back to the `DATABASE_URL` environment variable. Migrations run in one
 transaction under an advisory lock, so concurrent runs are safe.
 
+Version 3 replaces the `queue_key` index on the job table with two smaller partial indexes. It
+builds them without `CONCURRENTLY`, so writes to the job table wait for the build while the
+upgrade runs, and dropping the old index waits for every running job to finish while blocking
+other access to the table. Stop the workers before upgrading. Workers of an older release that
+start after the upgrade fail `init`, because it requires the exact table version.
+
 ## Defining jobs
 
 A job is a serializable struct with an `impl Job` inside `#[jalari::job]`. Its fields are the
@@ -162,6 +168,14 @@ Every enqueue returns a `jalari::EnqueueOutcome`:
 | `Kept(id)` | A job with the same `job_key` already existed and was kept |
 | `Replaced(id)` | The waiting job with the same `job_key` was overwritten |
 | `Running(id)` | The job with the same `job_key` is running and could not be replaced |
+
+`Replace` overwrites a job that is waiting, waiting for a retry, or claimed by a worker that
+has not started it yet; that claim is dropped. For a running job it waits about 100 ms before
+returning `Running`, so a worker that is only inspecting the job is not mistaken for one that
+runs it. If the job's last attempt was interrupted (see
+[Crashes and lost connections](#crashes-and-lost-connections)), the replace records the
+interruption, and the new payload waits the same 6 seconds as any interrupted job, together
+with the jobs sharing its `queue_key`. A dropped claim counts as an interrupted attempt.
 
 ### Inside your transaction
 
@@ -316,7 +330,9 @@ in the job's own task, not in tasks it spawns.
 ### Crashes and lost connections
 
 When a worker process dies, PostgreSQL releases its jobs. The next worker that finds one
-records the interrupted attempt in the job history and runs the job again 6 seconds later.
+records the interrupted attempt in the job history and runs the job again 6 seconds later. A
+`Replace` that finds the job does the same before it writes the new payload, so the new
+payload also waits 6 seconds.
 
 While a job runs, its worker checks the connection holding the job's lock every second. If
 that connection is lost (the database restarts, the network fails, or the session is ended by
@@ -537,7 +553,7 @@ jalari::cluster::update(|cluster| {
 | `housekeeping_interval` | How often the cleanup runs across the cluster | 10 min |
 | `succeeded_retention` | How long succeeded jobs are kept | 1 day |
 | `deleted_retention` | How long deleted jobs are kept | 7 days |
-| `failed_retention` | How long failed jobs are kept; `None` keeps them | `None` |
+| `failed_retention` | How long failed jobs are kept; `None` keeps them. A job with a `queue_key` whose last attempt was interrupted stays at least 6 s | `None` |
 | `worker_timeout` | Missed-heartbeat time before a worker leaves the list | 5 min |
 
 Workers apply changes immediately. One worker per interval performs the cleanup, deleting in

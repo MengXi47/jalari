@@ -87,8 +87,10 @@ pub async fn workers() -> Result<Vec<WorkerInfo>> {
     let rows: Vec<WorkerRow> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id::text AS id, hostname, pid, queues, scheduler, started_at, heartbeat_at
          FROM {worker}
+         WHERE heartbeat_at >= now() - (SELECT worker_timeout FROM {config})
          ORDER BY started_at, id",
         worker = config.schema.table("worker"),
+        config = config.schema.table("config"),
     )))
     .fetch_all(&config.pool.pool())
     .await?;

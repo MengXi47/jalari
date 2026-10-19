@@ -89,6 +89,21 @@ impl Schema {
         format!("jalari:{purpose}:{}.{}", self.name, self.prefix)
     }
 
+    pub(crate) fn schema_lock_key(&self, purpose: &str) -> String {
+        format!("jalari:{purpose}:{}", self.name)
+    }
+
+    pub(crate) fn unfinished_attempt(&self, job: &str) -> String {
+        format!(
+            "({job}.attempts > 0 AND NOT EXISTS (
+                 SELECT 1 FROM {history} AS history
+                 WHERE history.job_id = {job}.id AND history.attempt = {job}.attempts
+                     AND history.created_at >= {job}.updated_at
+             ))",
+            history = self.table("job_history"),
+        )
+    }
+
     pub(crate) fn notify_channel(&self, kind: &str) -> String {
         let channel = format!("{}.{}{kind}", self.name, self.prefix);
         if channel.len() <= MAX_IDENTIFIER_LENGTH {

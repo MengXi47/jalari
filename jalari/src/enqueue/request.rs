@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -7,12 +7,30 @@ use sqlx::{AssertSqlSafe, PgConnection};
 use crate::init::config;
 use crate::job::{context, registry};
 use crate::storage::{JOB_CHANNEL, interval};
+use crate::worker::{INTERRUPTED, mark_interrupted};
 use crate::{
     EnqueueOptions, EnqueueOutcome, Error, ErrorKind, Job, JobId, OnConflict, Result, Schema,
 };
 
 const DEFAULT_QUEUE: &str = "default";
 const MAX_CONFLICT_RETRIES: usize = 3;
+const LOCK_POLL: Duration = Duration::from_millis(25);
+const RUNNING_PATIENCE: Duration = Duration::from_millis(100);
+const REPLACE_PATIENCE: Duration = Duration::from_secs(1);
+
+enum Replacement {
+    Replaced(JobId),
+    Running(JobId),
+    Missing,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReplaceRow {
+    id: i64,
+    started: bool,
+    replaced: bool,
+    interrupted: bool,
+}
 
 pub(crate) struct EnqueueRequest {
     task: String,
@@ -154,15 +172,14 @@ impl EnqueueRequest {
                         return Ok(EnqueueOutcome::Kept(id));
                     }
                 }
-                OnConflict::Replace => {
-                    if let Some(id) = self.try_replace(connection, schema, job_key).await? {
+                OnConflict::Replace => match self.try_replace(connection, schema, job_key).await? {
+                    Replacement::Replaced(id) => {
                         self.notify(connection, schema).await?;
                         return Ok(EnqueueOutcome::Replaced(id));
                     }
-                    if let Some(id) = pending_id(connection, schema, job_key).await? {
-                        return Ok(EnqueueOutcome::Running(id));
-                    }
-                }
+                    Replacement::Running(id) => return Ok(EnqueueOutcome::Running(id)),
+                    Replacement::Missing => {}
+                },
             }
         }
 
@@ -210,37 +227,86 @@ impl EnqueueRequest {
         connection: &mut PgConnection,
         schema: &Schema,
         job_key: &str,
-    ) -> Result<Option<JobId>> {
+    ) -> Result<Replacement> {
         let sql = format!(
-            "UPDATE {job} AS job
-             SET queue = $1, task = $2, payload = $3,
-                 state = CASE WHEN input.run_at > now() THEN 'scheduled' ELSE 'enqueued' END,
-                 queue_key = $4, attempts = 0, max_attempts = $5, run_at = input.run_at,
-                 timeout_ms = $6, last_error = NULL, context = $10, updated_at = now()
-             FROM (SELECT COALESCE($7::timestamptz, now() + COALESCE($8::interval, interval '0'))
-                 AS run_at) AS input
-             WHERE job.id = (
-                 SELECT id FROM {job}
+            "WITH target AS (
+                 SELECT job.id, {unfinished} AS started
+                 FROM {job} AS job
+                 WHERE job.job_key = $9 AND job.state IN ('scheduled', 'enqueued')
+             ),
+             locked AS (
+                 SELECT id,
+                     CASE WHEN last_error = $11 AND run_at > statement_timestamp() THEN run_at END
+                         AS takeover_at
+                 FROM {job}
                  WHERE job_key = $9 AND state IN ('scheduled', 'enqueued')
                  FOR UPDATE SKIP LOCKED
+             ),
+             replaced AS (
+                 UPDATE {job} AS job
+                 SET queue = $1, task = $2, payload = $3,
+                     state = CASE WHEN input.run_at > now() THEN 'scheduled' ELSE 'enqueued' END,
+                     queue_key = $4, attempts = 0, max_attempts = $5, run_at = input.run_at,
+                     timeout_ms = $6,
+                     last_error = CASE WHEN locked.takeover_at IS NOT NULL THEN $11 END,
+                     context = $10, updated_at = statement_timestamp()
+                 FROM locked, LATERAL (
+                     SELECT greatest(
+                         COALESCE($7::timestamptz, now() + COALESCE($8::interval, interval '0')),
+                         locked.takeover_at
+                     ) AS run_at
+                 ) AS input
+                 WHERE job.id = locked.id AND NOT {unfinished}
+                 RETURNING job.id
              )
-             RETURNING job.id",
+             SELECT target.id, target.started, EXISTS (SELECT 1 FROM replaced) AS replaced,
+                 EXISTS (SELECT 1 FROM locked) AND NOT EXISTS (SELECT 1 FROM replaced)
+                     AS interrupted
+             FROM target",
             job = schema.table("job"),
+            unfinished = schema.unfinished_attempt("job"),
         );
-        let id = sqlx::query_scalar(AssertSqlSafe(sql))
-            .bind(&self.queue)
-            .bind(&self.task)
-            .bind(&self.payload)
-            .bind(&self.queue_key)
-            .bind(self.max_attempts)
-            .bind(self.timeout_ms)
-            .bind(self.run_at)
-            .bind(self.delay)
-            .bind(job_key)
-            .bind(&self.context)
-            .fetch_optional(connection)
-            .await?;
-        Ok(id.map(JobId))
+        let polling_since = Instant::now();
+        loop {
+            let row: Option<ReplaceRow> = sqlx::query_as(AssertSqlSafe(sql.as_str()))
+                .bind(&self.queue)
+                .bind(&self.task)
+                .bind(&self.payload)
+                .bind(&self.queue_key)
+                .bind(self.max_attempts)
+                .bind(self.timeout_ms)
+                .bind(self.run_at)
+                .bind(self.delay)
+                .bind(job_key)
+                .bind(&self.context)
+                .bind(INTERRUPTED)
+                .fetch_optional(&mut *connection)
+                .await?;
+            match row {
+                None => return Ok(Replacement::Missing),
+                Some(row) if row.replaced => return Ok(Replacement::Replaced(JobId(row.id))),
+                Some(row) if row.interrupted => {
+                    if !mark_interrupted(connection, schema, &[row.id], false).await?
+                        && polling_since.elapsed() >= REPLACE_PATIENCE
+                    {
+                        return Err(Error::new(
+                            ErrorKind::JobKeyContention,
+                            format!("job_key {job_key:?} stayed locked while enqueuing"),
+                        ));
+                    }
+                }
+                Some(row) if row.started && polling_since.elapsed() >= RUNNING_PATIENCE => {
+                    return Ok(Replacement::Running(JobId(row.id)));
+                }
+                Some(_) if polling_since.elapsed() >= REPLACE_PATIENCE => {
+                    return Err(Error::new(
+                        ErrorKind::JobKeyContention,
+                        format!("job_key {job_key:?} stayed locked while enqueuing"),
+                    ));
+                }
+                Some(_) => tokio::time::sleep(LOCK_POLL).await,
+            }
+        }
     }
 
     async fn notify(&self, connection: &mut PgConnection, schema: &Schema) -> Result<()> {

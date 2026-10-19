@@ -23,6 +23,9 @@ pub struct ClusterConfig {
     /// How long deleted jobs are kept after finishing; defaults to 7 days.
     pub deleted_retention: Duration,
     /// How long failed jobs are kept after finishing; `None`, the default, keeps them forever.
+    ///
+    /// A job with a `queue_key` that failed because its last attempt was interrupted is kept at
+    /// least 6 seconds, since it holds back the other jobs with that key until then.
     pub failed_retention: Option<Duration>,
     /// How long a worker may miss heartbeats before it leaves
     /// [`jalari::admin::workers`](crate::admin::workers); defaults to 5 minutes, at least

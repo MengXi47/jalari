@@ -97,6 +97,10 @@ pub async fn migrate_to(pool: &PgPool, schema: &Schema, version: i32) -> Result<
     let mut transaction = pool.begin().await?;
 
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(schema.schema_lock_key("create_schema"))
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(schema.lock_key("migrate"))
         .execute(&mut *transaction)
         .await?;
@@ -157,6 +161,7 @@ async fn current_version(connection: &mut PgConnection, schema: &Schema) -> Resu
 
 fn render(template: &str, version: i32, schema: &Schema) -> String {
     let mut sql = template
+        .replace("{schema}", &schema.quoted_name())
         .replace("{prefix}", schema.prefix())
         .replace("{version}", &version.to_string());
     for table in TABLES {
