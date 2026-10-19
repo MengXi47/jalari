@@ -21,7 +21,7 @@ use crate::{Error, ErrorKind, JobError, JobId, JobResult, JobRun, Result, Schema
 const CLAIM_LEASE: Duration = Duration::from_secs(2);
 const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECTION_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-pub(super) const TAKEOVER_DELAY: Duration = Duration::from_secs(6);
+pub(crate) const TAKEOVER_DELAY: Duration = Duration::from_secs(6);
 const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const INTERRUPTED: &str = "the worker stopped during the last attempt";
 

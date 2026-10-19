@@ -12,7 +12,7 @@ mod runner;
 mod scheduler;
 
 pub(crate) use close::{Closing, close};
-pub(crate) use execute::{INTERRUPTED, mark_interrupted};
+pub(crate) use execute::{INTERRUPTED, TAKEOVER_DELAY, mark_interrupted};
 
 pub use builder::WorkerBuilder;
 pub use config::WorkerConfig;

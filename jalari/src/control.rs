@@ -3,7 +3,7 @@ use sqlx::{AssertSqlSafe, PgConnection};
 use crate::init::config;
 use crate::job::Command;
 use crate::storage::JOB_CHANNEL;
-use crate::worker::{Closing, INTERRUPTED, close};
+use crate::worker::{Closing, INTERRUPTED, TAKEOVER_DELAY, close};
 use crate::{JobId, Result, Schema};
 
 /// What [`stop`] did with the job.
@@ -242,11 +242,12 @@ async fn apply(
          WHERE id = $1 AND ({idle} OR (job.state = 'stopped' AND $2))
          FOR UPDATE SKIP LOCKED",
         job = schema.table("job"),
-        idle = schema.idle_job("job", "$3"),
+        idle = schema.idle_job("job", "$3", "$4"),
     )))
     .bind(id.0)
     .bind(pending == Command::Cancel)
     .bind(INTERRUPTED)
+    .bind(TAKEOVER_DELAY)
     .fetch_optional(&mut *connection)
     .await?;
     if let Some(attempts) = idle {

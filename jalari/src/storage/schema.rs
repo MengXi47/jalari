@@ -104,11 +104,12 @@ impl Schema {
         )
     }
 
-    pub(crate) fn idle_job(&self, job: &str, interrupted: &str) -> String {
+    pub(crate) fn idle_job(&self, job: &str, interrupted: &str, takeover_delay: &str) -> String {
         format!(
             "({job}.state IN ('scheduled', 'enqueued') AND NOT {unfinished}
                  AND ({job}.last_error IS DISTINCT FROM {interrupted}
-                     OR {job}.run_at <= statement_timestamp()))",
+                     OR {job}.run_at <= statement_timestamp()
+                     OR {job}.updated_at + {takeover_delay} <= statement_timestamp()))",
             unfinished = self.unfinished_attempt(job),
         )
     }
