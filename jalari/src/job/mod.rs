@@ -11,4 +11,4 @@ pub use definition::{Job, JobResult};
 pub use error::JobError;
 pub use id::JobId;
 pub use run::{JobRun, current_job, shutdown_requested};
-pub(crate) use state::JobState;
+pub(crate) use state::{JOB_KEY_STATES, JobState};

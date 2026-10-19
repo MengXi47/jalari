@@ -7,9 +7,10 @@ include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 /// Table structure version this release of jalari needs; [`init`](crate::init) checks it.
 pub const SCHEMA_VERSION: i32 = TEMPLATES[TEMPLATES.len() - 1].0;
 
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 7] = [
     "job",
     "job_history",
+    "job_control",
     "recurring",
     "worker",
     "config",

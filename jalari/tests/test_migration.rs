@@ -244,6 +244,7 @@ async fn test_prefixed_schema_places_tables_in_existing_schema() {
         [
             "jalari_config",
             "jalari_job",
+            "jalari_job_control",
             "jalari_job_history",
             "jalari_recurring",
             "jalari_schema_version",

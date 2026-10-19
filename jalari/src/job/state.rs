@@ -1,3 +1,5 @@
+pub(crate) const JOB_KEY_STATES: &str = "('scheduled', 'enqueued', 'stopped')";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobState {
     Scheduled,

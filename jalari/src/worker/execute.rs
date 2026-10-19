@@ -10,12 +10,12 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, info_span, warn};
 
+use super::close::{Closing, Outcome, close, decide};
 use super::middleware::{JobMeta, Next};
 use super::runner::Shared;
 use crate::job::context::{self, Captured};
 use crate::job::registry::JobRegistration;
 use crate::job::{JobState, run};
-use crate::storage::interval;
 use crate::{Error, ErrorKind, JobError, JobId, JobResult, JobRun, Result, Schema};
 
 const CLAIM_LEASE: Duration = Duration::from_secs(2);
@@ -233,54 +233,22 @@ impl Shared {
         result: JobResult,
         duration: Duration,
     ) -> Result<()> {
-        let schema = &self.config.schema;
         let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-        let (state, retry_delay, error) = match result {
-            Ok(()) => {
-                debug!(duration_ms, "job succeeded");
-                (JobState::Succeeded, None, None)
+        let outcome = decide(result, attempt, job.max_attempts, &*self.retry_policy);
+        match &outcome {
+            Outcome::Succeeded => debug!(duration_ms, "job succeeded"),
+            Outcome::Retry { delay, error } => {
+                warn!(error = %error, ?delay, "job failed, retrying")
             }
-            Err(error) => match self
-                .retry_policy
-                .next_retry(attempt, job.max_attempts, &error)
-            {
-                Some(delay) => {
-                    warn!(error = %error, ?delay, "job failed, retrying");
-                    (JobState::Scheduled, Some(delay), Some(error))
-                }
-                None => {
-                    warn!(error = %error, "job failed");
-                    (JobState::Failed, None, Some(error))
-                }
-            },
+            Outcome::Failed { error } => warn!(error = %error, "job failed"),
+        }
+        let closing = Closing {
+            job_id: job.id,
+            outcome,
+            attempts: attempt,
+            duration_ms: Some(duration_ms),
         };
-
-        sqlx::query(AssertSqlSafe(format!(
-            "UPDATE {job} SET state = $2, attempts = $3, last_error = $4,
-                 run_at = coalesce(now() + $5, run_at), updated_at = now()
-             WHERE id = $1",
-            job = schema.table("job"),
-        )))
-        .bind(job.id)
-        .bind(state.as_str())
-        .bind(attempt)
-        .bind(error.as_ref().map(JobError::msg))
-        .bind(retry_delay.map(interval))
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {job_history} (job_id, state, attempt, error, duration_ms)
-             VALUES ($1, $2, $3, $4, $5)",
-            job_history = schema.table("job_history"),
-        )))
-        .bind(job.id)
-        .bind(state.as_str())
-        .bind(attempt)
-        .bind(error.as_ref().map(JobError::msg))
-        .bind(duration_ms)
-        .execute(connection)
-        .await?;
-        Ok(())
+        close(connection, &self.config.schema, &closing).await
     }
 }
 

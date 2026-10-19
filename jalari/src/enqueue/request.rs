@@ -5,7 +5,7 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::init::config;
-use crate::job::{context, registry};
+use crate::job::{JOB_KEY_STATES, context, registry};
 use crate::storage::{JOB_CHANNEL, interval};
 use crate::worker::{INTERRUPTED, mark_interrupted};
 use crate::{
@@ -201,7 +201,7 @@ impl EnqueueRequest {
                  $4, $5, $6, input.run_at, $7, $10
              FROM (SELECT COALESCE($8::timestamptz, now() + COALESCE($9::interval, interval '0'))
                  AS run_at) AS input
-             ON CONFLICT (job_key) WHERE job_key IS NOT NULL AND state IN ('scheduled', 'enqueued')
+             ON CONFLICT (job_key) WHERE job_key IS NOT NULL AND state IN {JOB_KEY_STATES}
              DO NOTHING
              RETURNING id",
             job = schema.table("job"),
@@ -333,7 +333,7 @@ async fn pending_id(
     job_key: &str,
 ) -> Result<Option<JobId>> {
     let sql = format!(
-        "SELECT id FROM {job} WHERE job_key = $1 AND state IN ('scheduled', 'enqueued')",
+        "SELECT id FROM {job} WHERE job_key = $1 AND state IN {JOB_KEY_STATES}",
         job = schema.table("job"),
     );
     let id = sqlx::query_scalar(AssertSqlSafe(sql))

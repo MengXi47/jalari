@@ -1104,9 +1104,9 @@ async fn check_concurrent_migrations(database: &Database) -> Vec<String> {
         ),
     )
     .await;
-    if tables != 6 || rows != 2 {
+    if tables != 7 || rows != 2 {
         violations.push(format!(
-            "{same} has {tables} tables and {rows} config and version rows, expected 6 and 2"
+            "{same} has {tables} tables and {rows} config and version rows, expected 7 and 2"
         ));
     }
 
