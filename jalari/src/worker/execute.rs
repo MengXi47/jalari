@@ -8,14 +8,14 @@ use sqlx::pool::PoolConnection;
 use sqlx::{AssertSqlSafe, Connection, PgConnection, Postgres, Transaction};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, debug, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
-use super::close::{Closing, Outcome, close, decide};
+use super::close::{Closing, Ending, Outcome, close, decide};
 use super::middleware::{JobMeta, Next};
 use super::runner::Shared;
 use crate::job::context::{self, Captured};
 use crate::job::registry::JobRegistration;
-use crate::job::{JobState, run};
+use crate::job::{Command, JobState, RunControl, run};
 use crate::{Error, ErrorKind, JobError, JobId, JobResult, JobRun, Result, Schema};
 
 const CLAIM_LEASE: Duration = Duration::from_secs(2);
@@ -44,6 +44,8 @@ struct ClaimedJob {
     timeout_ms: Option<i32>,
     queue_key: Option<String>,
     context: Option<Value>,
+    command: Option<String>,
+    unfinished: bool,
 }
 
 struct QueueKeyLock(i64);
@@ -60,6 +62,7 @@ struct MarkedJob {
     task: String,
     state: String,
     attempts: i32,
+    commanded: bool,
 }
 
 struct AbortOnDrop(JoinHandle<JobResult>);
@@ -112,6 +115,17 @@ impl Shared {
                 transaction.rollback().await?;
                 return Ok(false);
             };
+            if let Some(command) = job.command() {
+                if job.unfinished {
+                    mark_interrupted(&mut transaction, schema, &[job.id], false).await?;
+                } else {
+                    let closing = Closing::idle(job.id, job.attempts, command);
+                    close(&mut transaction, schema, &closing).await?;
+                    log_outcome(job.id, &closing);
+                }
+                transaction.commit().await?;
+                return Ok(true);
+            }
             let key = match &job.queue_key {
                 Some(queue_key) => {
                     match try_lock_queue_key(&mut transaction, schema, queue_key).await? {
@@ -145,12 +159,12 @@ impl Shared {
             }
             let attempt = job.start_attempt(&mut transaction, schema).await?;
             attempt.hand_over(&mut transaction, key.as_ref()).await?;
-            if !attempt.relock(&mut transaction, schema).await? {
+            let Some(command) = attempt.relock(&mut transaction, schema).await? else {
                 transaction.rollback().await?;
                 return Ok(true);
-            }
+            };
             waker.notify_one();
-            self.execute(transaction, queue, job, attempt.number)
+            self.execute(transaction, queue, job, attempt.number, command)
                 .await?;
             return Ok(true);
         }
@@ -163,18 +177,25 @@ impl Shared {
         queue: &str,
         excluded_keys: &[String],
     ) -> Result<Option<ClaimedJob>> {
+        let schema = &self.config.schema;
         let sql = format!(
-            "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, context
-             FROM {job}
-             WHERE queue = $1
-                 AND state IN ('scheduled', 'enqueued')
-                 AND run_at <= now()
-                 AND task = ANY($2)
-                 AND (queue_key IS NULL OR queue_key <> ALL($3))
-             ORDER BY priority DESC, run_at, id
+            "SELECT job.id, job.task, job.payload, job.attempts, job.max_attempts,
+                 job.timeout_ms, job.queue_key, job.context, control.command,
+                 CASE WHEN control.command IS NULL THEN FALSE ELSE {unfinished} END
+                     AS unfinished
+             FROM {job} AS job
+             LEFT JOIN {job_control} AS control ON control.job_id = job.id
+             WHERE job.queue = $1
+                 AND job.state IN ('scheduled', 'enqueued')
+                 AND job.run_at <= now()
+                 AND job.task = ANY($2)
+                 AND (job.queue_key IS NULL OR job.queue_key <> ALL($3))
+             ORDER BY job.priority DESC, job.run_at, job.id
              LIMIT 1
-             FOR UPDATE SKIP LOCKED",
-            job = self.config.schema.table("job"),
+             FOR UPDATE OF job SKIP LOCKED",
+            job = schema.table("job"),
+            job_control = schema.table("job_control"),
+            unfinished = schema.unfinished_attempt("job"),
         );
         let job = sqlx::query_as(AssertSqlSafe(sql))
             .bind(queue)
@@ -191,68 +212,96 @@ impl Shared {
         queue: &str,
         job: ClaimedJob,
         attempt: i32,
+        command: Option<Command>,
     ) -> Result<()> {
         let span = info_span!("job", job_id = job.id, task = %job.task, queue = %queue, attempt);
         async move {
+            let schema = &self.config.schema;
             let started = Instant::now();
-            let result = match self.jobs.get(job.task.as_str()) {
-                Some(&registration) => {
-                    let run = job.run(self, registration, queue, attempt);
+            let control = Arc::new(RunControl::default());
+            let mut command = command;
+            let ending = match (self.jobs.get(job.task.as_str()), command) {
+                (_, Some(_)) => Ending::NotStarted,
+                (None, None) => Ending::Returned(Err(JobError::new(format!(
+                    "no job is registered as {:?}",
+                    job.task
+                )))),
+                (Some(&registration), None) => {
+                    let run = job.run(self, registration, queue, attempt, Arc::clone(&control));
                     tokio::pin!(run);
+                    let mut deadline = None;
                     loop {
                         tokio::select! {
-                            result = &mut run => break result,
+                            result = &mut run => break Ending::Returned(result),
+                            () = sleep_until(deadline), if deadline.is_some() => {
+                                break Ending::Aborted { after: self.settings.stop_timeout };
+                            }
                             () = tokio::time::sleep(CONNECTION_CHECK_INTERVAL) => {
-                                if let Err(e) = check_connection(&mut transaction).await {
-                                    warn!(error = %e, "lost the database connection, aborting the job");
-                                    return Err(e);
+                                match poll_command(&mut transaction, schema, job.id).await {
+                                    Ok(Some(polled)) => {
+                                        control.request(polled);
+                                        command = command.max(Some(polled));
+                                        deadline.get_or_insert_with(|| {
+                                            tokio::time::Instant::now()
+                                                + self.settings.stop_timeout
+                                        });
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(error = %e, "lost the database connection, aborting the job");
+                                        return Err(e);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                None => Err(JobError::new(format!(
-                    "no job is registered as {:?}",
-                    job.task
-                ))),
             };
-            self.record(&mut transaction, &job, attempt, result, started.elapsed())
-                .await?;
+            let command = command.max(lock_command(&mut transaction, schema, job.id).await?);
+            let outcome = decide(
+                ending,
+                command,
+                attempt,
+                job.max_attempts,
+                &*self.retry_policy,
+            );
+            let closing =
+                Closing::after_run(job.id, attempt, outcome, started.elapsed(), command.is_some());
+            close(&mut transaction, schema, &closing).await?;
             transaction.commit().await?;
+            log_outcome(job.id, &closing);
             Ok(())
         }
         .instrument(span)
         .await
     }
+}
 
-    async fn record(
-        &self,
-        connection: &mut PgConnection,
-        job: &ClaimedJob,
-        attempt: i32,
-        result: JobResult,
-        duration: Duration,
-    ) -> Result<()> {
-        let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-        let outcome = decide(result, attempt, job.max_attempts, &*self.retry_policy);
-        match &outcome {
-            Outcome::Succeeded => debug!(duration_ms, "job succeeded"),
-            Outcome::Retry { delay, error } => {
-                warn!(error = %error, ?delay, "job failed, retrying")
-            }
-            Outcome::Failed { error } => warn!(error = %error, "job failed"),
+fn log_outcome(job_id: i64, closing: &Closing) {
+    let duration_ms = closing.duration_ms();
+    match closing.outcome() {
+        Outcome::Succeeded => debug!(duration_ms, "job succeeded"),
+        Outcome::Retry { delay, error } => {
+            warn!(error = %error, ?delay, "job failed, retrying");
         }
-        let closing = Closing {
-            job_id: job.id,
-            outcome,
-            attempts: attempt,
-            duration_ms: Some(duration_ms),
-        };
-        close(connection, &self.config.schema, &closing).await
+        Outcome::Failed { error } => warn!(error = %error, "job failed"),
+        Outcome::Stopped { note } => info!(job_id, note = %note, "job stopped"),
+        Outcome::Cancelled { note } => info!(job_id, note = %note, "job cancelled"),
+    }
+}
+
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
 impl ClaimedJob {
+    fn command(&self) -> Option<Command> {
+        self.command.as_deref().and_then(Command::parse)
+    }
+
     async fn start_attempt(
         &self,
         connection: &mut PgConnection,
@@ -354,6 +403,7 @@ impl ClaimedJob {
         registration: &'static JobRegistration,
         queue: &str,
         attempt: i32,
+        control: Arc<RunControl>,
     ) -> JobResult {
         let job_run = JobRun::new(
             JobId(self.id),
@@ -362,6 +412,7 @@ impl ClaimedJob {
             attempt,
             self.max_attempts,
             shared.job_shutdown.child_token(),
+            control,
         );
         let meta = JobMeta::new(job_run.clone(), self.context.clone());
         let captured = Captured::from_stored(self.context.clone());
@@ -423,16 +474,22 @@ impl StartedAttempt {
         Ok(())
     }
 
-    async fn relock(&self, connection: &mut PgConnection, schema: &Schema) -> Result<bool> {
-        let locked: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT 1 FROM {job} WHERE id = $1 AND xmin = $2::text::xid FOR UPDATE",
+    async fn relock(
+        &self,
+        connection: &mut PgConnection,
+        schema: &Schema,
+    ) -> Result<Option<Option<Command>>> {
+        let locked: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT (SELECT command FROM {job_control} WHERE job_id = $1)
+             FROM {job} WHERE id = $1 AND xmin = $2::text::xid FOR UPDATE",
             job = schema.table("job"),
+            job_control = schema.table("job_control"),
         )))
         .bind(self.job_id)
         .bind(&self.token)
         .fetch_optional(connection)
         .await?;
-        Ok(locked.is_some())
+        Ok(locked.map(|command| command.as_deref().and_then(Command::parse)))
     }
 }
 
@@ -445,27 +502,40 @@ pub(crate) async fn mark_interrupted(
     if ids.is_empty() {
         return Ok(false);
     }
+    let commanded = format!(
+        "EXISTS (SELECT 1 FROM {job_control} AS control
+             WHERE control.job_id = job.id AND control.command IS NOT NULL)",
+        job_control = schema.table("job_control"),
+    );
+    let exhausted = format!("($4 AND job.attempts >= job.max_attempts AND NOT {commanded})");
     let marked: Vec<MarkedJob> = sqlx::query_as(AssertSqlSafe(format!(
         "WITH marked AS (
              UPDATE {job} AS job
-             SET state = CASE WHEN $4 AND job.attempts >= job.max_attempts THEN 'failed'
-                     ELSE 'scheduled' END,
+             SET state = CASE WHEN {exhausted} THEN 'failed' ELSE 'scheduled' END,
+                 attempts = CASE WHEN {commanded} THEN job.attempts - 1 ELSE job.attempts END,
                  last_error = $2,
-                 run_at = CASE WHEN $4 AND job.attempts >= job.max_attempts THEN job.run_at
+                 run_at = CASE WHEN {exhausted} THEN job.run_at
                      ELSE statement_timestamp() + $3 END,
                  updated_at = statement_timestamp()
              WHERE job.id = ANY($1) AND job.state IN ('scheduled', 'enqueued')
                  AND job.attempts > 0
-                 AND (($4 AND job.attempts >= job.max_attempts) OR {unfinished})
-             RETURNING job.id, job.task, job.state, job.attempts
+                 AND ({exhausted} OR {unfinished})
+             RETURNING job.id, job.task, job.state, job.attempts, {commanded} AS commanded
          ),
          logged AS (
              INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
              SELECT id, state, attempts, $2, statement_timestamp() FROM marked
+         ),
+         fenced AS (
+             INSERT INTO {job_control} AS control (job_id, lease)
+             SELECT id, 1 FROM marked ORDER BY id
+             ON CONFLICT (job_id) DO UPDATE
+             SET lease = control.lease + 1, updated_at = statement_timestamp()
          )
-         SELECT id, task, state, attempts FROM marked",
+         SELECT id, task, state, attempts, commanded FROM marked",
         job = schema.table("job"),
         job_history = schema.table("job_history"),
+        job_control = schema.table("job_control"),
         unfinished = schema.unfinished_attempt("job"),
     )))
     .bind(ids)
@@ -481,6 +551,14 @@ pub(crate) async fn mark_interrupted(
                 task = %job.task,
                 attempts = job.attempts,
                 "job failed because its last attempt was interrupted"
+            );
+        } else if job.commanded {
+            warn!(
+                job_id = job.id,
+                task = %job.task,
+                attempts = job.attempts,
+                delay = ?TAKEOVER_DELAY,
+                "job was interrupted while asked to stop, settling it after a delay"
             );
         } else {
             warn!(
@@ -502,18 +580,40 @@ fn begin_with_idle_timeout() -> String {
     )
 }
 
-async fn check_connection(connection: &mut PgConnection) -> Result<()> {
-    let ping = sqlx::query("SELECT 1").execute(connection);
-    match tokio::time::timeout(CONNECTION_CHECK_TIMEOUT, ping).await {
-        Ok(result) => {
-            result?;
-            Ok(())
-        }
+async fn poll_command(
+    connection: &mut PgConnection,
+    schema: &Schema,
+    job_id: i64,
+) -> Result<Option<Command>> {
+    let sql = format!(
+        "SELECT command FROM {job_control} WHERE job_id = $1",
+        job_control = schema.table("job_control"),
+    );
+    let poll = sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(sql))
+        .bind(job_id)
+        .fetch_optional(connection);
+    match tokio::time::timeout(CONNECTION_CHECK_TIMEOUT, poll).await {
+        Ok(command) => Ok(command?.flatten().as_deref().and_then(Command::parse)),
         Err(_) => Err(Error::new(
             ErrorKind::ConnectionFailed,
             format!("the database did not answer within {CONNECTION_CHECK_TIMEOUT:?}"),
         )),
     }
+}
+
+async fn lock_command(
+    connection: &mut PgConnection,
+    schema: &Schema,
+    job_id: i64,
+) -> Result<Option<Command>> {
+    let command: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT command FROM {job_control} WHERE job_id = $1 FOR UPDATE",
+        job_control = schema.table("job_control"),
+    )))
+    .bind(job_id)
+    .fetch_optional(connection)
+    .await?;
+    Ok(command.flatten().as_deref().and_then(Command::parse))
 }
 
 async fn try_lock_queue_key(

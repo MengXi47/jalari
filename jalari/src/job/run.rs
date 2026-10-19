@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::task::futures::TaskLocalFuture;
 use tokio_util::sync::CancellationToken;
 
+use super::checkpoint::RunControl;
 use crate::JobId;
 
 tokio::task_local! {
@@ -22,6 +23,7 @@ pub struct JobRun {
     attempt: i32,
     max_attempts: i32,
     cancellation: CancellationToken,
+    control: Arc<RunControl>,
 }
 
 impl JobRun {
@@ -32,6 +34,7 @@ impl JobRun {
         attempt: i32,
         max_attempts: i32,
         cancellation: CancellationToken,
+        control: Arc<RunControl>,
     ) -> Self {
         Self {
             id,
@@ -40,7 +43,12 @@ impl JobRun {
             attempt,
             max_attempts,
             cancellation,
+            control,
         }
+    }
+
+    pub(crate) fn control(&self) -> &RunControl {
+        &self.control
     }
 
     /// Id of the job; it stays the same across retries, so it works as an idempotency key.

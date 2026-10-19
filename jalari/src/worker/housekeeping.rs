@@ -86,6 +86,27 @@ impl Shared {
             if deleted > 0 {
                 info!(deleted, "housekeeping removed finished jobs");
             }
+            while !shutdown.is_cancelled() {
+                let removed = sqlx::query(AssertSqlSafe(format!(
+                    "DELETE FROM {job_control} WHERE job_id IN (
+                         SELECT control.job_id FROM {job_control} AS control
+                         WHERE NOT EXISTS (
+                             SELECT 1 FROM {job} AS job WHERE job.id = control.job_id
+                         )
+                         LIMIT $1
+                         FOR UPDATE OF control SKIP LOCKED
+                     )",
+                    job = schema.table("job"),
+                    job_control = schema.table("job_control"),
+                )))
+                .bind(BATCH_SIZE)
+                .execute(&pool)
+                .await?
+                .rows_affected();
+                if removed < BATCH_SIZE.unsigned_abs() {
+                    break;
+                }
+            }
         }
 
         let schedule: Schedule = sqlx::query_as(AssertSqlSafe(format!(

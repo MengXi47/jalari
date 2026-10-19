@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::JobId;
 use crate::job::context::Captured;
 
-/// What to do when a job with the same `job_key` is already waiting or running.
+/// What to do when a job with the same `job_key` is already waiting, running or stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OnConflict {
     /// Keep the existing job and drop the new one.
@@ -23,6 +23,10 @@ pub enum OnConflict {
     /// attempt is recorded first, and the new payload starts no earlier than 6 seconds after the
     /// interruption was noticed, like any interrupted job; jobs sharing its `queue_key` wait as
     /// long. A dropped claim counts as such an interruption, so its new payload waits as well.
+    ///
+    /// A [stopped](crate::stop) job is never replaced; the enqueue returns
+    /// [`EnqueueOutcome::Kept`]. Replacing a job discards the progress its earlier attempts
+    /// saved.
     Replace,
 }
 
@@ -31,7 +35,7 @@ pub enum OnConflict {
 pub enum EnqueueOutcome {
     /// A new job was inserted.
     Inserted(JobId),
-    /// A job with the same `job_key` was already waiting or running and was kept.
+    /// A job with the same `job_key` was already waiting, running or stopped and was kept.
     Kept(JobId),
     /// A waiting job with the same `job_key` was overwritten.
     Replaced(JobId),

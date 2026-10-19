@@ -1,3 +1,4 @@
+mod checkpoint;
 pub(crate) mod context;
 mod definition;
 mod error;
@@ -6,6 +7,8 @@ pub(crate) mod registry;
 pub(crate) mod run;
 mod state;
 
+pub use checkpoint::checkpoint;
+pub(crate) use checkpoint::{Command, RunControl};
 pub use context::scope;
 pub use definition::{Job, JobResult};
 pub use error::JobError;

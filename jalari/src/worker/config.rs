@@ -4,6 +4,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_CLAIM_TRIES: u32 = 10;
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timings of a single worker, set with [`WorkerBuilder::config`](crate::WorkerBuilder::config).
 ///
@@ -36,6 +37,10 @@ pub struct WorkerConfig {
     ///
     /// Must be shorter than the cluster's [`worker_timeout`](crate::ClusterConfig::worker_timeout).
     pub heartbeat_interval: Duration,
+    /// How long a running job may take to reach a [`checkpoint`](crate::checkpoint) after
+    /// [`stop`](crate::stop) or [`cancel`](crate::cancel) before it is aborted; defaults to 30
+    /// seconds.
+    pub stop_timeout: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -45,6 +50,7 @@ impl Default for WorkerConfig {
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             max_claim_tries: DEFAULT_MAX_CLAIM_TRIES,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            stop_timeout: DEFAULT_STOP_TIMEOUT,
         }
     }
 }

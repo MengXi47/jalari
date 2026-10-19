@@ -21,12 +21,14 @@ const REPLACE_PATIENCE: Duration = Duration::from_secs(1);
 enum Replacement {
     Replaced(JobId),
     Running(JobId),
+    Kept(JobId),
     Missing,
 }
 
 #[derive(sqlx::FromRow)]
 struct ReplaceRow {
     id: i64,
+    stopped: bool,
     started: bool,
     replaced: bool,
     interrupted: bool,
@@ -178,6 +180,7 @@ impl EnqueueRequest {
                         return Ok(EnqueueOutcome::Replaced(id));
                     }
                     Replacement::Running(id) => return Ok(EnqueueOutcome::Running(id)),
+                    Replacement::Kept(id) => return Ok(EnqueueOutcome::Kept(id)),
                     Replacement::Missing => {}
                 },
             }
@@ -230,9 +233,9 @@ impl EnqueueRequest {
     ) -> Result<Replacement> {
         let sql = format!(
             "WITH target AS (
-                 SELECT job.id, {unfinished} AS started
+                 SELECT job.id, job.state = 'stopped' AS stopped, {unfinished} AS started
                  FROM {job} AS job
-                 WHERE job.job_key = $9 AND job.state IN ('scheduled', 'enqueued')
+                 WHERE job.job_key = $9 AND job.state IN {JOB_KEY_STATES}
              ),
              locked AS (
                  SELECT id,
@@ -258,12 +261,19 @@ impl EnqueueRequest {
                  ) AS input
                  WHERE job.id = locked.id AND NOT {unfinished}
                  RETURNING job.id
+             ),
+             reset AS (
+                 UPDATE {job_control}
+                 SET progress = NULL, lease = lease + 1, updated_at = statement_timestamp()
+                 WHERE job_id IN (SELECT id FROM replaced)
              )
-             SELECT target.id, target.started, EXISTS (SELECT 1 FROM replaced) AS replaced,
+             SELECT target.id, target.stopped, target.started,
+                 EXISTS (SELECT 1 FROM replaced) AS replaced,
                  EXISTS (SELECT 1 FROM locked) AND NOT EXISTS (SELECT 1 FROM replaced)
                      AS interrupted
              FROM target",
             job = schema.table("job"),
+            job_control = schema.table("job_control"),
             unfinished = schema.unfinished_attempt("job"),
         );
         let polling_since = Instant::now();
@@ -284,6 +294,7 @@ impl EnqueueRequest {
                 .await?;
             match row {
                 None => return Ok(Replacement::Missing),
+                Some(row) if row.stopped => return Ok(Replacement::Kept(JobId(row.id))),
                 Some(row) if row.replaced => return Ok(Replacement::Replaced(JobId(row.id))),
                 Some(row) if row.interrupted => {
                     if !mark_interrupted(connection, schema, &[row.id], false).await?

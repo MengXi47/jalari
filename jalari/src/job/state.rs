@@ -5,6 +5,8 @@ pub(crate) enum JobState {
     Scheduled,
     Succeeded,
     Failed,
+    Stopped,
+    Deleted,
 }
 
 impl JobState {
@@ -13,6 +15,8 @@ impl JobState {
             Self::Scheduled => "scheduled",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Stopped => "stopped",
+            Self::Deleted => "deleted",
         }
     }
 }

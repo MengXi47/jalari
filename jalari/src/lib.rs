@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod cluster;
+mod control;
 mod enqueue;
 mod error;
 mod init;
@@ -12,11 +13,14 @@ mod worker;
 pub mod __private;
 
 pub use cluster::ClusterConfig;
+pub use control::{CancelOutcome, RestartOutcome, StopOutcome, cancel, restart, stop};
 pub use enqueue::{EnqueueOptions, EnqueueOutcome, OnConflict, enqueue, enqueue_in, enqueue_with};
 pub use error::{Error, ErrorKind, Result};
 pub use init::{InitBuilder, PoolSource, init};
 pub use jalari_macros::job;
-pub use job::{Job, JobError, JobId, JobResult, JobRun, current_job, scope, shutdown_requested};
+pub use job::{
+    Job, JobError, JobId, JobResult, JobRun, checkpoint, current_job, scope, shutdown_requested,
+};
 pub use recurring::{Cron, RecurringInfo};
 pub use sqlx;
 pub use storage::{

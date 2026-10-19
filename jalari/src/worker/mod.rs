@@ -10,6 +10,7 @@ mod retry;
 mod runner;
 mod scheduler;
 
+pub(crate) use close::{Closing, close};
 pub(crate) use execute::{INTERRUPTED, mark_interrupted};
 
 pub use builder::WorkerBuilder;
