@@ -167,14 +167,14 @@ impl RunControl {
     pub(crate) fn is_dirty(&self) -> bool {
         self.slot.lock().unwrap().dirty
     }
+}
 
-    async fn stop_point(&self) -> JobResult {
-        if let Some(halt) = self.halt() {
-            return Err(JobError::halted(halt));
-        }
-        tokio::task::consume_budget().await;
-        Ok(())
+async fn stop_point(halt: Option<Halt>) -> JobResult {
+    if let Some(halt) = halt {
+        return Err(JobError::halted(halt));
     }
+    tokio::task::consume_budget().await;
+    Ok(())
 }
 
 /// Saves a running job's progress so a later run continues from it; created by [`resume`].
@@ -224,10 +224,11 @@ impl<P: Serialize> Checkpoint<P> {
         let Some(control) = &self.control else {
             return Ok(());
         };
-        if control.halt().is_some() || control.is_due() {
+        let halt = control.halt();
+        if halt.is_some() || control.is_due() {
             control.keep(serde_json::to_value(progress).map_err(JobError::permanent)?);
         }
-        control.stop_point().await
+        stop_point(halt).await
     }
 }
 
@@ -314,7 +315,7 @@ pub fn resume<P: Serialize + DeserializeOwned>()
 /// ```
 pub async fn checkpoint() -> JobResult {
     match current_job() {
-        Some(job) => job.control().stop_point().await,
+        Some(job) => stop_point(job.control().halt()).await,
         None => Ok(()),
     }
 }
