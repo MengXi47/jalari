@@ -14,9 +14,15 @@ use crate::{JobError, JobResult};
 
 const KEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// A request sent to a job with [`stop`](crate::stop) or [`cancel`](crate::cancel) that a
+/// worker has not acted on yet.
+///
+/// A cancel outranks a stop: once a cancel is pending, a later stop does not replace it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Command {
+pub enum Command {
+    /// Stop the job and keep it for [`restart`](crate::restart).
     Stop,
+    /// Stop the job and mark it deleted.
     Cancel,
 }
 

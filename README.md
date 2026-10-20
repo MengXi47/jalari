@@ -35,7 +35,9 @@ jalari = "0.4"
 - **Stop, restart and cancel** — stop a job to free everything it holds, restart it later from
   the progress it saved at its last checkpoint, or cancel it for good.
 - **Graceful shutdown** — running jobs finish before a worker exits.
-- **Monitoring and cleanup** — a live list of workers, and optional deletion of finished jobs.
+- **Monitoring and management** — a live list of workers, counts and throughput per queue,
+  job listing by state, queue, key, time or tenant context, each job's history, retrying
+  failed jobs and running scheduled ones now; optional deletion of finished jobs.
 - **Table setup your way** — from code, with the `jalari` CLI, or as SQL for your own
   migrations.
 

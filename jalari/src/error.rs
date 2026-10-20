@@ -69,6 +69,9 @@ pub enum ErrorKind {
     NotInitialized,
     /// A job could not be serialized with `serde_json`.
     PayloadEncodeFailed,
+    /// A stored payload could not be decoded: its codec is not `json`, or the bytes do not
+    /// deserialize into the requested type.
+    PayloadDecodeFailed,
     /// A timeout does not fit in an `i32` of milliseconds (about 24 days).
     TimeoutTooLong,
     /// An enqueue with [`OnConflict::Replace`](crate::OnConflict::Replace) kept racing with

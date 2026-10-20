@@ -98,6 +98,10 @@ Version 5 adds the interval and end-condition columns to the `recurring` table. 
 nullable columns and checks to that small table, so it runs quickly, but workers of an older
 release fail `init` after it, as for every version.
 
+Version 6 adds a GIN index on the job table's context column for
+[listing jobs](#listing-jobs) by context. Building it reads the whole job table and blocks
+writes to it until the upgrade commits.
+
 ## Defining jobs
 
 A job is a serializable struct with an `impl Job` inside `#[jalari::job]`. Its fields are the
@@ -751,13 +755,79 @@ for worker in jalari::admin::workers().await? {
 }
 
 for schedule in jalari::recurring::list().await? {
-    println!("{} next at {}", schedule.name, schedule.next_run_at);
+    println!("{} next at {:?} after {} runs", schedule.name, schedule.next_run_at,
+        schedule.run_count);
+}
+
+for count in jalari::admin::stats().await? {
+    println!("{} {}: {}", count.queue, count.state, count.count);
+}
+
+for queue in jalari::admin::throughput(Duration::from_secs(3600)).await? {
+    println!("{}: {} succeeded, {} failed, {} retried, max {:?}",
+        queue.queue, queue.succeeded, queue.failed, queue.retried, queue.max_duration);
 }
 ```
 
-If no listed worker has `scheduler` set, recurring schedules are not firing. Jobs and their
-history are plain tables, so `SELECT state, count(*) FROM jalari.job GROUP BY state` works
-too.
+If no listed worker has `scheduler` set, recurring schedules are not firing. `stats` counts
+the jobs in every queue by state; `throughput` sums up the job history of the last window,
+so it only sees as far back as the retention housekeeping keeps.
+
+### Listing jobs
+
+```rust
+let filter = jalari::admin::JobFilter::new()
+    .state(jalari::JobState::Failed)
+    .context(serde_json::json!({ "tenant_id": "acme" }));
+let total = jalari::admin::count(&filter).await?;
+let page = jalari::admin::jobs(&filter, 50, None).await?;
+let next_page = jalari::admin::jobs(&filter, 50, page.last().map(|job| job.id)).await?;
+
+if let Some(detail) = jalari::admin::job(page[0].id).await? {
+    let job: SendWelcome = detail.job.payload_json()?;
+    for entry in &detail.history {
+        println!("{} attempt {} {:?}", entry.state, entry.attempt, entry.error);
+    }
+    if let Some(control) = &detail.control {
+        println!("pending {:?} progress {:?}", control.pending, control.progress);
+    }
+}
+```
+
+`JobFilter` combines any of: states, queue, task, exact `job_key` or a prefix, a creation
+time range, and a context the stored context must contain (PostgreSQL's `@>`, so
+`{"tenant_id": "acme"}` matches whatever else the context holds). Pages are cut by id, newest
+first: pass the last id of a page as `before` for the next one, and they stay consistent while
+jobs come and go. `job` returns the job, every state change from its history and its control
+row with any pending stop or cancel and the progress saved at its last checkpoint. Payloads
+come back as the stored bytes with their codec; `payload_json` decodes the `json` ones.
+
+Migration 6 adds a GIN index on the context column for the context filter. Every insert or
+update of a job that has a context also updates that index; jobs without a context are not in
+it. The index is built without `CONCURRENTLY`, so writes to the job table wait while the
+upgrade runs.
+
+### Retrying and rescheduling
+
+```rust
+match jalari::admin::retry(id).await? {
+    jalari::admin::RetryOutcome::Retried => {}
+    jalari::admin::RetryOutcome::KeyTaken(other) => println!("job {other} holds the key"),
+    outcome => println!("{outcome:?}"),
+}
+let summary = jalari::admin::retry_failed(&filter).await?;
+jalari::admin::run_now(id).await?;
+```
+
+`retry` makes a failed job due now with its attempts reset, so it gets its full
+`max_attempts` again; `last_error` stays until an attempt succeeds, the change is recorded in
+the history, and the queue's workers are notified. A failed job whose `job_key` is held by a
+waiting, running or stopped job stays failed and the outcome names that job. `retry_failed`
+does the same for every failed job matching the filter, in batches of 100 that each commit on
+their own. `run_now` makes a scheduled job, or a retry waiting for its backoff, due now; a
+running job, or one interrupted less than 6 seconds ago, is reported as `Running` and left
+alone. To delete a job, [`cancel`](#stopping-restarting-and-cancelling) it: a waiting or stopped
+job is marked deleted at once, a running one once it stops.
 
 ## Errors
 

@@ -19,8 +19,8 @@ pub use error::{Error, ErrorKind, Result};
 pub use init::{InitBuilder, PoolSource, init};
 pub use jalari_macros::job;
 pub use job::{
-    Checkpoint, Job, JobError, JobId, JobResult, JobRun, checkpoint, current_job, resume, scope,
-    shutdown_requested,
+    Checkpoint, Command, Job, JobError, JobId, JobResult, JobRun, JobState, checkpoint,
+    current_job, resume, scope, shutdown_requested,
 };
 pub use recurring::{Cron, Interval, IntervalUnit, RecurringInfo, Schedule};
 pub use sqlx;
