@@ -11,6 +11,7 @@ use crate::{Error, ErrorKind, JobId, JobState, Result, Schema};
 
 const BATCH_SIZE: i64 = 100;
 const UNIQUE_VIOLATION: &str = "23505";
+const MAX_KEY_RETRIES: usize = 3;
 
 /// What [`retry`] did with the job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +66,7 @@ pub enum RunNowOutcome {
 /// # Errors
 ///
 /// Returns an error if:
-/// - The job's `job_key` was taken by a job that disappeared again before it could be named
+/// - Other jobs kept taking and freeing the job's `job_key` during several tries
 ///   ([`JobKeyContention`](crate::ErrorKind::JobKeyContention)); call again
 /// - [`init`](crate::init) has not completed or the database query fails
 ///
@@ -256,6 +257,22 @@ async fn retry_locked(
     schema: &Schema,
     id: JobId,
 ) -> Result<RetryOutcome> {
+    for _ in 0..MAX_KEY_RETRIES {
+        if let Some(outcome) = try_retry(transaction, schema, id).await? {
+            return Ok(outcome);
+        }
+    }
+    Err(Error::new(
+        ErrorKind::JobKeyContention,
+        format!("job {id}: its job_key kept changing hands while retrying"),
+    ))
+}
+
+async fn try_retry(
+    transaction: &mut Transaction<'_, Postgres>,
+    schema: &Schema,
+    id: JobId,
+) -> Result<Option<RetryOutcome>> {
     let mut attempt = Connection::begin(&mut **transaction).await?;
     let retried = sqlx::query(AssertSqlSafe(format!(
         "WITH retried AS (
@@ -283,11 +300,11 @@ async fn retry_locked(
     match retried {
         Ok(result) if result.rows_affected() == 1 => {
             attempt.commit().await?;
-            Ok(RetryOutcome::Retried)
+            Ok(Some(RetryOutcome::Retried))
         }
         Ok(_) => {
             attempt.rollback().await?;
-            Ok(RetryOutcome::NotFailed)
+            Ok(Some(RetryOutcome::NotFailed))
         }
         Err(e) if is_unique_violation(&e) => {
             attempt.rollback().await?;
@@ -301,15 +318,7 @@ async fn retry_locked(
             .bind(id.0)
             .fetch_optional(&mut **transaction)
             .await?;
-            holder
-                .map(JobId)
-                .map(RetryOutcome::KeyTaken)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::JobKeyContention,
-                        format!("job {id}: its job_key was taken while retrying"),
-                    )
-                })
+            Ok(holder.map(JobId).map(RetryOutcome::KeyTaken))
         }
         Err(e) => Err(e.into()),
     }
