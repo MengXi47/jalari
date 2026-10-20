@@ -231,8 +231,9 @@ async fn check_max_runs_finishes_the_schedule(fixture: &Fixture) {
 }
 
 async fn check_until_finishes_the_schedule(fixture: &Fixture) {
-    let until = Utc::now() + TimeDelta::milliseconds(2500);
-    let schedule = Schedule::from(every_second()).until(until);
+    let given = Utc::now() + TimeDelta::milliseconds(2500);
+    let schedule = Schedule::from(every_second()).until(given);
+    let until = schedule.ends_at().unwrap();
     recurring::add_or_update("until", schedule, &beat("until"))
         .await
         .unwrap();
