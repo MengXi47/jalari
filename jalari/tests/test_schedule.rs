@@ -172,8 +172,11 @@ async fn test_schedule() {
 }
 
 async fn check_interval_fires_aligned_with_its_anchor(fixture: &Fixture) {
-    let anchor = Utc::now().naive_utc() - TimeDelta::seconds(10);
-    let interval = Interval::new(2, IntervalUnit::Seconds, anchor).unwrap();
+    let given =
+        Utc::now().naive_utc().with_nanosecond(123_456_789).unwrap() - TimeDelta::seconds(10);
+    let interval = Interval::new(2, IntervalUnit::Seconds, given).unwrap();
+    let anchor = interval.anchor();
+    assert_eq!(anchor.nanosecond(), 123_456_000);
     recurring::add_or_update("aligned", interval.clone(), &beat("aligned"))
         .await
         .unwrap();
@@ -436,8 +439,9 @@ async fn check_switching_between_cron_and_interval(fixture: &Fixture) {
 }
 
 async fn check_future_anchor_waits(fixture: &Fixture) {
-    let anchor = Utc::now().naive_utc() + TimeDelta::seconds(2);
-    let interval = Interval::new(1, IntervalUnit::Hours, anchor).unwrap();
+    let given = Utc::now().naive_utc() + TimeDelta::seconds(2);
+    let interval = Interval::new(1, IntervalUnit::Hours, given).unwrap();
+    let anchor = interval.anchor();
     recurring::add_or_update("later", interval, &beat("later"))
         .await
         .unwrap();
