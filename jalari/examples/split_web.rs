@@ -1,7 +1,7 @@
 #[path = "common/jobs.rs"]
 mod jobs;
 
-use jobs::{DailyReport, SendEmail};
+use jobs::{DailyReport, Export, SendEmail};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    println!("enqueued 11 jobs and scheduled \"promo\"; no worker runs in this process");
+    let export = jalari::enqueue(&Export { rows: 120 }).await?.id();
+
+    println!("enqueued 12 jobs and scheduled \"promo\"; no worker runs in this process");
+    println!("export job {export} runs for a minute; control it from another process with");
+    println!("  cargo run -p jalari --example split_control -- stop {export}");
+    println!("  cargo run -p jalari --example split_control -- restart {export}");
+    println!("  cargo run -p jalari --example split_control -- cancel {export}");
     Ok(())
 }

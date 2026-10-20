@@ -705,12 +705,22 @@ Database errors are classified by SQLSTATE. `ConnectionFailed`, `PoolTimedOut`,
 
 ```bash
 export DATABASE_URL=postgres://localhost/app
+cargo run -p jalari --example migrate
 cargo run -p jalari --example basic
+cargo run -p jalari --example stop_restart
+cargo run -p jalari --example middleware
 cargo run -p jalari --example split_worker
 cargo run -p jalari --example split_web
+cargo run -p jalari --example split_control -- stop 42
 ```
 
-- [`basic`](../jalari/examples/basic.rs) uses every feature in one process.
-- [`split_web`](../jalari/examples/split_web.rs) and
-  [`split_worker`](../jalari/examples/split_worker.rs) run the same jobs as separate web and
-  worker binaries; pass `--no-scheduler` to a worker to turn its scheduler off.
+| Example | Shows |
+|---|---|
+| [`migrate`](../jalari/examples/migrate.rs) | Creating and checking the tables; `--dry-run` prints the SQL instead |
+| [`basic`](../jalari/examples/basic.rs) | Defining, enqueueing and running jobs in one process: errors and retries, `job_key` with `KeepExisting` and `Replace`, `queue_key`, delays, transactions, recurring schedules, `current_job`, `shutdown_requested`, cluster settings and monitoring. It runs until Ctrl-C |
+| [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
+| [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, and a job that passes its context to the jobs it enqueues. It exits when done |
+| [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job from yet another process |
+
+The examples use `jalari::Schema::default()`, so they share the `jalari` schema of the
+database they run against.

@@ -134,8 +134,11 @@ worker.run(shutdown).await;
 
 ## Documentation
 
-- [Guide](docs/guide.md) — setup, jobs, enqueueing, cron, workers, deployment and settings
-- [Examples](jalari/examples) — complete programs, including split web and worker binaries
+- [Guide](docs/guide.md) — setup, jobs, enqueueing, cron, workers, stopping and restarting,
+  middleware, deployment and settings
+- [Examples](docs/guide.md#examples) — complete programs: a tour of the basics, stopping and
+  restarting with checkpoints, middleware and context, and split web, worker and control
+  binaries
 - [Contributing](CONTRIBUTING.md)
 
 ## License

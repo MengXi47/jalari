@@ -2,7 +2,7 @@
 mod jobs;
 
 use jalari::Job;
-use jobs::{DailyReport, SendEmail};
+use jobs::{DailyReport, Export, SendEmail};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,16 +15,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = jalari::Worker::builder()
         .queue("emails", 4)
         .queue("reports", 1)
+        .queue("exports", 2)
         .scheduler(scheduler)
         .build()
         .await?;
     let worker_task = tokio::spawn(worker.run(shutdown.child_token()));
 
     println!(
-        "[pid {}] worker for {} and {} started, scheduler = {scheduler}",
+        "[pid {}] worker for {}, {} and {} started, scheduler = {scheduler}",
         std::process::id(),
         SendEmail::NAME,
-        DailyReport::NAME
+        DailyReport::NAME,
+        Export::NAME
     );
     for worker in jalari::admin::workers().await? {
         println!(
