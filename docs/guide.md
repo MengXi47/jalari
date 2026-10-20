@@ -260,7 +260,7 @@ jalari::recurring::remove("digest:sales").await?;
 `add_or_update` and `update_schedule` take a `jalari::Cron`, a `jalari::Interval` or a
 `jalari::Schedule`. Calling `add_or_update` with the same schedule again only updates the
 payload: the next run, the run count and a finished state are kept, so calling it at every
-start of your application is safe. A different schedule starts over.
+start of your application is safe. A different cron or interval starts over.
 
 `jalari::recurring::trigger(name)` enqueues a schedule's job immediately, for either kind,
 without moving its timetable. `jalari::recurring::list()` returns every schedule with its next
@@ -306,8 +306,11 @@ jalari::recurring::add_or_update("digest:sales:trial", schedule, &digest).await?
   neither does a round skipped because the previous job was still waiting or running.
 - A finished schedule stays in the list with `finished_at` set and no `next_run_at`. It never
   fires again, `pause` and `resume` leave it finished, and `trigger` still works.
-- `update_schedule` or `add_or_update` with a different schedule resets the run count to zero
-  and un-finishes it; the same schedule leaves it as it is.
+- `update_schedule` or `add_or_update` with a different cron or interval resets the run count
+  to zero and un-finishes it. Changing only `until` or `max_runs` keeps the count: raising
+  `max_runs` from 10 to 20 after 10 runs gives 10 more, and lowering it below the count
+  finishes the schedule. The same schedule leaves it as it is. Times are kept to whole
+  microseconds, as the database stores them.
 
 ### Cron format
 

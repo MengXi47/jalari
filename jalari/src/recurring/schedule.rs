@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use chrono::{
     DateTime, Datelike, LocalResult, Months, NaiveDate, NaiveDateTime, Offset, TimeDelta, TimeZone,
-    Utc,
+    Timelike, Utc,
 };
 use chrono_tz::Tz;
 
@@ -127,6 +127,13 @@ impl Interval {
                 "an interval must be at least one unit long".to_owned(),
             ));
         }
+        if i32::try_from(count).is_err() {
+            return Err(Error::new(
+                ErrorKind::InvalidInterval,
+                format!("an interval of {count} units is longer than the database can store"),
+            ));
+        }
+        let anchor = truncate_to_microseconds(anchor);
         Ok(Self {
             count,
             unit,
@@ -156,7 +163,8 @@ impl Interval {
         self.unit
     }
 
-    /// Local time of the first run.
+    /// Local time the runs are aligned with, as given to [`new`](Self::new) and truncated to
+    /// whole microseconds, the precision the database keeps.
     pub fn anchor(&self) -> NaiveDateTime {
         self.anchor
     }
@@ -248,9 +256,12 @@ impl fmt::Display for Interval {
 /// Both end conditions count only runs the scheduler enqueued;
 /// [`trigger`](crate::recurring::trigger) does not count. A schedule that reaches its end is
 /// finished: it never fires again, [`RecurringInfo`](crate::RecurringInfo) reports when, and
-/// [`resume`](crate::recurring::resume) does not revive it. Changing the schedule with
+/// [`resume`](crate::recurring::resume) does not revive it. Changing the cron or interval with
 /// [`add_or_update`](crate::recurring::add_or_update) or
-/// [`update_schedule`](crate::recurring::update_schedule) starts counting again from zero.
+/// [`update_schedule`](crate::recurring::update_schedule) starts counting again from zero;
+/// changing only the end conditions keeps the count, so raising `max_runs` revives a finished
+/// schedule for the difference. Times are kept to whole microseconds, as the database stores
+/// them.
 ///
 /// # Examples
 ///
@@ -284,7 +295,8 @@ enum Rule {
 impl Schedule {
     /// Stops the schedule after the last run at or before `until`.
     pub fn until(mut self, until: DateTime<Utc>) -> Self {
-        self.until = Some(until);
+        let truncated = truncate_to_microseconds(until.naive_utc()).and_utc();
+        self.until = Some(truncated);
         self
     }
 
@@ -298,6 +310,12 @@ impl Schedule {
             return Err(Error::new(
                 ErrorKind::InvalidSchedule,
                 "a schedule must allow at least one run".to_owned(),
+            ));
+        }
+        if i32::try_from(max_runs).is_err() {
+            return Err(Error::new(
+                ErrorKind::InvalidSchedule,
+                format!("a run limit of {max_runs} is higher than the database can store"),
             ));
         }
         self.max_runs = Some(max_runs);
@@ -419,6 +437,11 @@ pub(crate) fn parse_timezone(timezone: &str) -> Result<Tz> {
     })
 }
 
+fn truncate_to_microseconds(time: NaiveDateTime) -> NaiveDateTime {
+    time.with_nanosecond(time.nanosecond() / 1000 * 1000)
+        .unwrap_or(time)
+}
+
 fn months_between(from: NaiveDate, to: NaiveDate) -> i64 {
     (i64::from(to.year()) - i64::from(from.year())) * 12 + i64::from(to.month())
         - i64::from(from.month())
@@ -506,6 +529,24 @@ mod tests {
             .max_runs(0)
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidSchedule);
+        let err = Interval::new(u32::MAX, IntervalUnit::Days, anchor).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInterval);
+        let err = Schedule::from(Interval::new(1, IntervalUnit::Days, anchor).unwrap())
+            .max_runs(u32::MAX)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidSchedule);
+    }
+
+    #[test]
+    fn test_times_are_kept_to_whole_microseconds() {
+        let anchor = local(2026, 1, 1, 0, 0)
+            .with_nanosecond(123_456_789)
+            .unwrap();
+        let interval = Interval::new(1, IntervalUnit::Days, anchor).unwrap();
+        assert_eq!(interval.anchor().nanosecond(), 123_456_000);
+        let until = utc(2026, 1, 2, 0, 0).with_nanosecond(999_999_999).unwrap();
+        let schedule = Schedule::from(interval).until(until);
+        assert_eq!(schedule.ends_at().unwrap().nanosecond(), 999_999_000);
     }
 
     #[test]
@@ -743,7 +784,7 @@ mod tests {
     #[test]
     fn test_far_future_runs_report_an_error() {
         let every = interval(
-            u32::MAX,
+            u32::try_from(i32::MAX).unwrap(),
             IntervalUnit::Years,
             local(2026, 1, 1, 0, 0),
             "UTC",

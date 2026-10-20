@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeDelta, Timelike, Utc};
 use jalari::sqlx::postgres::PgPoolOptions;
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
@@ -341,10 +341,41 @@ async fn check_unchanged_update_keeps_the_count(fixture: &Fixture) {
     )
     .await
     .unwrap();
+    let extended = info("kept").await;
+    assert!(extended.run_count >= before.run_count);
+    assert_eq!(extended.finished_at, None);
+    assert!(extended.next_run_at.unwrap() > before.last_run_at.unwrap());
+
+    recurring::update_schedule(
+        "kept",
+        Schedule::from(Interval::new(1, IntervalUnit::Seconds, anchor_now()).unwrap())
+            .max_runs(10)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     let reset = info("kept").await;
     assert_eq!(reset.run_count, 0);
     assert_eq!(reset.finished_at, None);
     assert!(reset.next_run_at.unwrap() > before.last_run_at.unwrap());
+
+    let nanos = Utc::now().naive_utc().with_nanosecond(123_456_789).unwrap();
+    let precise = Schedule::from(Interval::new(1, IntervalUnit::Seconds, nanos).unwrap())
+        .until(Utc::now().with_nanosecond(987_654_321).unwrap() + TimeDelta::hours(1));
+    recurring::add_or_update("kept", precise.clone(), &beat("kept"))
+        .await
+        .unwrap();
+    wait_until("the precise schedule to run", async || {
+        info("kept").await.run_count >= 1
+    })
+    .await;
+    let precise_count = info("kept").await.run_count;
+    recurring::add_or_update("kept", precise.clone(), &beat("kept"))
+        .await
+        .unwrap();
+    let same = info("kept").await;
+    assert!(same.run_count >= precise_count);
+    assert_eq!(same.schedule, Some(precise));
     recurring::remove("kept").await.unwrap();
     let _ = fixture;
 }
@@ -431,7 +462,14 @@ async fn check_invalid_schedule_is_reported(fixture: &Fixture) {
     assert_eq!(err.kind, ErrorKind::InvalidSchedule);
 
     let anchor = Utc::now().naive_utc();
-    let interval = Interval::new(u32::MAX, IntervalUnit::Years, anchor).unwrap();
+    let err = Interval::new(u32::MAX, IntervalUnit::Years, anchor).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::InvalidInterval);
+    let too_many = Schedule::from(every_second())
+        .max_runs(u32::MAX)
+        .unwrap_err();
+    assert_eq!(too_many.kind, ErrorKind::InvalidSchedule);
+    let largest = u32::try_from(i32::MAX).unwrap();
+    let interval = Interval::new(largest, IntervalUnit::Years, anchor).unwrap();
     let err = recurring::add_or_update("overflow", interval, &beat("overflow"))
         .await
         .unwrap_err();

@@ -20,6 +20,24 @@ pub(crate) struct StoredSchedule {
 }
 
 impl StoredSchedule {
+    fn rule(
+        &self,
+    ) -> (
+        &Option<String>,
+        &str,
+        Option<i32>,
+        &Option<String>,
+        Option<NaiveDateTime>,
+    ) {
+        (
+            &self.cron,
+            &self.timezone,
+            self.interval_count,
+            &self.interval_unit,
+            self.anchor,
+        )
+    }
+
     pub(crate) fn parse(&self) -> Result<Schedule> {
         let mut schedule = match (
             &self.cron,
@@ -127,8 +145,18 @@ pub(crate) async fn plan(
     existing: Option<&LockedSchedule>,
     schedule: &Schedule,
 ) -> Result<Plan> {
+    let stored = schedule.stored();
     match existing {
-        Some(existing) if existing.stored == schedule.stored() => Ok(Plan::kept(existing)),
+        Some(existing) if existing.stored == stored => Ok(Plan::kept(existing)),
+        Some(existing) if existing.stored.rule() == stored.rule() => {
+            Plan::fresh(
+                connection,
+                schedule,
+                existing.last_run_at,
+                existing.run_count,
+            )
+            .await
+        }
         _ => {
             Plan::fresh(
                 connection,

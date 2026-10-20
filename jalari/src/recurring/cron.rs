@@ -224,7 +224,7 @@ mod tests {
             .timezone("America/New_York")
             .unwrap();
         let next = cron.next_after(utc(2026, 3, 8, 0, 0, 0)).unwrap();
-        assert!(next < utc(2026, 3, 9, 0, 0, 0), "{next}");
+        assert_eq!(next, utc(2026, 3, 8, 7, 0, 0));
     }
 
     #[test]

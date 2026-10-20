@@ -42,10 +42,12 @@ struct InfoRow {
 /// `schedule` is a [`Cron`](crate::Cron), an [`Interval`](crate::Interval) or a [`Schedule`]
 /// with end conditions. The job goes to `T`'s default queue. Every run carries the context of
 /// the surrounding [`scope`](crate::scope), if any. Updating keeps a paused schedule paused and
-/// never repeats a run that already fired. A changed schedule starts counting its runs again
-/// from zero and is no longer finished; an unchanged one keeps its count, its next run and its
-/// finished state, so calling this at every start of your application is safe. Runs are
-/// enqueued by workers with the scheduler enabled; they all wake up as soon as this commits.
+/// never repeats a run that already fired. An unchanged schedule keeps its run count, its next
+/// run and its finished state, so calling this at every start of your application is safe. A
+/// schedule whose cron or interval changed starts counting again from zero; one where only
+/// `until` or `max_runs` changed keeps its count and is finished or revived accordingly. Runs
+/// are enqueued by workers with the scheduler enabled; they all wake up as soon as this
+/// commits.
 ///
 /// # Errors
 ///
@@ -99,6 +101,10 @@ pub async fn add_or_update<T: Job>(
     let context = crate::job::context::current().into_value(T::NAME)?;
 
     let mut transaction = config.pool.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("{}:{name}", schema.lock_key("recurring")))
+        .execute(&mut *transaction)
+        .await?;
     let existing = lock_schedule(&mut transaction, schema, name).await?;
     if existing.as_ref().is_some_and(|schedule| schedule.managed) {
         return Err(managed_by_code(name));
@@ -153,8 +159,9 @@ pub async fn add_or_update<T: Job>(
 /// Changes only when a runtime schedule runs, keeping its job and payload.
 ///
 /// The next run is recomputed from the new schedule and is always later than the last run. A
-/// changed schedule starts counting its runs again from zero and is no longer finished; an
-/// unchanged one is left as it is.
+/// new cron or interval starts counting its runs again from zero; new end conditions alone
+/// keep the count and finish or revive the schedule accordingly; an unchanged schedule is
+/// left as it is.
 ///
 /// # Errors
 ///
