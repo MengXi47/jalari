@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{TimeDelta, Utc};
 use jalari::admin::{self, JobFilter, RetryOutcome, RunNowOutcome};
-use jalari::sqlx::postgres::PgPoolOptions;
+use jalari::sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
     CancellationToken, Command, EnqueueOptions, ErrorKind, Job, JobError, JobId, JobResult,
@@ -17,6 +17,7 @@ use serde_json::json;
 static EXECUTIONS: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static GATE_OPEN: AtomicBool = AtomicBool::new(false);
+static FRAGILE_OPEN: AtomicBool = AtomicBool::new(false);
 
 fn record_execution(label: &str) -> u32 {
     let mut executions = EXECUTIONS.lock().unwrap();
@@ -51,6 +52,23 @@ impl Job for Ping {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Gate;
+
+#[derive(Serialize, Deserialize)]
+struct Fragile;
+
+#[jalari::job(queue = "gate")]
+impl Job for Fragile {
+    const NAME: &'static str = "a_fragile";
+    const MAX_ATTEMPTS: i32 = 1;
+
+    async fn run(self) -> JobResult {
+        record_execution("fragile");
+        while !FRAGILE_OPEN.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+}
 
 #[jalari::job(queue = "gate")]
 impl Job for Gate {
@@ -125,9 +143,10 @@ async fn test_admin() {
         return;
     };
     let schema_name = unique_schema_name();
+    let options: PgConnectOptions = url.parse().unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&url)
+        .connect_with(options.application_name(&schema_name))
         .await
         .unwrap();
     jalari::init(pool.clone())
@@ -159,6 +178,7 @@ async fn test_admin() {
     check_retry(&fixture).await;
     check_retry_failed_in_batches(&fixture).await;
     check_run_now(&fixture).await;
+    check_retry_waits_out_an_interruption(&fixture).await;
     check_throughput(&fixture).await;
 
     shutdown.cancel();
@@ -584,6 +604,58 @@ async fn check_run_now(fixture: &Fixture) {
     jalari::cancel(stopped).await.unwrap();
 }
 
+async fn check_retry_waits_out_an_interruption(fixture: &Fixture) {
+    FRAGILE_OPEN.store(false, Ordering::SeqCst);
+    let id = jalari::enqueue(&Fragile).await.unwrap().id();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while executions("fragile") == 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let terminated: Vec<bool> = sqlx::query_scalar(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database()
+             AND state = 'idle in transaction'
+             AND state_change < now() - interval '200 milliseconds'
+             AND application_name = $1",
+    )
+    .bind(&fixture.schema_name)
+    .fetch_all(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(terminated, [true]);
+    FRAGILE_OPEN.store(true, Ordering::SeqCst);
+    fixture.wait_for_state(id, "failed").await;
+    let failed = admin::job(id).await.unwrap().unwrap();
+    assert_eq!(
+        failed.job.last_error.as_deref(),
+        Some("the worker stopped during the last attempt")
+    );
+
+    let retried_at = Instant::now();
+    assert_eq!(admin::retry(id).await.unwrap(), RetryOutcome::Retried);
+    let waiting = admin::job(id).await.unwrap().unwrap();
+    assert_eq!(waiting.job.state, JobState::Scheduled);
+    assert_eq!(waiting.job.attempts, 0);
+    let fence = waiting.job.run_at - failed.job.updated_at;
+    assert!(
+        fence >= TimeDelta::seconds(5) && fence <= TimeDelta::seconds(7),
+        "{fence}"
+    );
+    assert_eq!(
+        waiting
+            .history
+            .last()
+            .map(|entry| (entry.state, entry.attempt)),
+        Some((JobState::Scheduled, 0))
+    );
+    assert_eq!(admin::run_now(id).await.unwrap(), RunNowOutcome::Running);
+    fixture.wait_for_state(id, "succeeded").await;
+    assert!(retried_at.elapsed() >= Duration::from_secs(5));
+    assert_eq!(executions("fragile"), 2);
+}
+
 async fn check_throughput(fixture: &Fixture) {
     let throughput = admin::throughput(Duration::from_secs(3600)).await.unwrap();
     let pings = throughput
@@ -600,7 +672,7 @@ async fn check_throughput(fixture: &Fixture) {
         .iter()
         .find(|queue| queue.queue == "gate")
         .unwrap();
-    assert_eq!((gate.succeeded, gate.stopped, gate.cancelled), (1, 0, 1));
+    assert_eq!((gate.succeeded, gate.stopped, gate.cancelled), (2, 0, 1));
     assert_eq!(admin::throughput(Duration::from_secs(0)).await.unwrap(), []);
 
     let stats = admin::stats().await.unwrap();

@@ -319,7 +319,7 @@ pub struct JobCount {
 
 /// What one queue's jobs did within a window, as returned by [`throughput`].
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Throughput {
     /// Queue name.
     pub queue: String,
@@ -327,9 +327,10 @@ pub struct Throughput {
     pub succeeded: i64,
     /// Jobs that failed for good.
     pub failed: i64,
-    /// Attempts that failed and were scheduled again, including interrupted ones.
+    /// Attempts that ran, failed and were scheduled again; interrupted attempts are not
+    /// counted, since they never finished.
     pub retried: i64,
-    /// Runs that were stopped.
+    /// Attempts that ran and were stopped.
     pub stopped: i64,
     /// Jobs that were cancelled.
     pub cancelled: i64,
@@ -394,6 +395,16 @@ pub async fn stats() -> Result<Vec<JobCount>> {
 /// # Errors
 ///
 /// Returns an error if [`init`](crate::init) has not completed or the database query fails.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// let failed = jalari::admin::JobFilter::new().state(jalari::JobState::Failed);
+/// println!("{} failed jobs", jalari::admin::count(&failed).await?);
+/// # Ok(())
+/// # }
+/// ```
 pub async fn count(filter: &JobFilter) -> Result<i64> {
     let config = config()?;
     let query = sqlx::query_scalar(AssertSqlSafe(format!(
@@ -473,7 +484,11 @@ pub async fn jobs(filter: &JobFilter, limit: u32, before: Option<JobId>) -> Resu
 pub async fn job(id: JobId) -> Result<Option<JobDetail>> {
     let config = config()?;
     let schema = &config.schema;
-    let mut connection = config.pool.pool().acquire().await?;
+    let mut connection = config
+        .pool
+        .pool()
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
     let Some(job) = load_job(&mut connection, schema, id).await? else {
         return Ok(None);
     };
@@ -543,9 +558,10 @@ pub async fn throughput(window: Duration) -> Result<Vec<Throughput>> {
         "SELECT job.queue,
              count(*) FILTER (WHERE history.state = 'succeeded') AS succeeded,
              count(*) FILTER (WHERE history.state = 'failed') AS failed,
-             count(*) FILTER (WHERE history.state = 'scheduled' AND history.attempt > 0)
-                 AS retried,
-             count(*) FILTER (WHERE history.state = 'stopped') AS stopped,
+             count(*) FILTER (WHERE history.state = 'scheduled'
+                 AND history.duration_ms IS NOT NULL) AS retried,
+             count(*) FILTER (WHERE history.state = 'stopped'
+                 AND history.duration_ms IS NOT NULL) AS stopped,
              count(*) FILTER (WHERE history.state = 'deleted') AS cancelled,
              avg(history.duration_ms)::float8 AS average_ms,
              max(history.duration_ms) AS max_ms

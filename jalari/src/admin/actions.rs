@@ -41,7 +41,9 @@ pub struct RetrySummary {
 pub enum RunNowOutcome {
     /// The job is due now; a worker runs it as soon as it can.
     Enqueued,
-    /// A worker holds the job, or its last run was interrupted less than 6 seconds ago.
+    /// A worker holds the job, or its last run was interrupted less than 6 seconds ago. Another
+    /// call holding the row for an instant, such as [`stop`](crate::stop) or a `Replace`, also
+    /// answers this; call again.
     Running,
     /// The job is stopped, succeeded, failed or deleted; [`restart`](crate::restart) a
     /// stopped job and [`retry`] a failed one instead.
@@ -55,11 +57,17 @@ pub enum RunNowOutcome {
 /// The job becomes due now with `attempts` reset to zero, so it gets its full `max_attempts`
 /// again. `last_error` stays until an attempt succeeds, the change is recorded in the job's
 /// history, and workers of its queue are notified. A job whose `job_key` is held by another
-/// waiting, running or stopped job stays failed, because two such jobs cannot share a key.
+/// waiting, running or stopped job stays failed, because two such jobs cannot share a key. A
+/// job that failed because its last attempt was interrupted waits out the 6 seconds after the
+/// interruption first, like any interrupted job, so the lost run has stopped before the new
+/// one starts.
 ///
 /// # Errors
 ///
-/// Returns an error if [`init`](crate::init) has not completed or the database query fails.
+/// Returns an error if:
+/// - The job's `job_key` was taken by a job that disappeared again before it could be named
+///   ([`JobKeyContention`](crate::ErrorKind::JobKeyContention)); call again
+/// - [`init`](crate::init) has not completed or the database query fails
 ///
 /// # Examples
 ///
@@ -252,17 +260,24 @@ async fn retry_locked(
     let retried = sqlx::query(AssertSqlSafe(format!(
         "WITH retried AS (
              UPDATE {job}
-             SET state = 'enqueued', attempts = 0, run_at = statement_timestamp(),
+             SET state = CASE WHEN last_error = $2 AND updated_at + $3 > statement_timestamp()
+                     THEN 'scheduled' ELSE 'enqueued' END,
+                 attempts = 0,
+                 run_at = CASE WHEN last_error = $2
+                     THEN greatest(statement_timestamp(), updated_at + $3)
+                     ELSE statement_timestamp() END,
                  updated_at = statement_timestamp()
              WHERE id = $1 AND state = 'failed'
-             RETURNING id
+             RETURNING id, state
          )
          INSERT INTO {job_history} (job_id, state, attempt, created_at)
-         SELECT id, 'enqueued', 0, statement_timestamp() FROM retried",
+         SELECT id, state, 0, statement_timestamp() FROM retried",
         job = schema.table("job"),
         job_history = schema.table("job_history"),
     )))
     .bind(id.0)
+    .bind(INTERRUPTED)
+    .bind(TAKEOVER_DELAY)
     .execute(&mut *attempt)
     .await;
     match retried {
