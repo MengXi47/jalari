@@ -1,10 +1,14 @@
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::AssertSqlSafe;
 
-use super::store::{lock_schedule, managed_by_code, next_run, not_found, notify_change};
+use super::store::{
+    Plan, SCHEDULE_COLUMNS, StoredSchedule, lock_schedule, managed_by_code, not_found,
+    notify_change, plan,
+};
 use crate::enqueue::{EnqueueRequest, default_queue, encode_payload, timeout_ms};
 use crate::init::config;
-use crate::{Cron, EnqueueOutcome, Job, RecurringInfo, Result};
+use crate::{EnqueueOutcome, Job, RecurringInfo, Result, Schedule};
 
 #[derive(sqlx::FromRow)]
 struct TriggerRow {
@@ -16,13 +20,32 @@ struct TriggerRow {
     context: Option<Value>,
 }
 
-/// Creates a runtime schedule that enqueues `job` on every `cron` run, or updates the one named
-/// `name`.
+#[derive(sqlx::FromRow)]
+struct InfoRow {
+    name: String,
+    #[sqlx(flatten)]
+    stored: StoredSchedule,
+    task: String,
+    queue: String,
+    enabled: bool,
+    managed: bool,
+    next_run_at: Option<DateTime<Utc>>,
+    last_run_at: Option<DateTime<Utc>>,
+    run_count: i32,
+    finished_at: Option<DateTime<Utc>>,
+    context: Option<Value>,
+}
+
+/// Creates a runtime schedule that enqueues `job` on every run of `schedule`, or updates the
+/// one named `name`.
 ///
-/// The job goes to `T`'s default queue. Every run carries the context of the surrounding
-/// [`scope`](crate::scope), if any. Updating keeps a paused schedule paused and never repeats a
-/// run that already fired. Runs are enqueued by workers with the scheduler enabled;
-/// they all wake up as soon as this commits.
+/// `schedule` is a [`Cron`](crate::Cron), an [`Interval`](crate::Interval) or a [`Schedule`]
+/// with end conditions. The job goes to `T`'s default queue. Every run carries the context of
+/// the surrounding [`scope`](crate::scope), if any. Updating keeps a paused schedule paused and
+/// never repeats a run that already fired. A changed schedule starts counting its runs again
+/// from zero and is no longer finished; an unchanged one keeps its count, its next run and its
+/// finished state, so calling this at every start of your application is safe. Runs are
+/// enqueued by workers with the scheduler enabled; they all wake up as soon as this commits.
 ///
 /// # Errors
 ///
@@ -30,6 +53,9 @@ struct TriggerRow {
 /// - `name` belongs to a schedule declared with `#[jalari::job(cron = ...)]`
 ///   ([`RecurringManagedByCode`](crate::ErrorKind::RecurringManagedByCode))
 /// - `job` cannot be serialized ([`PayloadEncodeFailed`](crate::ErrorKind::PayloadEncodeFailed))
+/// - The schedule has no run after the last one, such as a cron expression for February 30th
+///   ([`InvalidCronExpression`](crate::ErrorKind::InvalidCronExpression) or
+///   [`InvalidInterval`](crate::ErrorKind::InvalidInterval))
 /// - [`init`](crate::init) has not completed or the database query fails
 ///
 /// # Examples
@@ -48,10 +74,24 @@ struct TriggerRow {
 /// let cron = jalari::Cron::new("0 0 9 * * MON-FRI")?.timezone("Asia/Taipei")?;
 /// let digest = Digest { team: "sales".to_owned() };
 /// jalari::recurring::add_or_update("digest:sales", cron, &digest).await?;
+///
+/// let anchor = chrono::NaiveDate::from_ymd_opt(2026, 10, 3)
+///     .unwrap()
+///     .and_hms_opt(9, 0, 0)
+///     .unwrap();
+/// let every_five_days = jalari::Interval::new(5, jalari::IntervalUnit::Days, anchor)?
+///     .timezone("Asia/Taipei")?;
+/// let ten_times = jalari::Schedule::from(every_five_days).max_runs(10)?;
+/// jalari::recurring::add_or_update("digest:sales:trial", ten_times, &digest).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn add_or_update<T: Job>(name: &str, cron: Cron, job: &T) -> Result<()> {
+pub async fn add_or_update<T: Job>(
+    name: &str,
+    schedule: impl Into<Schedule>,
+    job: &T,
+) -> Result<()> {
+    let schedule = schedule.into();
     let config = config()?;
     let schema = &config.schema;
     let payload = encode_payload(job)?;
@@ -63,31 +103,42 @@ pub async fn add_or_update<T: Job>(name: &str, cron: Cron, job: &T) -> Result<()
     if existing.as_ref().is_some_and(|schedule| schedule.managed) {
         return Err(managed_by_code(name));
     }
-    let last_run_at = existing.and_then(|schedule| schedule.last_run_at);
-    let next_run_at = next_run(&mut transaction, &cron, last_run_at).await?;
+    let plan = plan(&mut transaction, existing.as_ref(), &schedule).await?;
+    let stored = schedule.stored();
     let saved: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-        "INSERT INTO {recurring} AS existing (name, cron, timezone, task, payload, queue,
-             max_attempts, timeout_ms, managed, next_run_at, context)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10)
+        "INSERT INTO {recurring} AS existing (name, {SCHEDULE_COLUMNS}, task, payload, queue,
+             max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at, context)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, $14, $15, $16,
+             $17)
          ON CONFLICT (name) DO UPDATE SET
-             cron = EXCLUDED.cron, timezone = EXCLUDED.timezone, task = EXCLUDED.task,
-             payload = EXCLUDED.payload, queue = EXCLUDED.queue,
-             max_attempts = EXCLUDED.max_attempts, timeout_ms = EXCLUDED.timeout_ms,
-             next_run_at = EXCLUDED.next_run_at, context = EXCLUDED.context,
-             updated_at = now()
+             cron = EXCLUDED.cron, timezone = EXCLUDED.timezone,
+             interval_count = EXCLUDED.interval_count, interval_unit = EXCLUDED.interval_unit,
+             anchor = EXCLUDED.anchor, until_at = EXCLUDED.until_at,
+             max_runs = EXCLUDED.max_runs, task = EXCLUDED.task, payload = EXCLUDED.payload,
+             queue = EXCLUDED.queue, max_attempts = EXCLUDED.max_attempts,
+             timeout_ms = EXCLUDED.timeout_ms, next_run_at = EXCLUDED.next_run_at,
+             run_count = EXCLUDED.run_count, finished_at = EXCLUDED.finished_at,
+             context = EXCLUDED.context, updated_at = now()
          WHERE NOT existing.managed
          RETURNING name",
         recurring = schema.table("recurring"),
     )))
     .bind(name)
-    .bind(cron.expression())
-    .bind(cron.timezone_name())
+    .bind(&stored.cron)
+    .bind(&stored.timezone)
+    .bind(stored.interval_count)
+    .bind(&stored.interval_unit)
+    .bind(stored.anchor)
+    .bind(stored.until_at)
+    .bind(stored.max_runs)
     .bind(T::NAME)
     .bind(payload)
     .bind(default_queue(T::NAME))
     .bind(T::MAX_ATTEMPTS)
     .bind(timeout_ms)
-    .bind(next_run_at)
+    .bind(plan.next_run_at)
+    .bind(plan.run_count)
+    .bind(plan.finished_at)
     .bind(&context)
     .fetch_optional(&mut *transaction)
     .await?;
@@ -99,9 +150,11 @@ pub async fn add_or_update<T: Job>(name: &str, cron: Cron, job: &T) -> Result<()
     Ok(())
 }
 
-/// Changes only the cron expression and time zone of a runtime schedule.
+/// Changes only when a runtime schedule runs, keeping its job and payload.
 ///
-/// The next run is recomputed from the new expression and is always later than the last run.
+/// The next run is recomputed from the new schedule and is always later than the last run. A
+/// changed schedule starts counting its runs again from zero and is no longer finished; an
+/// unchanged one is left as it is.
 ///
 /// # Errors
 ///
@@ -109,8 +162,12 @@ pub async fn add_or_update<T: Job>(name: &str, cron: Cron, job: &T) -> Result<()
 /// - No schedule is named `name` ([`RecurringNotFound`](crate::ErrorKind::RecurringNotFound))
 /// - The schedule is declared in code
 ///   ([`RecurringManagedByCode`](crate::ErrorKind::RecurringManagedByCode))
+/// - The schedule has no run after the last one
+///   ([`InvalidCronExpression`](crate::ErrorKind::InvalidCronExpression) or
+///   [`InvalidInterval`](crate::ErrorKind::InvalidInterval))
 /// - [`init`](crate::init) has not completed or the database query fails
-pub async fn update_schedule(name: &str, cron: Cron) -> Result<()> {
+pub async fn update_schedule(name: &str, schedule: impl Into<Schedule>) -> Result<()> {
+    let schedule = schedule.into();
     let config = config()?;
     let schema = &config.schema;
     let mut transaction = config.pool.pool().begin().await?;
@@ -120,17 +177,27 @@ pub async fn update_schedule(name: &str, cron: Cron) -> Result<()> {
     if existing.managed {
         return Err(managed_by_code(name));
     }
-    let next_run_at = next_run(&mut transaction, &cron, existing.last_run_at).await?;
+    let plan = plan(&mut transaction, Some(&existing), &schedule).await?;
+    let stored = schedule.stored();
     sqlx::query(AssertSqlSafe(format!(
         "UPDATE {recurring}
-         SET cron = $2, timezone = $3, next_run_at = $4, updated_at = now()
+         SET cron = $2, timezone = $3, interval_count = $4, interval_unit = $5, anchor = $6,
+             until_at = $7, max_runs = $8, next_run_at = $9, run_count = $10,
+             finished_at = $11, updated_at = now()
          WHERE name = $1",
         recurring = schema.table("recurring"),
     )))
     .bind(name)
-    .bind(cron.expression())
-    .bind(cron.timezone_name())
-    .bind(next_run_at)
+    .bind(&stored.cron)
+    .bind(&stored.timezone)
+    .bind(stored.interval_count)
+    .bind(&stored.interval_unit)
+    .bind(stored.anchor)
+    .bind(stored.until_at)
+    .bind(stored.max_runs)
+    .bind(plan.next_run_at)
+    .bind(plan.run_count)
+    .bind(plan.finished_at)
     .execute(&mut *transaction)
     .await?;
     notify_change(&mut transaction, schema, name).await?;
@@ -140,9 +207,10 @@ pub async fn update_schedule(name: &str, cron: Cron) -> Result<()> {
 
 /// Enqueues the schedule's job now, outside its timetable.
 ///
-/// Works for runtime and code-declared schedules, and for paused ones. It does not move the
-/// next scheduled run. The job shares the schedule's `job_key`, so while an earlier run is still
-/// waiting or running the existing job is kept and returned as [`EnqueueOutcome::Kept`].
+/// Works for runtime and code-declared schedules, and for paused or finished ones. It does not
+/// move the next scheduled run and does not count towards the schedule's run limit. The job
+/// shares the schedule's `job_key`, so while an earlier run is still waiting or running the
+/// existing job is kept and returned as [`EnqueueOutcome::Kept`].
 ///
 /// # Errors
 ///
@@ -194,7 +262,8 @@ pub async fn pause(name: &str) -> Result<()> {
 
 /// Lets a paused runtime schedule fire again.
 ///
-/// Runs missed while paused are skipped; the next run is the first one after now.
+/// Runs missed while paused are skipped; the next run is the first one after now. A schedule
+/// that reaches its end while paused, or already finished, stays finished.
 ///
 /// # Errors
 ///
@@ -239,16 +308,31 @@ pub async fn remove(name: &str) -> Result<()> {
 /// Returns an error if [`init`](crate::init) has not completed or the database query fails.
 pub async fn list() -> Result<Vec<RecurringInfo>> {
     let config = config()?;
-    let rows = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT name, cron, timezone, task, queue, enabled, managed, next_run_at,
-             last_run_at, context
+    let rows: Vec<InfoRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT name, {SCHEDULE_COLUMNS}, task, queue, enabled, managed, next_run_at,
+             last_run_at, run_count, finished_at, context
          FROM {recurring}
          ORDER BY name",
         recurring = config.schema.table("recurring"),
     )))
     .fetch_all(&config.pool.pool())
     .await?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|row| RecurringInfo {
+            name: row.name,
+            schedule: row.stored.parse().ok(),
+            task: row.task,
+            queue: row.queue,
+            enabled: row.enabled,
+            managed: row.managed,
+            next_run_at: row.next_run_at,
+            last_run_at: row.last_run_at,
+            run_count: row.run_count,
+            finished_at: row.finished_at,
+            context: row.context,
+        })
+        .collect())
 }
 
 async fn set_enabled(name: &str, enabled: bool) -> Result<()> {
@@ -261,24 +345,29 @@ async fn set_enabled(name: &str, enabled: bool) -> Result<()> {
     if existing.managed {
         return Err(managed_by_code(name));
     }
-    let next_run_at = if enabled {
-        let cron = Cron::parse(&existing.cron, &existing.timezone)?;
-        Some(next_run(&mut transaction, &cron, existing.last_run_at).await?)
+    let plan = if enabled && !existing.enabled && existing.finished_at.is_none() {
+        let schedule = existing.stored.parse()?;
+        Plan::fresh(
+            &mut transaction,
+            &schedule,
+            existing.last_run_at,
+            existing.run_count,
+        )
+        .await?
     } else {
-        None
+        Plan::kept(&existing)
     };
 
     sqlx::query(AssertSqlSafe(format!(
         "UPDATE {recurring}
-         SET enabled = $2,
-             next_run_at = CASE WHEN $2 AND NOT enabled THEN $3 ELSE next_run_at END,
-             updated_at = now()
+         SET enabled = $2, next_run_at = $3, finished_at = $4, updated_at = now()
          WHERE name = $1",
         recurring = schema.table("recurring"),
     )))
     .bind(name)
     .bind(enabled)
-    .bind(next_run_at)
+    .bind(plan.next_run_at)
+    .bind(plan.finished_at)
     .execute(&mut *transaction)
     .await?;
     notify_change(&mut transaction, schema, name).await?;

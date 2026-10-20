@@ -106,6 +106,11 @@ impl Fixture {
     }
 }
 
+fn cron_of(info: &RecurringInfo) -> (&str, &str) {
+    let cron = info.schedule.as_ref().unwrap().cron().unwrap();
+    (cron.expression(), cron.timezone_name())
+}
+
 async fn info(name: &str) -> Option<RecurringInfo> {
     recurring::list()
         .await
@@ -245,15 +250,14 @@ async fn check_declared_jobs_are_synced() {
     .await;
 
     let tick = info("r_tick").await.unwrap();
-    assert_eq!(tick.cron, "* * * * * *");
+    assert_eq!(cron_of(&tick), ("* * * * * *", "UTC"));
     assert_eq!(tick.queue, "ticks");
     assert!(tick.managed && tick.enabled);
 
     let daily = info("r_daily").await.unwrap();
-    assert_eq!(daily.cron, "0 0 3 * * *");
-    assert_eq!(daily.timezone, "Asia/Taipei");
+    assert_eq!(cron_of(&daily), ("0 0 3 * * *", "Asia/Taipei"));
     assert_eq!(daily.queue, "daily");
-    assert!(daily.next_run_at > chrono::Utc::now());
+    assert!(daily.next_run_at.unwrap() > chrono::Utc::now());
 
     assert!(info("removed_from_code").await.is_none());
     assert!(info("other_binary").await.is_some());
@@ -285,7 +289,7 @@ async fn check_code_declared_cron_cannot_change_at_runtime(fixture: &Fixture) {
         assert_eq!(error.unwrap_err().kind, ErrorKind::RecurringManagedByCode);
     }
     let tick = info("r_tick").await.unwrap();
-    assert_eq!(tick.cron, "* * * * * *");
+    assert_eq!(cron_of(&tick), ("* * * * * *", "UTC"));
     assert!(tick.enabled);
 
     fixture.disable_directly("r_tick").await;
@@ -322,8 +326,7 @@ async fn check_runtime_schedule_is_independent() {
     .await;
 
     let declared = info("r_daily").await.unwrap();
-    assert_eq!(declared.cron, "0 0 3 * * *");
-    assert_eq!(declared.timezone, "Asia/Taipei");
+    assert_eq!(cron_of(&declared), ("0 0 3 * * *", "Asia/Taipei"));
     assert!(declared.last_run_at.is_none());
     assert_eq!(executions("daily:"), 0);
 
@@ -371,8 +374,7 @@ async fn check_runtime_schedule_can_change_pause_and_cancel() {
     .await
     .unwrap();
     let report = info("report").await.unwrap();
-    assert_eq!(report.cron, "0 0 0 1 1 *");
-    assert_eq!(report.timezone, "Asia/Taipei");
+    assert_eq!(cron_of(&report), ("0 0 0 1 1 *", "Asia/Taipei"));
     assert_stops("report:second").await;
 
     recurring::update_schedule("report", every_second())
@@ -430,11 +432,11 @@ async fn check_recomputed_schedule_never_repeats_a_fired_run(fixture: &Fixture) 
     recurring::update_schedule("guarded", every_second())
         .await
         .unwrap();
-    assert!(info("guarded").await.unwrap().next_run_at > fired_run);
+    assert!(info("guarded").await.unwrap().next_run_at.unwrap() > fired_run);
 
     recurring::pause("guarded").await.unwrap();
     recurring::resume("guarded").await.unwrap();
-    assert!(info("guarded").await.unwrap().next_run_at > fired_run);
+    assert!(info("guarded").await.unwrap().next_run_at.unwrap() > fired_run);
 
     recurring::add_or_update(
         "guarded",
@@ -445,7 +447,7 @@ async fn check_recomputed_schedule_never_repeats_a_fired_run(fixture: &Fixture) 
     )
     .await
     .unwrap();
-    assert!(info("guarded").await.unwrap().next_run_at > fired_run);
+    assert!(info("guarded").await.unwrap().next_run_at.unwrap() > fired_run);
 
     recurring::remove("guarded").await.unwrap();
 }
@@ -512,7 +514,10 @@ async fn check_trigger_runs_now() {
         executions("daily:") >= 1
     })
     .await;
-    assert_eq!(info("r_daily").await.unwrap().cron, "0 0 3 * * *");
+    assert_eq!(
+        cron_of(&info("r_daily").await.unwrap()),
+        ("0 0 3 * * *", "Asia/Taipei")
+    );
 
     jalari::enqueue(&Daily {
         label: "manual".to_owned(),

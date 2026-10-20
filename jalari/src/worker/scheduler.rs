@@ -9,21 +9,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::runner::{ERROR_BACKOFF, Shared, wait};
-use crate::enqueue::{EnqueueRequest, timeout_ms};
-use crate::recurring::store::{lock_schedule, next_run};
-use crate::{Cron, Error, ErrorKind, Result};
+use crate::enqueue::{EnqueueOutcome, EnqueueRequest, timeout_ms};
+use crate::recurring::store::{Plan, SCHEDULE_COLUMNS, StoredSchedule, lock_schedule};
+use crate::{Error, ErrorKind, Result, Schedule};
 
 #[derive(sqlx::FromRow)]
 struct DueRecurring {
     name: String,
-    cron: String,
-    timezone: String,
+    #[sqlx(flatten)]
+    stored: StoredSchedule,
     task: String,
     payload: Vec<u8>,
     queue: String,
     max_attempts: i32,
     timeout_ms: Option<i32>,
     context: Option<Value>,
+    run_count: i32,
     scheduled_at: DateTime<Utc>,
     now: DateTime<Utc>,
 }
@@ -70,30 +71,33 @@ impl Shared {
                 )
             })?;
 
+            let schedule = Schedule::from(declared.cron.clone());
+            let stored = schedule.stored();
             let existing = lock_schedule(&mut transaction, schema, registration.name).await?;
-            let unchanged = existing.as_ref().filter(|schedule| {
-                schedule.managed
-                    && schedule.enabled
-                    && schedule.cron == declared.cron.expression()
-                    && schedule.timezone == declared.cron.timezone_name()
+            let unchanged = existing.as_ref().filter(|existing| {
+                existing.managed && existing.enabled && existing.stored == stored
             });
-            let next_run_at = match unchanged {
-                Some(schedule) => schedule.next_run_at,
+            let plan = match unchanged {
+                Some(existing) => Plan::kept(existing),
                 None => {
-                    let last_run_at = existing.and_then(|schedule| schedule.last_run_at);
-                    next_run(&mut transaction, &declared.cron, last_run_at).await?
+                    let last_run_at = existing.and_then(|existing| existing.last_run_at);
+                    Plan::fresh(&mut transaction, &schedule, last_run_at, 0).await?
                 }
             };
 
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {recurring} (name, cron, timezone, task, payload, queue,
-                     max_attempts, timeout_ms, managed, next_run_at)
-                 VALUES ($1, $2, $3, $1, $4, $5, $6, $7, TRUE, $8)
+                     max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at)
+                 VALUES ($1, $2, $3, $1, $4, $5, $6, $7, TRUE, $8, $9, $10)
                  ON CONFLICT (name) DO UPDATE SET
                      task = EXCLUDED.task, payload = EXCLUDED.payload, queue = EXCLUDED.queue,
                      max_attempts = EXCLUDED.max_attempts, timeout_ms = EXCLUDED.timeout_ms,
                      cron = EXCLUDED.cron, timezone = EXCLUDED.timezone,
+                     interval_count = NULL, interval_unit = NULL, anchor = NULL,
+                     until_at = NULL, max_runs = NULL,
                      next_run_at = EXCLUDED.next_run_at,
+                     run_count = EXCLUDED.run_count,
+                     finished_at = EXCLUDED.finished_at,
                      context = NULL,
                      enabled = TRUE,
                      managed = TRUE,
@@ -101,13 +105,15 @@ impl Shared {
                 recurring = schema.table("recurring"),
             )))
             .bind(registration.name)
-            .bind(declared.cron.expression())
-            .bind(declared.cron.timezone_name())
+            .bind(&stored.cron)
+            .bind(&stored.timezone)
             .bind(payload)
             .bind(registration.queue)
             .bind(registration.max_attempts)
             .bind(timeout_ms(registration.name, registration.timeout)?)
-            .bind(next_run_at)
+            .bind(plan.next_run_at)
+            .bind(plan.run_count)
+            .bind(plan.finished_at)
             .execute(&mut *transaction)
             .await?;
             declared_names.push(registration.name.to_owned());
@@ -133,8 +139,8 @@ impl Shared {
         loop {
             let mut transaction = pool.begin().await?;
             let due: Option<DueRecurring> = sqlx::query_as(AssertSqlSafe(format!(
-                "SELECT name, cron, timezone, task, payload, queue, max_attempts, timeout_ms,
-                     context, next_run_at AS scheduled_at, now() AS now
+                "SELECT name, {SCHEDULE_COLUMNS}, task, payload, queue, max_attempts,
+                     timeout_ms, context, run_count, next_run_at AS scheduled_at, now() AS now
                  FROM {recurring}
                  WHERE enabled AND next_run_at <= now() AND task = ANY($1)
                  ORDER BY next_run_at
@@ -151,8 +157,12 @@ impl Shared {
             };
 
             let after = due.now.max(due.scheduled_at);
-            match Cron::parse(&due.cron, &due.timezone).and_then(|cron| cron.next_after(after)) {
-                Ok(next_run_at) => {
+            let planned = due
+                .stored
+                .parse()
+                .and_then(|schedule| schedule.next_after(after).map(|next| (schedule, next)));
+            match planned {
+                Ok((schedule, next)) => {
                     let outcome = EnqueueRequest::recurring(
                         &due.name,
                         due.task,
@@ -164,17 +174,32 @@ impl Shared {
                     )
                     .insert(&mut transaction, schema)
                     .await?;
+                    let run_count = match outcome {
+                        EnqueueOutcome::Inserted(_) => due.run_count.saturating_add(1),
+                        _ => due.run_count,
+                    };
+                    let next_run_at = schedule.unless_ended(next, run_count);
                     sqlx::query(AssertSqlSafe(format!(
-                        "UPDATE {recurring} SET next_run_at = $2, last_run_at = $3
+                        "UPDATE {recurring}
+                         SET next_run_at = $2, last_run_at = $3, run_count = $4,
+                             finished_at = CASE WHEN $2::timestamptz IS NULL THEN now() END
                          WHERE name = $1",
                         recurring = schema.table("recurring"),
                     )))
                     .bind(&due.name)
                     .bind(next_run_at)
                     .bind(due.scheduled_at)
+                    .bind(run_count)
                     .execute(&mut *transaction)
                     .await?;
-                    debug!(recurring = %due.name, ?outcome, %next_run_at, "fired recurring job");
+                    match next_run_at {
+                        Some(next_run_at) => {
+                            debug!(recurring = %due.name, ?outcome, %next_run_at, "fired recurring job");
+                        }
+                        None => {
+                            debug!(recurring = %due.name, ?outcome, run_count, "fired the last run of a recurring job");
+                        }
+                    }
                 }
                 Err(e) => {
                     sqlx::query(AssertSqlSafe(format!(

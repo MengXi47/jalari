@@ -22,8 +22,9 @@ jalari = "0.4"
 ## Features
 
 - **Jobs** — immediate or delayed, enqueued alone or inside your own transaction.
-- **Cron** — schedules declared in code, plus schedules added, changed and removed at runtime,
-  with time zones and daylight saving handled.
+- **Cron and intervals** — cron schedules declared in code, plus cron or every-N-units
+  schedules added, changed and removed at runtime, with time zones, daylight saving and end
+  conditions (`until`, `max_runs`) handled.
 - **Deduplication and exclusion** — `job_key` keeps one job per key; `queue_key` keeps jobs
   with the same key from running at once.
 - **Retries** — exponential backoff with jitter, permanent errors, timeouts, and panics
@@ -43,7 +44,7 @@ jalari = "0.4"
 ```
    Your app                Schedules
   ┌───────────────┐      ┌───────────────┐
-  │ enqueue a job │      │  cron is due  │
+  │ enqueue a job │      │ a run is due  │
   └───────┬───────┘      └───────┬───────┘
           └──────────┬───────────┘
                      ▼
@@ -95,8 +96,8 @@ Every job moves through the same states:
   before running an interrupted job again.
 - **Crashes recover on their own.** When a worker dies, its jobs are released and another
   worker runs them again within seconds.
-- **Each cron run is enqueued once**, however many workers run the scheduler. If one stops,
-  the others keep schedules firing.
+- **Each scheduled run is enqueued once**, however many workers run the scheduler. If one
+  stops, the others keep schedules firing.
 - **Run workers where you like** — inside your web server, or as separate binaries that serve
   different queues.
 
@@ -134,8 +135,8 @@ worker.run(shutdown).await;
 
 ## Documentation
 
-- [Guide](docs/guide.md) — setup, jobs, enqueueing, cron, workers, stopping and restarting,
-  middleware, deployment and settings
+- [Guide](docs/guide.md) — setup, jobs, enqueueing, schedules, workers, stopping and
+  restarting, middleware, deployment and settings
 - [Examples](docs/guide.md#examples) — complete programs: a tour of the basics, stopping and
   restarting with checkpoints, middleware and context, and split web, worker and control
   binaries

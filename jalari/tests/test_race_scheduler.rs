@@ -470,8 +470,7 @@ async fn check_declared_sync_converges(database: &Database) -> Vec<String> {
         let converged = matching.len() == 1
             && matching[0].managed
             && matching[0].enabled
-            && matching[0].cron == expression
-            && matching[0].timezone == "UTC"
+            && matching[0].schedule == Some(jalari::Schedule::from(cron(expression, "UTC")))
             && matching[0].task == name;
         if !converged {
             violations.push(format!(
@@ -760,13 +759,12 @@ fn check_final_state(name: &str, ops: &[Done], last: Option<&RecurringInfo>) -> 
     let writers = last_candidates(&writers);
     if !writers.iter().any(|op| {
         matches!(op.kind, Kind::Add | Kind::Update)
-            && op.cron == info.cron
-            && op.timezone == info.timezone
+            && info.schedule == Some(jalari::Schedule::from(cron(&op.cron, &op.timezone)))
     }) {
         violations.push(format!(
-            "{name} ended with cron {:?} in {} which no possibly-last add_or_update or \
+            "{name} ended with schedule {:?} which no possibly-last add_or_update or \
              update_schedule set: {writers:?}",
-            info.cron, info.timezone
+            info.schedule
         ));
     }
     let switches: Vec<&Done> = ops

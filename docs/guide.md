@@ -94,6 +94,10 @@ Version 4 adds the `job_control` table and the `stopped` state, and replaces the
 table and blocks all access to it until the upgrade commits, and it waits for every running
 job to finish first. Stop the workers before upgrading, as for version 3.
 
+Version 5 adds the interval and end-condition columns to the `recurring` table. It only adds
+nullable columns and checks to that small table, so it runs quickly, but workers of an older
+release fail `init` after it, as for every version.
+
 ## Defining jobs
 
 A job is a serializable struct with an `impl Job` inside `#[jalari::job]`. Its fields are the
@@ -211,8 +215,9 @@ There are two kinds of schedules, and they never affect each other.
 
 | | Declared in code | Added at runtime |
 |---|---|---|
-| Create | `#[jalari::job(cron = "...")]` | `jalari::recurring::add_or_update(name, cron, &job)` |
+| Create | `#[jalari::job(cron = "...")]` | `jalari::recurring::add_or_update(name, schedule, &job)` |
 | Change | Edit the code and deploy | `update_schedule`, `pause`, `resume`, `remove` |
+| Schedule | Cron only | Cron or interval, with optional end conditions |
 | Arguments | `Default::default()` | Any value you pass |
 | Name | The job's `NAME` | Any name you choose |
 
@@ -248,15 +253,66 @@ jalari::recurring::resume("digest:sales").await?;
 jalari::recurring::remove("digest:sales").await?;
 ```
 
+`add_or_update` and `update_schedule` take a `jalari::Cron`, a `jalari::Interval` or a
+`jalari::Schedule`. Calling `add_or_update` with the same schedule again only updates the
+payload: the next run, the run count and a finished state are kept, so calling it at every
+start of your application is safe. A different schedule starts over.
+
 `jalari::recurring::trigger(name)` enqueues a schedule's job immediately, for either kind,
 without moving its timetable. `jalari::recurring::list()` returns every schedule with its next
-run.
+run, its run count and when it finished.
+
+### Intervals
+
+An interval runs every N units from an anchor, which cron cannot express: every 5 days from
+October 3rd stays aligned with October 3rd instead of restarting on the 1st of each month.
+
+```rust
+let anchor = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap().and_hms_opt(9, 0, 0).unwrap();
+let every_five_days = jalari::Interval::new(5, jalari::IntervalUnit::Days, anchor)?
+    .timezone("Asia/Taipei")?;
+jalari::recurring::add_or_update("digest:sales", every_five_days, &digest).await?;
+```
+
+- The anchor is a local time in the interval's time zone, `UTC` by default, and is the first
+  run. An anchor in the past is not run; the next run is the first aligned time after now.
+- Seconds, minutes and hours count absolute time from the anchor.
+- Days, weeks, months and years count on the local calendar, so each run keeps the anchor's
+  wall-clock time across daylight saving changes. A repeated local hour runs once, at its first
+  occurrence; a skipped one runs at the first valid time after the gap, as a cron does.
+- Monthly and yearly runs whose day does not exist in the target month move to that month's
+  last day, and later months use the anchor's day again: every month from January 31st runs
+  on February 28th or 29th, then on March 31st.
+- The next run is computed directly from the anchor, never by stepping through the missed
+  rounds, so a long outage costs nothing.
+
+### End conditions
+
+Both cron and interval schedules can end:
+
+```rust
+let schedule = jalari::Schedule::from(every_five_days)
+    .until(Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap())
+    .max_runs(10)?;
+jalari::recurring::add_or_update("digest:sales:trial", schedule, &digest).await?;
+```
+
+- `until` allows the last run at or before that time; `max_runs` finishes the schedule once it
+  has enqueued that many runs. Only runs the scheduler enqueued count: `trigger` does not, and
+  neither does a round skipped because the previous job was still waiting or running.
+- A finished schedule stays in the list with `finished_at` set and no `next_run_at`. It never
+  fires again, `pause` and `resume` leave it finished, and `trigger` still works.
+- `update_schedule` or `add_or_update` with a different schedule resets the run count to zero
+  and un-finishes it; the same schedule leaves it as it is.
 
 ### Cron format
 
 - Five fields (`minute hour day month weekday`) or six with seconds first.
+- The day fields also take `L` for the last day of the month or the last given weekday
+  (`5L`), `#` for the nth given weekday (`1#2`) and `W` for the weekday nearest a day
+  (`15W`).
 - Evaluated in the given IANA time zone, `UTC` by default. A repeated local hour during a
-  daylight saving change fires once; a skipped one still fires.
+  daylight saving change fires once; a skipped one fires at the first valid time after the gap.
 - After an outage, each schedule enqueues one catch-up run, not every missed one.
 - Each scheduled time is enqueued at most once, however many workers run the scheduler.
 - While a schedule's previous job is still waiting or running, no second one is added.

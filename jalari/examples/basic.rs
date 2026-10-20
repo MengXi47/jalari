@@ -204,8 +204,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for schedule in jalari::recurring::list().await? {
         println!(
-            "schedule {} [{} {}] managed={} next={}",
-            schedule.name, schedule.cron, schedule.timezone, schedule.managed, schedule.next_run_at
+            "schedule {} [{}] managed={} next={:?}",
+            schedule.name,
+            schedule
+                .schedule
+                .as_ref()
+                .map_or_else(|| "unreadable".to_owned(), ToString::to_string),
+            schedule.managed,
+            schedule.next_run_at
         );
     }
     for worker in jalari::admin::workers().await? {

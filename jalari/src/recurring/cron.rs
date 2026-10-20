@@ -1,16 +1,17 @@
-use std::str::FromStr;
-
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use croner::parser::{CronParser, Seconds, Year};
 
+use super::schedule::parse_timezone;
 use crate::{Error, ErrorKind, Result};
 
 /// Validated cron expression with the time zone it is evaluated in.
 ///
-/// Accepts five fields (minute to weekday) or six with a leading seconds field. Times are
-/// evaluated in the time zone, so daylight saving changes are handled: a repeated local hour
-/// fires once and a skipped one still fires.
+/// Accepts five fields (minute to weekday) or six with a leading seconds field. The day fields
+/// also take `L` for the last day of the month or the last given weekday (`5L`), `#` for the
+/// nth given weekday (`1#2`) and `W` for the weekday nearest a day (`15W`). Times are evaluated
+/// in the time zone, so daylight saving changes are handled: a repeated local hour fires once
+/// and a skipped one fires at the first valid time after the gap.
 ///
 /// # Examples
 ///
@@ -60,12 +61,7 @@ impl Cron {
     /// Returns an error if the name is not a known time zone
     /// ([`UnknownTimezone`](ErrorKind::UnknownTimezone)).
     pub fn timezone(mut self, timezone: &str) -> Result<Self> {
-        self.timezone = Tz::from_str(timezone).map_err(|_| {
-            Error::new(
-                ErrorKind::UnknownTimezone,
-                format!("{timezone:?} is not an IANA timezone"),
-            )
-        })?;
+        self.timezone = parse_timezone(timezone)?;
         Ok(self)
     }
 
@@ -102,6 +98,14 @@ impl Cron {
     }
 }
 
+impl PartialEq for Cron {
+    fn eq(&self, other: &Self) -> bool {
+        self.expression == other.expression && self.timezone == other.timezone
+    }
+}
+
+impl Eq for Cron {}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -128,6 +132,33 @@ mod tests {
                 .unwrap(),
             utc(2026, 10, 7, 0, 0, 10)
         );
+    }
+
+    #[test]
+    fn test_last_nth_and_nearest_weekday_fields() {
+        let after = utc(2026, 2, 1, 0, 0, 0);
+        let cases = [
+            ("0 0 0 L * *", utc(2026, 2, 28, 0, 0, 0)),
+            ("0 0 0 * * 5L", utc(2026, 2, 27, 0, 0, 0)),
+            ("0 0 0 * * 1#2", utc(2026, 2, 9, 0, 0, 0)),
+            ("0 0 0 15W * *", utc(2026, 2, 16, 0, 0, 0)),
+            ("0 0 L * *", utc(2026, 2, 28, 0, 0, 0)),
+        ];
+        for (expression, expected) in cases {
+            let cron = Cron::new(expression).unwrap();
+            assert_eq!(cron.next_after(after).unwrap(), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn test_equality_compares_expression_and_timezone() {
+        let taipei = Cron::new("0 3 * * *")
+            .unwrap()
+            .timezone("Asia/Taipei")
+            .unwrap();
+        assert_eq!(taipei, Cron::parse("0 3 * * *", "Asia/Taipei").unwrap());
+        assert_ne!(taipei, Cron::new("0 3 * * *").unwrap());
+        assert_ne!(taipei, Cron::parse("0 4 * * *", "Asia/Taipei").unwrap());
     }
 
     #[test]

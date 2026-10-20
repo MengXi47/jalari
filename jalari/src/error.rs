@@ -108,6 +108,11 @@ pub enum ErrorKind {
     InvalidCronExpression,
     /// A time zone is not a known IANA name such as `Asia/Taipei`.
     UnknownTimezone,
+    /// An [`Interval`](crate::Interval) has a count of zero, or its next run is past the
+    /// representable dates.
+    InvalidInterval,
+    /// A [`Schedule`](crate::Schedule) was given a run limit of zero.
+    InvalidSchedule,
     /// No recurring schedule has the given name.
     RecurringNotFound,
     /// The recurring schedule is declared with `#[jalari::job(cron = ...)]` and cannot be
