@@ -115,7 +115,7 @@ impl Shared {
         let mut excluded_keys: Vec<String> = Vec::new();
         for _ in 0..self.settings.max_claim_tries {
             let mut transaction = connection
-                .begin_with(AssertSqlSafe(begin_with_idle_timeout()))
+                .begin_with(AssertSqlSafe(begin_with_timeouts()))
                 .await?;
             let Some(job) = self.claim(&mut transaction, queue, &excluded_keys).await? else {
                 transaction.rollback().await?;
@@ -498,7 +498,7 @@ impl StartedAttempt {
         connection: &mut PgConnection,
         key: Option<&QueueKeyLock>,
     ) -> Result<()> {
-        let commit = format!("COMMIT; {}", begin_with_idle_timeout());
+        let commit = format!("COMMIT; {}", begin_with_timeouts());
         let sql = match key {
             Some(QueueKeyLock(lock_id)) => format!(
                 "SELECT pg_advisory_lock('{lock_id}'::bigint);
@@ -621,9 +621,11 @@ pub(crate) async fn mark_interrupted(
     Ok(!marked.is_empty())
 }
 
-fn begin_with_idle_timeout() -> String {
+fn begin_with_timeouts() -> String {
     format!(
-        "BEGIN; SET LOCAL idle_in_transaction_session_timeout = {}",
+        "BEGIN; SET LOCAL idle_in_transaction_session_timeout = {};
+         SELECT set_config('transaction_timeout', '0', true)
+         WHERE current_setting('transaction_timeout', true) IS NOT NULL",
         IDLE_SESSION_TIMEOUT.as_millis()
     )
 }

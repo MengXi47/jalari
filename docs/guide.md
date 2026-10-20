@@ -356,7 +356,7 @@ is not frozen for several seconds, for example by a virtual machine pause.
 
 The same check keeps a long job's transaction busy, so `idle_in_transaction_session_timeout`
 never ends it while the job is still running. jalari sets that timeout to 10 seconds on the
-job's own transaction, overriding the server default: if a worker freezes or the network fails
+job's own transaction, overriding the pool's setting: if a worker freezes or the network fails
 without closing the connection, PostgreSQL ends the session after 10 seconds without a check,
 and another worker takes the job over about 16 seconds after the failure instead of waiting
 for TCP keepalives.
@@ -609,6 +609,25 @@ let pool = PgPoolOptions::new()
     .connect(&url)
     .await?;
 ```
+
+The pool given to `jalari::init` may set session options such as `statement_timeout`, for
+example as `-c` startup options. jalari never changes a connection's session settings. It only
+uses `SET LOCAL`, which ends with its own transaction, so every connection returns to the pool
+with the values it had.
+
+- A running job keeps one transaction open for its whole run. jalari sets
+  `idle_in_transaction_session_timeout` to 10 seconds in that transaction and turns off
+  `transaction_timeout` on PostgreSQL 17 and later, so neither setting on the pool limits how
+  long a job may run.
+- Every other jalari statement runs under the pool's settings, `statement_timeout` included.
+  None of them waits for long on its own. Jobs that share a `queue_key` are skipped while the
+  key is taken, not waited for.
+- An enqueue with a `job_key` waits while another open transaction is inserting or replacing
+  a job with the same key, for example your own transaction that called `jalari::enqueue_in`.
+  It fails with `jalari::ErrorKind::QueryCanceled` if the wait outlasts `statement_timeout`.
+- `jalari::migrate` waits for a concurrent migration, and an upgrade waits for running jobs as
+  described in [Creating the tables](#creating-the-tables). Give it a pool without a short
+  `statement_timeout`, or apply the SQL from `jalari sql` with your own migration tool.
 
 A job's writes to your own tables commit separately from jalari marking it done. If the worker
 dies in between, the job runs again, so make those writes idempotent, for example with a table
