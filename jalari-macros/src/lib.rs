@@ -1,4 +1,6 @@
 mod fingerprint;
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 

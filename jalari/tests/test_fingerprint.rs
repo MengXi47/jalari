@@ -1,30 +1,87 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
-use jalari::admin::{self, JobFilter, RetryOutcome, StrandedJobs};
+use chrono::{DateTime, Utc};
+use jalari::admin::{self, JobFilter, RetryOutcome, RunNowOutcome, StrandedJobs};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{
-    EnqueueOptions, EnqueueOutcome, Interval, IntervalUnit, Job, JobId, JobResult, OnConflict,
-    Worker, recurring,
+    Cron, EnqueueOptions, EnqueueOutcome, Interval, IntervalUnit, Job, JobId, JobResult,
+    OnConflict, Worker, recurring,
 };
 use serde::{Deserialize, Serialize};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 use common::{Database, RunningWorker, wait_until, worker_config};
 
 const QUEUE: &str = "fingerprint";
+const UNSERVED: &str = "fp_unserved";
 const PINNED: &str = "fp_pinned";
 const UNPINNED: &str = "fp_unpinned";
+const ELSEWHERE: &str = "fp_elsewhere";
 const OTHER: &str = "0123456789abcdef0123456789abcdef";
 const WAIT: Duration = Duration::from_secs(20);
+const ANOTHER_BUILD: &str = "no live worker runs these jobs, enqueued by another build of the task";
+const UNKNOWN_TASK: &str = "no live worker knows this task";
 
 static RAN: LazyLock<Mutex<BTreeSet<String>>> = LazyLock::new(|| Mutex::new(BTreeSet::new()));
+static WARNINGS: LazyLock<Mutex<Vec<BTreeMap<String, String>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn ran(label: &str) -> bool {
     RAN.lock().unwrap().contains(label)
+}
+
+#[derive(Default)]
+struct Fields(BTreeMap<String, String>);
+
+impl Visit for Fields {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+}
+
+struct CaptureWarnings;
+
+impl Subscriber for CaptureWarnings {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() == Level::WARN
+    }
+
+    fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        WARNINGS.lock().unwrap().push(fields.0);
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+fn warned(queue: &str, task: &str, message: &str) -> bool {
+    WARNINGS.lock().unwrap().iter().any(|fields| {
+        fields.get("queue").map(String::as_str) == Some(queue)
+            && fields.get("task").map(String::as_str) == Some(task)
+            && fields.get("message").map(String::as_str) == Some(message)
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,30 +120,49 @@ fn pinned(label: &str) -> Pinned {
     }
 }
 
-async fn insert(
-    database: &Database,
-    task: &str,
-    label: &str,
-    state: &str,
-    fingerprint: Option<&str>,
-    job_key: Option<&str>,
-) -> JobId {
-    let id: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-        "INSERT INTO {} (queue, task, payload, state, max_attempts, fingerprint, job_key)
-         VALUES ($1, $2, $3, $4, 3, $5, $6)
-         RETURNING id",
-        database.table("job")
-    )))
-    .bind(QUEUE)
-    .bind(task)
-    .bind(serde_json::to_vec(&serde_json::json!({ "label": label })).unwrap())
-    .bind(state)
-    .bind(fingerprint)
-    .bind(job_key)
-    .fetch_one(&database.pool)
-    .await
-    .unwrap();
-    JobId(id)
+struct Row<'a> {
+    queue: &'a str,
+    task: &'a str,
+    label: &'a str,
+    state: &'a str,
+    fingerprint: Option<&'a str>,
+    job_key: Option<&'a str>,
+    due_in_hours: i32,
+}
+
+impl<'a> Row<'a> {
+    fn new(task: &'a str, label: &'a str, fingerprint: Option<&'a str>) -> Self {
+        Self {
+            queue: QUEUE,
+            task,
+            label,
+            state: "enqueued",
+            fingerprint,
+            job_key: None,
+            due_in_hours: 0,
+        }
+    }
+
+    async fn insert(self, database: &Database) -> JobId {
+        let id: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+            "INSERT INTO {} (queue, task, payload, state, max_attempts, fingerprint, job_key,
+                 run_at)
+             VALUES ($1, $2, $3, $4, 3, $5, $6, now() + make_interval(hours => $7))
+             RETURNING id",
+            database.table("job")
+        )))
+        .bind(self.queue)
+        .bind(self.task)
+        .bind(serde_json::to_vec(&serde_json::json!({ "label": self.label })).unwrap())
+        .bind(self.state)
+        .bind(self.fingerprint)
+        .bind(self.job_key)
+        .bind(self.due_in_hours)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        JobId(id)
+    }
 }
 
 async fn fingerprint_of(id: JobId) -> Option<String> {
@@ -98,27 +174,27 @@ async fn state_of(id: JobId) -> (String, i32) {
     (job.state.as_str().to_owned(), job.attempts)
 }
 
-fn summary(groups: &[StrandedJobs]) -> Vec<(String, String, Option<String>, i64)> {
-    groups
-        .iter()
-        .map(|group| {
-            (
-                group.queue.clone(),
-                group.task.clone(),
-                group.fingerprint.clone(),
-                group.count,
-            )
-        })
-        .collect()
+async fn updated_at(id: JobId) -> DateTime<Utc> {
+    admin::job(id).await.unwrap().unwrap().job.updated_at
 }
 
-fn stranded_row(task: &str, fingerprint: Option<&str>) -> (String, String, Option<String>, i64) {
+type Group = (String, String, Option<String>, i64);
+
+fn group(queue: &str, task: &str, fingerprint: Option<&str>, count: i64) -> Group {
     (
-        QUEUE.to_owned(),
+        queue.to_owned(),
         task.to_owned(),
         fingerprint.map(str::to_owned),
-        1,
+        count,
     )
+}
+
+async fn stranded() -> Vec<Group> {
+    let groups: Vec<StrandedJobs> = admin::stranded().await.unwrap();
+    groups
+        .into_iter()
+        .map(|found| (found.queue, found.task, found.fingerprint, found.count))
+        .collect()
 }
 
 async fn add_worker_row(database: &Database, tasks: Option<serde_json::Value>) -> String {
@@ -146,8 +222,20 @@ async fn remove_worker_row(database: &Database, id: &str) {
     .unwrap();
 }
 
+async fn listening(database: &Database) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+             WHERE application_name = $1 AND query ILIKE 'LISTEN%')",
+    )
+    .bind(&database.schema_name)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn test_fingerprint() {
+    tracing::subscriber::set_global_default(CaptureWarnings).unwrap();
     let Some(database) = Database::start("fingerprint", 12).await else {
         return;
     };
@@ -179,14 +267,11 @@ async fn test_fingerprint() {
     };
     assert_eq!(fingerprint_of(unpinned).await, None);
 
-    let foreign = insert(
-        &database,
-        PINNED,
-        "foreign",
-        "enqueued",
-        Some(OTHER),
-        Some("k"),
-    )
+    let foreign = Row {
+        job_key: Some("k"),
+        ..Row::new(PINNED, "foreign", Some(OTHER))
+    }
+    .insert(&database)
     .await;
     let outcome = jalari::enqueue_with(
         &pinned("replaced"),
@@ -199,38 +284,31 @@ async fn test_fingerprint() {
     assert_eq!(outcome, EnqueueOutcome::Replaced(foreign));
     assert_eq!(fingerprint_of(foreign).await.as_deref(), Some(registered));
 
-    insert(&database, PINNED, "no fingerprint", "enqueued", None, None).await;
-    insert(
-        &database,
-        PINNED,
-        "same build",
-        "enqueued",
-        Some(registered),
-        None,
-    )
-    .await;
-    let waiting = insert(
-        &database,
-        PINNED,
-        "other build",
-        "enqueued",
-        Some(OTHER),
-        None,
-    )
-    .await;
-    insert(
-        &database,
-        UNPINNED,
-        "unpinned other build",
-        "enqueued",
-        Some(OTHER),
-        None,
-    )
+    Row::new(PINNED, "no fingerprint", None)
+        .insert(&database)
+        .await;
+    Row::new(PINNED, "same build", Some(registered))
+        .insert(&database)
+        .await;
+    let waiting = Row::new(PINNED, "other build", Some(OTHER))
+        .insert(&database)
+        .await;
+    Row::new(UNPINNED, "unpinned other build", Some(OTHER))
+        .insert(&database)
+        .await;
+    Row::new(ELSEWHERE, "unknown task", None)
+        .insert(&database)
+        .await;
+    let unserved = Row {
+        queue: UNSERVED,
+        ..Row::new(PINNED, "unserved queue", Some(registered))
+    }
+    .insert(&database)
     .await;
 
     let worker = Worker::builder()
         .queue(QUEUE, 4)
-        .config(worker_config(Duration::from_millis(100)))
+        .config(worker_config(Duration::from_secs(30)))
         .build()
         .await
         .unwrap();
@@ -247,6 +325,7 @@ async fn test_fingerprint() {
         expected.iter().all(|label| ran(label))
     })
     .await;
+    wait_until("the listener to subscribe", WAIT, || listening(&database)).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!ran("other build"));
     assert_eq!(state_of(waiting).await, ("enqueued".to_owned(), 0));
@@ -262,31 +341,103 @@ async fn test_fingerprint() {
     );
 
     let groups = admin::stranded().await.unwrap();
-    assert_eq!(summary(&groups), [stranded_row(PINNED, Some(OTHER))]);
-    assert!(groups[0].since <= Utc::now());
-
-    let old_build = add_worker_row(&database, Some(serde_json::json!({ PINNED: OTHER }))).await;
-    assert!(admin::stranded().await.unwrap().is_empty());
-    remove_worker_row(&database, &old_build).await;
-    let old_release = add_worker_row(&database, None).await;
-    assert!(admin::stranded().await.unwrap().is_empty());
-    remove_worker_row(&database, &old_release).await;
+    assert!(groups.iter().all(|found| found.since <= Utc::now()));
     assert_eq!(
-        summary(&admin::stranded().await.unwrap()),
-        [stranded_row(PINNED, Some(OTHER))]
+        stranded().await,
+        [
+            group(QUEUE, ELSEWHERE, None, 1),
+            group(QUEUE, PINNED, Some(OTHER), 1),
+            group(UNSERVED, PINNED, Some(registered), 1),
+        ]
     );
-
-    let released = admin::clear_fingerprint(&JobFilter::new().task(PINNED))
-        .await
-        .unwrap();
-    assert_eq!(released, 1);
-    wait_until("the released job to run", WAIT, || async {
-        ran("other build")
+    wait_until("the worker to warn about stranded jobs", WAIT, || async {
+        warned(QUEUE, PINNED, ANOTHER_BUILD) && warned(QUEUE, ELSEWHERE, UNKNOWN_TASK)
     })
     .await;
-    assert!(admin::stranded().await.unwrap().is_empty());
+    assert!(
+        !WARNINGS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|fields| fields.get("queue").map(String::as_str) == Some(UNSERVED)),
+        "a worker only warns about its own queues"
+    );
+
+    let old_build = add_worker_row(&database, Some(serde_json::json!({ PINNED: OTHER }))).await;
     assert_eq!(
-        admin::clear_fingerprint(&JobFilter::new().task(PINNED))
+        stranded().await,
+        [
+            group(QUEUE, ELSEWHERE, None, 1),
+            group(UNSERVED, PINNED, Some(registered), 1),
+        ]
+    );
+    remove_worker_row(&database, &old_build).await;
+    let old_release = add_worker_row(&database, None).await;
+    let listed = admin::workers().await.unwrap();
+    let old = listed
+        .iter()
+        .find(|worker| worker.id == old_release)
+        .expect("the old release worker is listed");
+    assert!(old.tasks.is_empty());
+    assert_eq!(
+        stranded().await,
+        [group(UNSERVED, PINNED, Some(registered), 1)]
+    );
+    remove_worker_row(&database, &old_release).await;
+
+    let later = Row {
+        due_in_hours: 1,
+        state: "scheduled",
+        ..Row::new(PINNED, "run now", Some(OTHER))
+    }
+    .insert(&database)
+    .await;
+    assert_eq!(
+        admin::run_now(later).await.unwrap(),
+        RunNowOutcome::Enqueued
+    );
+    assert_eq!(fingerprint_of(later).await.as_deref(), Some(OTHER));
+    assert!(
+        stranded()
+            .await
+            .contains(&group(QUEUE, PINNED, Some(OTHER), 2))
+    );
+
+    let stopped = Row {
+        state: "stopped",
+        ..Row::new(PINNED, "stopped", Some(OTHER))
+    }
+    .insert(&database)
+    .await;
+    let failed = Row {
+        state: "failed",
+        ..Row::new(PINNED, "failed", Some(OTHER))
+    }
+    .insert(&database)
+    .await;
+    let stopped_updated_at = updated_at(stopped).await;
+    let released = admin::clear_fingerprint(&JobFilter::new().task(PINNED).queue(QUEUE))
+        .await
+        .unwrap();
+    assert_eq!(released, 3);
+    assert_eq!(fingerprint_of(stopped).await, None);
+    assert_eq!(updated_at(stopped).await, stopped_updated_at);
+    assert_eq!(state_of(stopped).await.0, "stopped");
+    assert_eq!(fingerprint_of(failed).await.as_deref(), Some(OTHER));
+    assert_eq!(fingerprint_of(unserved).await.as_deref(), Some(registered));
+    wait_until("the released jobs to run", WAIT, || async {
+        ran("other build") && ran("run now")
+    })
+    .await;
+    assert_eq!(
+        stranded().await,
+        [
+            group(QUEUE, ELSEWHERE, None, 1),
+            group(UNSERVED, PINNED, Some(registered), 1),
+        ]
+    );
+    assert_eq!(
+        admin::clear_fingerprint(&JobFilter::new().task(PINNED).queue(QUEUE))
             .await
             .unwrap(),
         0
@@ -312,28 +463,27 @@ async fn test_fingerprint() {
             .all(|fingerprint| fingerprint.as_deref() == Some(registered))
     );
 
-    let yearly = jalari::Cron::new("0 0 0 1 1 *").unwrap();
-    recurring::add_or_update("fp_manual", yearly, &pinned("triggered"))
-        .await
-        .unwrap();
+    recurring::add_or_update(
+        "fp_manual",
+        Cron::new("0 0 0 1 1 *").unwrap(),
+        &pinned("triggered"),
+    )
+    .await
+    .unwrap();
     let EnqueueOutcome::Inserted(triggered) = recurring::trigger("fp_manual").await.unwrap() else {
         panic!("a trigger with nothing pending inserts");
     };
     assert_eq!(fingerprint_of(triggered).await.as_deref(), Some(registered));
     wait_until("the triggered run", WAIT, || async { ran("triggered") }).await;
 
-    let failed = insert(&database, PINNED, "retried", "failed", Some(OTHER), None).await;
-    assert_eq!(admin::retry(failed).await.unwrap(), RetryOutcome::Retried);
-    assert_eq!(fingerprint_of(failed).await.as_deref(), Some(registered));
-    wait_until("the retried job to run", WAIT, || async { ran("retried") }).await;
-
     sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO {} (name, cron, timezone, task, payload, queue, max_attempts, managed,
              next_run_at)
-         VALUES ('fp_unknown', '0 0 0 1 1 *', 'UTC', 'fp_elsewhere', 'null', $1, 1, FALSE,
+         VALUES ('fp_unknown', '0 0 0 1 1 *', 'UTC', $1, 'null', $2, 1, FALSE,
              now() + interval '1 day')",
         database.table("recurring")
     )))
+    .bind(ELSEWHERE)
     .bind(QUEUE)
     .execute(&database.pool)
     .await
@@ -343,9 +493,50 @@ async fn test_fingerprint() {
         panic!("a trigger with nothing pending inserts");
     };
     assert_eq!(fingerprint_of(elsewhere).await, None);
+
+    let retried = Row {
+        state: "failed",
+        ..Row::new(PINNED, "retried", Some(OTHER))
+    }
+    .insert(&database)
+    .await;
+    assert_eq!(admin::retry(retried).await.unwrap(), RetryOutcome::Retried);
+    assert_eq!(fingerprint_of(retried).await.as_deref(), Some(registered));
+    wait_until("the retried job to run", WAIT, || async { ran("retried") }).await;
+
+    let kept = Row {
+        state: "failed",
+        ..Row::new(ELSEWHERE, "kept", Some(OTHER))
+    }
+    .insert(&database)
+    .await;
+    assert_eq!(admin::retry(kept).await.unwrap(), RetryOutcome::Retried);
+    assert_eq!(fingerprint_of(kept).await.as_deref(), Some(OTHER));
+
+    let kept_in_batch = Row {
+        state: "failed",
+        ..Row::new(ELSEWHERE, "kept in batch", Some(OTHER))
+    }
+    .insert(&database)
+    .await;
+    let summary = admin::retry_failed(&JobFilter::new().queue(QUEUE))
+        .await
+        .unwrap();
+    assert_eq!(summary.retried, 2);
+    assert_eq!(fingerprint_of(failed).await.as_deref(), Some(registered));
+    assert_eq!(fingerprint_of(kept_in_batch).await.as_deref(), Some(OTHER));
+    wait_until("the batch-retried job to run", WAIT, || async {
+        ran("failed")
+    })
+    .await;
+
     assert_eq!(
-        summary(&admin::stranded().await.unwrap()),
-        [stranded_row("fp_elsewhere", None)]
+        stranded().await,
+        [
+            group(QUEUE, ELSEWHERE, None, 2),
+            group(QUEUE, ELSEWHERE, Some(OTHER), 2),
+            group(UNSERVED, PINNED, Some(registered), 1),
+        ]
     );
 
     running.stop().await;

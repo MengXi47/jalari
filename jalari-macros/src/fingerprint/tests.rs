@@ -920,3 +920,383 @@ fn test_measure_reach_over_this_repository() {
     }
     assert!(measured > 0);
 }
+
+#[test]
+fn test_macro_tokens_feed_member_names() {
+    let base = source(
+        "println!(\"{}\", self.client.ping());",
+        "struct Client;\nimpl Client {\n    fn ping(&self) -> u32 { 1 }\n    fn other(&self) -> u32 { 1 }\n}",
+    )
+    .replace("count: u32,", "client: Client,");
+    assert_ne!(
+        lib(&base),
+        lib(&base.replace("fn ping(&self) -> u32 { 1 }", "fn ping(&self) -> u32 { 2 }"))
+    );
+    assert_eq!(
+        lib(&base),
+        lib(&base.replace(
+            "fn other(&self) -> u32 { 1 }",
+            "fn other(&self) -> u32 { 2 }"
+        ))
+    );
+}
+
+#[test]
+fn test_job_trait_bound_does_not_join_jobs() {
+    let shared =
+        "pub trait Job {\n    fn run(self);\n}\npub fn enqueue<T: Job>(job: &T) -> u32 { 1 }";
+    let build = |k_body: &str| {
+        let text = format!(
+            "use shared::Job;\n\nstruct J;\n\nimpl Job for J {{\n    fn run(self) {{\n        shared::enqueue(&self);\n    }}\n}}\n\nstruct K;\n\nimpl Job for K {{\n    fn run(self) {{\n        {k_body}\n    }}\n}}\n"
+        );
+        let workspace = with_shared(&text, shared);
+        let item: syn::ItemImpl = syn::parse_str(
+            "impl Job for J {\n    fn run(self) {\n        shared::enqueue(&self);\n    }\n}",
+        )
+        .unwrap();
+        fingerprint(
+            &Index::build(&workspace),
+            &workspace,
+            &JobSite {
+                item: &item,
+                file: Some("src/lib.rs"),
+            },
+            VERSION,
+        )
+    };
+    assert_eq!(build("let _ = 1;"), build("let _ = 2;"));
+}
+
+#[test]
+fn test_implemented_trait_does_not_open_sibling_impls() {
+    let base = source(
+        "",
+        "mod store {\n    pub trait Store {\n        fn save(&self) -> u32;\n    }\n}\nuse store::Store;\nstruct Pg;\nstruct Memory;\nimpl Store for Pg {\n    fn save(&self) -> u32 { 1 }\n}\nimpl Store for Memory {\n    fn save(&self) -> u32 { 10 }\n}",
+    )
+    .replace("count: u32,", "pg: Pg,");
+    assert_eq!(lib(&base), lib(&base.replace("{ 10 }", "{ 20 }")));
+    assert_ne!(lib(&base), lib(&base.replace("{ 1 }", "{ 2 }")));
+}
+
+#[test]
+fn test_impl_without_local_gate_is_always_open() {
+    let rest = "impl Generated {\n    pub fn make() -> u32 { 1 }\n}";
+    assert_ne!(
+        job("Generated::make();", rest),
+        job("Generated::make();", &rest.replace("{ 1 }", "{ 2 }"))
+    );
+}
+
+#[test]
+fn test_path_attribute_module_is_followed() {
+    let text = source("helper();", "#[path = \"custom/place.rs\"]\nmod helpers;");
+    let build = |body: &str| {
+        of(&single(&[
+            ("src/lib.rs", &text),
+            ("src/custom/place.rs", body),
+        ]))
+    };
+    assert_ne!(
+        build("pub fn helper() -> u32 { 1 }"),
+        build("pub fn helper() -> u32 { 2 }")
+    );
+}
+
+#[test]
+fn test_nested_mod_rs_modules_are_followed() {
+    let text = source("a::b::helper();", "mod a;");
+    let build = |body: &str| {
+        of(&single(&[
+            ("src/lib.rs", &text),
+            ("src/a/mod.rs", "pub mod b;"),
+            ("src/a/b.rs", body),
+        ]))
+    };
+    assert_ne!(
+        build("pub fn helper() -> u32 { 1 }"),
+        build("pub fn helper() -> u32 { 2 }")
+    );
+}
+
+#[test]
+fn test_every_root_holding_the_file_is_analysed() {
+    let jobs = source("from_lib();\n        from_main();", "");
+    let build = |lib_body: &str, main_body: &str| {
+        let workspace = single(&[
+            ("src/lib.rs", &format!("mod jobs;\n{lib_body}")),
+            (
+                "src/main.rs",
+                &format!("mod jobs;\n{main_body}\nfn main() {{}}"),
+            ),
+            ("src/jobs.rs", &jobs),
+        ]);
+        job_at(&workspace, "src/jobs.rs", "J", VERSION)
+    };
+    let base = build("fn from_lib() -> u32 { 1 }", "fn from_main() -> u32 { 1 }");
+    assert_ne!(
+        base,
+        build("fn from_lib() -> u32 { 2 }", "fn from_main() -> u32 { 1 }")
+    );
+    assert_ne!(
+        base,
+        build("fn from_lib() -> u32 { 1 }", "fn from_main() -> u32 { 2 }")
+    );
+}
+
+#[test]
+fn test_shared_module_counts_once_across_roots() {
+    let common = source("helper();", "fn helper() -> u32 { 1 }");
+    let build = |roots: &[&str]| {
+        let mut workspace = single(&[
+            ("examples/first.rs", "mod common;\nfn main() {}"),
+            ("examples/second.rs", "mod common;\nfn main() {}"),
+            ("examples/common.rs", &common),
+        ]);
+        workspace.crates[0].roots = roots.iter().map(|root| (*root).to_owned()).collect();
+        job_at(&workspace, "examples/common.rs", "J", VERSION)
+    };
+    assert_eq!(
+        build(&["examples/first.rs"]),
+        build(&["examples/first.rs", "examples/second.rs"])
+    );
+}
+
+#[test]
+fn test_impl_missing_from_the_file_falls_back() {
+    let workspace = single(&[("src/lib.rs", &source("", "fn other() -> u32 { 1 }"))]);
+    let index = Index::build(&workspace);
+    let item: syn::ItemImpl =
+        syn::parse_str("impl Job for Elsewhere {\n    const NAME: &'static str = \"e\";\n}")
+            .unwrap();
+    let at = |file: Option<&str>| {
+        fingerprint(&index, &workspace, &JobSite { item: &item, file }, VERSION)
+    };
+    assert_eq!(at(Some("src/lib.rs")), at(None));
+}
+
+#[test]
+fn test_fallback_pins_every_registry_dependency() {
+    let app = source("", "");
+    let whole_of = |lock: &str| whole(&with_registry(&app, lock), None, VERSION);
+    assert_ne!(whole_of(LOCK), whole_of(&LOCK.replace("0.12.0", "0.12.1")));
+}
+
+#[test]
+fn test_renamed_registry_dependency_pins_its_package() {
+    let app = source("json::to_vec(&self.count);", "");
+    let build = |lock: &str| {
+        let mut workspace = single(&[("src/lib.rs", &app)]);
+        workspace.crates[0].deps.insert(
+            "json".to_owned(),
+            Dependency::Registry("serde_json".to_owned()),
+        );
+        workspace.lock = Some(Lock::parse(lock));
+        of(&workspace)
+    };
+    assert_ne!(build(LOCK), build(&LOCK.replace("1.0.1", "1.0.2")));
+}
+
+#[test]
+fn test_glob_import_pins_registry_crate() {
+    let app = source("to_vec(&self.count);", "use serde_json::*;");
+    assert_ne!(
+        of(&with_registry(&app, LOCK)),
+        of(&with_registry(&app, &LOCK.replace("1.0.1", "1.0.2"))),
+    );
+}
+
+#[test]
+fn test_path_package_is_never_pinned() {
+    let app = source("shared::compute();", "");
+    let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"shared\",\n]\n\n[[package]]\nname = \"shared\"\nversion = \"0.1.0\"\n";
+    let build = |lock: &str| {
+        let mut workspace = with_shared(&app, "pub fn compute() -> u32 { 1 }");
+        workspace.lock = Some(Lock::parse(lock));
+        of(&workspace)
+    };
+    assert_eq!(build(lock), build(&lock.replace("0.1.0", "0.2.0")));
+}
+
+#[test]
+fn test_extern_crate_roots_path_dependency() {
+    let app = source("compute();", "extern crate shared as renamed;");
+    assert_ne!(
+        of(&with_shared(&app, "pub fn compute() -> u32 { 1 }")),
+        of(&with_shared(&app, "pub fn compute() -> u32 { 2 }")),
+    );
+}
+
+#[test]
+fn test_use_inside_a_function_roots_path_dependency() {
+    let app = source("compute();", "fn unrelated() {\n    use shared::thing;\n}");
+    assert_ne!(
+        of(&with_shared(&app, "pub fn compute() -> u32 { 1 }")),
+        of(&with_shared(&app, "pub fn compute() -> u32 { 2 }")),
+    );
+}
+
+#[test]
+fn test_item_macro_is_reached_through_its_own_tokens() {
+    let rest = "lazy! {\n    static COUNTER: u32 = 1;\n}";
+    assert_ne!(
+        job("let _ = COUNTER;", rest),
+        job("let _ = COUNTER;", &rest.replace("= 1", "= 2"))
+    );
+}
+
+#[test]
+fn test_unlexable_file_is_always_reached() {
+    let text = source("", "mod broken;");
+    let build = |body: &str| of(&single(&[("src/lib.rs", &text), ("src/broken.rs", body)]));
+    assert_ne!(build("fn x() { \"open 1"), build("fn x() { \"open 2"));
+}
+
+#[test]
+fn test_loader_resolves_a_relative_local_file() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fingerprint/app");
+    let absolute = manifest.join("src/lib.rs");
+    let relative = Path::new("tests/fixtures/fingerprint/app/src/lib.rs");
+    assert_eq!(
+        env::current_dir().unwrap().join(relative),
+        absolute,
+        "cargo runs unit tests from the package directory"
+    );
+    let item = find_job(&fs::read_to_string(&absolute).unwrap(), "UsesHelper");
+    assert_eq!(
+        load::fingerprint_at(Some(&manifest), Some(relative), &item),
+        load::fingerprint_at(Some(&manifest), Some(&absolute), &item)
+    );
+}
+
+#[test]
+fn test_loader_fingerprint_uses_the_jalari_version() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fingerprint/app");
+    let file = manifest.join("src/lib.rs");
+    let item = find_job(&fs::read_to_string(&file).unwrap(), "Standalone");
+    let workspace = load::load(&manifest);
+    let index = Index::build(&workspace);
+    let site = JobSite {
+        item: &item,
+        file: Some("src/lib.rs"),
+    };
+    let loaded = load::fingerprint_at(Some(&manifest), Some(&file), &item);
+    assert_eq!(
+        loaded,
+        fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
+    );
+    assert_ne!(loaded, fingerprint(&index, &workspace, &site, "0.0.0"));
+}
+
+fn write(path: &Path, text: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
+}
+
+#[test]
+fn test_loader_reads_targets_dependencies_and_skips_build_output() {
+    let base = env::temp_dir().join(format!("jalari-fingerprint-manifest-{}", process::id()));
+    let app = base.join("app");
+    write(
+        &app.join("Cargo.toml"),
+        "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nname = \"custom_lib\"\npath = \"lib/root.rs\"\n\n[[bin]]\nname = \"run\"\npath = \"tools/run.rs\"\n\n[dependencies]\njson = { package = \"serde_json\", version = \"1\" }\nlocal-dep = { path = \"../local\" }\n\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n\n[dev-dependencies]\ntempo = \"1\"\n",
+    );
+    for file in [
+        "lib/root.rs",
+        "tools/run.rs",
+        "tests/check.rs",
+        "target/debug/build.rs",
+        ".git/hook.rs",
+        "nested/src/lib.rs",
+    ] {
+        write(&app.join(file), "fn f() {}");
+    }
+    write(
+        &app.join("nested/Cargo.toml"),
+        "[package]\nname = \"nested\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        &base.join("local/Cargo.toml"),
+        "[package]\nname = \"local-dep\"\nversion = \"0.1.0\"\n",
+    );
+    write(&base.join("local/src/lib.rs"), "pub fn f() {}");
+
+    let workspace = load::load(&app);
+    fs::remove_dir_all(&base).unwrap();
+    let primary = &workspace.crates[0];
+    assert_eq!(primary.package, "my-app");
+    assert_eq!(
+        primary.roots,
+        ["lib/root.rs", "tests/check.rs", "tools/run.rs"]
+    );
+    assert_eq!(
+        primary.files.keys().collect::<Vec<_>>(),
+        ["lib/root.rs", "tests/check.rs", "tools/run.rs"]
+    );
+    let lib = match primary.deps.get("custom_lib") {
+        Some(Dependency::Path(index)) => *index,
+        other => panic!("the package's own lib is a path dependency, got {other:?}"),
+    };
+    assert_eq!(workspace.crates[lib].roots, ["lib/root.rs"]);
+    let local = match primary.deps.get("local_dep") {
+        Some(Dependency::Path(index)) => *index,
+        other => panic!("a path dependency is loaded, got {other:?}"),
+    };
+    assert_eq!(workspace.crates[local].package, "local-dep");
+    assert_eq!(workspace.crates[local].roots, ["src/lib.rs"]);
+    let registry = |name: &str| Some(Dependency::Registry(name.to_owned()));
+    assert_eq!(primary.deps.get("json").cloned(), registry("serde_json"));
+    assert_eq!(primary.deps.get("libc").cloned(), registry("libc"));
+    assert_eq!(primary.deps.get("tempo").cloned(), registry("tempo"));
+    assert_eq!(workspace.crates[lib].deps.get("tempo"), None);
+    assert_eq!(
+        workspace.crates[lib].deps.get("json").cloned(),
+        registry("serde_json")
+    );
+}
+
+#[test]
+fn test_loader_resolves_workspace_dependencies_per_package() {
+    let base = env::temp_dir().join(format!("jalari-fingerprint-shared-{}", process::id()));
+    write(
+        &base.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[workspace]\n\n[workspace.dependencies]\nnear = { path = \"near\" }\n\n[dependencies]\nmember = { path = \"../other/member\" }\nnear.workspace = true\n",
+    );
+    write(&base.join("app/src/lib.rs"), "");
+    write(
+        &base.join("app/near/Cargo.toml"),
+        "[package]\nname = \"near\"\nversion = \"0.1.0\"\n",
+    );
+    write(&base.join("app/near/src/lib.rs"), "");
+    write(
+        &base.join("other/Cargo.toml"),
+        "[workspace]\nmembers = [\"member\", \"deep\"]\n\n[workspace.dependencies]\ndeep = { path = \"deep\" }\n",
+    );
+    write(
+        &base.join("other/member/Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\n\n[dependencies]\ndeep.workspace = true\n",
+    );
+    write(&base.join("other/member/src/lib.rs"), "");
+    write(
+        &base.join("other/deep/Cargo.toml"),
+        "[package]\nname = \"deep\"\nversion = \"0.1.0\"\n",
+    );
+    write(&base.join("other/deep/src/lib.rs"), "");
+
+    let workspace = load::load(&base.join("app"));
+    fs::remove_dir_all(&base).unwrap();
+    let member = workspace
+        .crates
+        .iter()
+        .position(|source| source.package == "member")
+        .expect("member is loaded");
+    let deep = match workspace.crates[member].deps.get("deep") {
+        Some(Dependency::Path(index)) => *index,
+        other => panic!("deep resolves through its own workspace, got {other:?}"),
+    };
+    assert_eq!(workspace.crates[deep].package, "deep");
+    let near = match workspace.crates[0].deps.get("near") {
+        Some(Dependency::Path(index)) => *index,
+        other => panic!("near resolves through the app's workspace, got {other:?}"),
+    };
+    assert_eq!(workspace.crates[near].package, "near");
+}
