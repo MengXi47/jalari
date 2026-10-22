@@ -1,3 +1,12 @@
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the job attribute calls the analyser once the loader lands"
+    )
+)]
+mod fingerprint;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;

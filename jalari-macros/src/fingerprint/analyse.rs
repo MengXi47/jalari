@@ -1,0 +1,108 @@
+use std::collections::BTreeSet;
+
+use quote::ToTokens;
+
+use super::hash::{Fnv, canonical};
+use super::index::{Index, ItemId};
+use super::reach::{MemberRule, reach};
+use super::workspace::{Dependency, JobSite, Workspace};
+
+const TAG: &str = "jalari-fingerprint/1";
+const WHOLE_TAG: &str = "jalari-fingerprint/1/whole";
+
+pub(crate) fn fingerprint(workspace: &Workspace, site: &JobSite<'_>, jalari_version: &str) -> u128 {
+    fingerprint_indexed(&Index::build(workspace), workspace, site, jalari_version)
+}
+
+pub(crate) fn fingerprint_indexed(
+    index: &Index,
+    workspace: &Workspace,
+    site: &JobSite<'_>,
+    jalari_version: &str,
+) -> u128 {
+    let (tag, items, pins) = match reach(index, site, MemberRule::Gated) {
+        Some(reached) => {
+            let mut roots = reached.roots.clone();
+            for &item in &reached.items {
+                let record = &index.items[item];
+                let unit = &index.units[record.unit];
+                for glob in unit.globs.get(&record.file).into_iter().flatten() {
+                    roots.insert((unit.krate, glob.clone()));
+                }
+            }
+            let pins = pins(
+                workspace,
+                roots.iter().map(|(krate, name)| (*krate, name.as_str())),
+            );
+            (TAG, reached.items.into_iter().collect::<Vec<_>>(), pins)
+        }
+        None => {
+            let roots = workspace
+                .crates
+                .iter()
+                .enumerate()
+                .flat_map(|(krate, source)| {
+                    source.deps.keys().map(move |name| (krate, name.as_str()))
+                });
+            (
+                WHOLE_TAG,
+                (0..index.items.len()).collect(),
+                pins(workspace, roots),
+            )
+        }
+    };
+    let texts = texts(index, workspace, &items);
+    let mut fnv = Fnv::new();
+    fnv.field(tag.as_bytes());
+    fnv.field(jalari_version.as_bytes());
+    fnv.field(canonical(site.item.to_token_stream()).as_bytes());
+    fnv.count(texts.len());
+    for text in &texts {
+        fnv.field(text.as_bytes());
+    }
+    fnv.count(pins.len());
+    for pin in &pins {
+        fnv.field(pin.as_bytes());
+    }
+    fnv.finish()
+}
+
+pub(crate) fn hex(fingerprint: u128) -> String {
+    format!("{fingerprint:032x}")
+}
+
+pub(crate) fn texts<'i>(index: &'i Index, workspace: &Workspace, items: &[ItemId]) -> Vec<&'i str> {
+    let unique: BTreeSet<(&str, &str, &str)> = items
+        .iter()
+        .map(|&item| {
+            let record = &index.items[item];
+            let krate = index.units[record.unit].krate;
+            let package = workspace
+                .crates
+                .get(krate)
+                .map_or("", |source| source.package.as_str());
+            (package, record.file.as_str(), record.text.as_str())
+        })
+        .collect();
+    let mut texts: Vec<&str> = unique.into_iter().map(|(_, _, text)| text).collect();
+    texts.sort_unstable();
+    texts
+}
+
+fn pins<'a>(
+    workspace: &Workspace,
+    roots: impl Iterator<Item = (usize, &'a str)>,
+) -> BTreeSet<String> {
+    let Some(lock) = &workspace.lock else {
+        return BTreeSet::new();
+    };
+    roots
+        .filter_map(|(krate, name)| {
+            let source = workspace.crates.get(krate)?;
+            let Some(Dependency::Registry(package)) = source.deps.get(name) else {
+                return None;
+            };
+            lock.pin(&source.package, package)
+        })
+        .collect()
+}
