@@ -846,6 +846,32 @@ fn test_loader_fingerprint_ignores_checkout_path() {
 }
 
 #[test]
+fn test_loader_ignores_target_roots_that_do_not_contain_the_job() {
+    let base = env::temp_dir().join(format!("jalari-fingerprint-roots-{}", process::id()));
+    fs::create_dir_all(base.join("tests")).unwrap();
+    fs::write(
+        base.join("Cargo.toml"),
+        "[package]\nname = \"roots\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    let job = source("self.count.describe();", "fn Describe() -> u32 { 1 }");
+    fs::write(base.join("tests/alpha.rs"), &job).unwrap();
+    let other = base.join("tests/beta.rs");
+    fs::write(
+        &other,
+        "mod alpha_helpers {}\ntrait Describe {\n    fn describe(&self) -> u32;\n}\n",
+    )
+    .unwrap();
+    let file = base.join("tests/alpha.rs");
+    let item = find_job(&job, "J");
+    let before = load::fingerprint_at(Some(&base), Some(&file), &item);
+    fs::write(&other, "mod alpha_helpers {}\n").unwrap();
+    let after = load::fingerprint_at(Some(&base), Some(&file), &item);
+    fs::remove_dir_all(&base).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn test_measure_reach_over_this_repository() {
     let package = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

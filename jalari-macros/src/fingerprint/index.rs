@@ -87,6 +87,7 @@ pub(crate) struct Index {
 #[derive(Default)]
 pub(crate) struct Unit {
     pub(crate) krate: usize,
+    pub(crate) root: String,
     pub(crate) files: BTreeSet<String>,
     pub(crate) uses: BTreeSet<String>,
     pub(crate) globs: BTreeMap<String, BTreeSet<String>>,
@@ -157,6 +158,7 @@ impl Index {
                     let unit = builder.index.units.len();
                     builder.index.units.push(Unit {
                         krate,
+                        root: root.clone(),
                         ..Unit::default()
                     });
                     builder.index.crate_units[krate].push(unit);

@@ -35,21 +35,41 @@ pub(crate) fn fingerprint_at(
         item,
         file: file.as_deref(),
     };
-    if let (Some(file), Some(primary)) = (&file, workspace.crates.first_mut()) {
+    if let (Some(file), Some(primary)) = (&file, workspace.crates.first()) {
         let all = primary.roots.clone();
-        primary
-            .roots
-            .retain(|root| could_contain(&primary.files, root, file));
-        let index = cached(&workspace);
-        if locates(&index, &site) {
-            return fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"));
+        let likely: Vec<String> = all
+            .iter()
+            .filter(|root| could_contain(&primary.files, root, file))
+            .cloned()
+            .collect();
+        for candidates in [likely, all.clone()] {
+            set_roots(&mut workspace, candidates);
+            let index = cached(&workspace);
+            if locates(&index, &site) {
+                set_roots(&mut workspace, roots_containing(&index, file));
+                let index = cached(&workspace);
+                return fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"));
+            }
         }
-        if let Some(primary) = workspace.crates.first_mut() {
-            primary.roots = all;
-        }
+        set_roots(&mut workspace, all);
     }
     let index = cached(&workspace);
     fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
+}
+
+fn set_roots(workspace: &mut Workspace, roots: Vec<String>) {
+    if let Some(primary) = workspace.crates.first_mut() {
+        primary.roots = roots;
+    }
+}
+
+fn roots_containing(index: &Index, file: &str) -> Vec<String> {
+    index
+        .units
+        .iter()
+        .filter(|unit| unit.krate == 0 && unit.files.contains(file))
+        .map(|unit| unit.root.clone())
+        .collect()
 }
 
 fn could_contain(files: &BTreeMap<String, String>, root: &str, file: &str) -> bool {
