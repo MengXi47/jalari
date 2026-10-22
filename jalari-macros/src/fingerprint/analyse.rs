@@ -10,11 +10,7 @@ use super::workspace::{Dependency, JobSite, Workspace};
 const TAG: &str = "jalari-fingerprint/1";
 const WHOLE_TAG: &str = "jalari-fingerprint/1/whole";
 
-pub(crate) fn fingerprint(workspace: &Workspace, site: &JobSite<'_>, jalari_version: &str) -> u128 {
-    fingerprint_indexed(&Index::build(workspace), workspace, site, jalari_version)
-}
-
-pub(crate) fn fingerprint_indexed(
+pub(crate) fn fingerprint(
     index: &Index,
     workspace: &Workspace,
     site: &JobSite<'_>,

@@ -1,19 +1,14 @@
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the job attribute calls the analyser once the loader lands"
-    )
-)]
 mod fingerprint;
 
-use proc_macro::TokenStream;
+use std::path::PathBuf;
+
+use proc_macro::{Span, TokenStream};
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::{
-    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitStr, MetaNameValue, Token, parse_macro_input,
-    parse_quote,
+    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitBool, LitStr, MetaNameValue, Token,
+    parse_macro_input, parse_quote,
 };
 
 /// Registers an `impl Job for T` so workers can run `T`, optionally on a cron schedule.
@@ -72,7 +67,7 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     let arguments =
         parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
     let item_impl = parse_macro_input!(item as ItemImpl);
-    match expand(arguments, item_impl) {
+    match expand(arguments, item_impl, Span::call_site().local_file()) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -82,11 +77,13 @@ struct JobArguments {
     cron: Option<LitStr>,
     timezone: Option<LitStr>,
     queue: Option<LitStr>,
+    fingerprint: Option<LitBool>,
 }
 
 fn expand(
     arguments: Punctuated<MetaNameValue, Token![,]>,
     mut item_impl: ItemImpl,
+    local_file: Option<PathBuf>,
 ) -> syn::Result<TokenStream2> {
     let arguments = parse_arguments(arguments)?;
 
@@ -107,6 +104,13 @@ fn expand(
             "#[jalari::job] does not support generic jobs",
         ));
     }
+
+    let fingerprint = if arguments.fingerprint.as_ref().is_none_or(LitBool::value) {
+        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_file));
+        quote!(::core::option::Option::Some(#hex))
+    } else {
+        quote!(::core::option::Option::None)
+    };
 
     fill_in_context(&mut item_impl);
 
@@ -134,7 +138,7 @@ fn expand(
         #item_impl
 
         ::jalari::__private::inventory::submit! {
-            ::jalari::__private::JobRegistration::new::<#job_type>(#queue, #cron)
+            ::jalari::__private::JobRegistration::new::<#job_type>(#queue, #cron, #fingerprint)
         }
     })
 }
@@ -167,8 +171,19 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         cron: None,
         timezone: None,
         queue: None,
+        fingerprint: None,
     };
     for argument in arguments {
+        if argument.path.is_ident("fingerprint") {
+            if parsed.fingerprint.is_some() {
+                return Err(syn::Error::new_spanned(
+                    &argument.path,
+                    "duplicate argument",
+                ));
+            }
+            parsed.fingerprint = Some(bool_value(&argument)?);
+            continue;
+        }
         let value = string_value(&argument)?;
         let slot = if argument.path.is_ident("cron") {
             &mut parsed.cron
@@ -179,7 +194,7 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         } else {
             return Err(syn::Error::new_spanned(
                 &argument.path,
-                "expected `cron`, `timezone` or `queue`",
+                "expected `cron`, `timezone`, `queue` or `fingerprint`",
             ));
         };
         if slot.is_some() {
@@ -206,5 +221,15 @@ fn string_value(argument: &MetaNameValue) -> syn::Result<LitStr> {
             ..
         }) => Ok(value.clone()),
         other => Err(syn::Error::new_spanned(other, "expected a string literal")),
+    }
+}
+
+fn bool_value(argument: &MetaNameValue) -> syn::Result<LitBool> {
+    match &argument.value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Bool(value),
+            ..
+        }) => Ok(value.clone()),
+        other => Err(syn::Error::new_spanned(other, "expected `true` or `false`")),
     }
 }

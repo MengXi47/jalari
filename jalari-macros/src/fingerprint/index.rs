@@ -482,11 +482,12 @@ impl Builder<'_> {
         header_refs(item_impl, &mut refs, true);
         let mut gate_refs = Refs::default();
         header_refs(item_impl, &mut gate_refs, false);
-        let gates = gate_refs
-            .names
-            .into_iter()
-            .chain(gate_refs.implemented)
-            .collect();
+        let trait_gates = if is_job_impl(item_impl) {
+            BTreeSet::new()
+        } else {
+            gate_refs.implemented
+        };
+        let gates = gate_refs.names.into_iter().chain(trait_gates).collect();
         let header_id = self.push(
             place.unit,
             place.file,

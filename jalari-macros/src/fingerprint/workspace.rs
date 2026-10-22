@@ -8,7 +8,7 @@ pub(crate) struct Workspace {
     pub(crate) lock: Option<Lock>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 pub(crate) struct CrateSource {
     pub(crate) package: String,
     pub(crate) roots: Vec<String>,
@@ -16,7 +16,7 @@ pub(crate) struct CrateSource {
     pub(crate) deps: BTreeMap<String, Dependency>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Dependency {
     Path(usize),
     Registry(String),

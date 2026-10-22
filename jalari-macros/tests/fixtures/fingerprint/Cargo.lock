@@ -1,0 +1,18 @@
+version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "helper",
+ "serde_json",
+]
+
+[[package]]
+name = "helper"
+version = "0.1.0"
+
+[[package]]
+name = "serde_json"
+version = "1.0.140"
+source = "registry+https://github.com/rust-lang/crates.io-index"

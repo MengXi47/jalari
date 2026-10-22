@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::{env, fs, process};
 
 use quote::ToTokens;
 use syn::visit::Visit;
@@ -6,6 +8,7 @@ use syn::visit::Visit;
 use super::analyse::{fingerprint, hex};
 use super::hash::{Fnv, canonical};
 use super::index::{Index, is_job_impl};
+use super::load;
 use super::lock::Lock;
 use super::reach::{MemberRule, reach};
 use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
@@ -114,33 +117,43 @@ fn with_registry(app_lib: &str, lock: &str) -> Workspace {
 }
 
 fn macro_input(workspace: &Workspace, file: &str, self_ty: &str) -> syn::ItemImpl {
-    let parsed = syn::parse_file(&workspace.crates[0].files[file]).expect("job file parses");
-    let mut finder = Finder {
-        self_ty,
-        found: None,
+    find_job(&workspace.crates[0].files[file], self_ty)
+}
+
+fn find_job(text: &str, self_ty: &str) -> syn::ItemImpl {
+    jobs_in(text)
+        .into_iter()
+        .find(|item| item.self_ty.to_token_stream().to_string() == self_ty)
+        .expect("job impl present")
+}
+
+fn jobs_in(text: &str) -> Vec<syn::ItemImpl> {
+    let Ok(parsed) = syn::parse_file(text) else {
+        return Vec::new();
     };
+    let mut finder = Finder::default();
     finder.visit_file(&parsed);
-    let mut item = finder.found.expect("job impl present");
-    item.attrs.retain(|attribute| {
-        attribute
-            .path()
-            .segments
-            .last()
-            .is_none_or(|segment| segment.ident != "job")
-    });
-    item
+    finder.found
 }
 
-struct Finder<'a> {
-    self_ty: &'a str,
-    found: Option<syn::ItemImpl>,
+#[derive(Default)]
+struct Finder {
+    found: Vec<syn::ItemImpl>,
 }
 
-impl<'ast> Visit<'ast> for Finder<'_> {
+impl<'ast> Visit<'ast> for Finder {
     fn visit_item_impl(&mut self, item_impl: &'ast syn::ItemImpl) {
-        if is_job_impl(item_impl) && item_impl.self_ty.to_token_stream().to_string() == self.self_ty
-        {
-            self.found = Some(item_impl.clone());
+        let is_job_attribute = |attribute: &syn::Attribute| {
+            attribute
+                .path()
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "job")
+        };
+        if is_job_impl(item_impl) && item_impl.attrs.iter().any(is_job_attribute) {
+            let mut item = item_impl.clone();
+            item.attrs.retain(|attribute| !is_job_attribute(attribute));
+            self.found.push(item);
         }
         syn::visit::visit_item_impl(self, item_impl);
     }
@@ -149,6 +162,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 fn job_at(workspace: &Workspace, file: &str, self_ty: &str, version: &str) -> u128 {
     let item = macro_input(workspace, file, self_ty);
     fingerprint(
+        &Index::build(workspace),
         workspace,
         &JobSite {
             item: &item,
@@ -639,7 +653,12 @@ fn test_root_selection_follows_call_site() {
 
 fn whole(workspace: &Workspace, file: Option<&str>, version: &str) -> u128 {
     let item = macro_input(workspace, "src/lib.rs", "J");
-    fingerprint(workspace, &JobSite { item: &item, file }, version)
+    fingerprint(
+        &Index::build(workspace),
+        workspace,
+        &JobSite { item: &item, file },
+        version,
+    )
 }
 
 #[test]
@@ -748,4 +767,130 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         Some("fork 0.3.0 git+https://example.com/fork.git?rev=abc#abc")
     );
     assert_eq!(lock.pin("app", "missing"), None);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+fn checkout(root: &Path, self_ty: &str) -> u128 {
+    let file = root.join("app/src/lib.rs");
+    let item = find_job(&fs::read_to_string(&file).unwrap(), self_ty);
+    load::fingerprint_at(Some(&root.join("app")), Some(&file), &item)
+}
+
+fn rewrite(path: &Path, from: &str, to: &str) {
+    let text = fs::read_to_string(path).unwrap();
+    assert!(text.contains(from), "{from:?} not in {}", path.display());
+    fs::write(path, text.replace(from, to)).unwrap();
+}
+
+#[test]
+fn test_loader_fingerprint_ignores_checkout_path() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fingerprint");
+    let base = env::temp_dir().join(format!("jalari-fingerprint-{}", process::id()));
+    let first = base.join("a");
+    let second = base.join("b/nested/deeper");
+    copy_dir(&fixture, &first);
+    copy_dir(&fixture, &second);
+
+    let uses_helper = checkout(&first, "UsesHelper");
+    let standalone = checkout(&first, "Standalone");
+    assert_ne!(uses_helper, standalone);
+    assert_eq!(checkout(&second, "UsesHelper"), uses_helper);
+    assert_eq!(checkout(&second, "Standalone"), standalone);
+
+    let helper = second.join("helper/src/lib.rs");
+    let text = fs::read_to_string(&helper).unwrap();
+    fs::write(
+        &helper,
+        format!("\u{feff}// note\n{}", text.replace('\n', "\r\n")),
+    )
+    .unwrap();
+    rewrite(
+        &helper,
+        "pub fn unused() -> u32 {\r\n    1",
+        "pub fn unused() -> u32 {\r\n    2",
+    );
+    assert_eq!(checkout(&second, "UsesHelper"), uses_helper);
+
+    rewrite(
+        &helper,
+        "pub fn compute() -> u32 {\r\n    1",
+        "pub fn compute() -> u32 {\r\n    2",
+    );
+    let edited = checkout(&second, "UsesHelper");
+    assert_ne!(edited, uses_helper);
+    assert_eq!(checkout(&second, "Standalone"), standalone);
+
+    rewrite(&second.join("Cargo.lock"), "1.0.140", "1.0.141");
+    assert_ne!(checkout(&second, "UsesHelper"), edited);
+    assert_eq!(checkout(&second, "Standalone"), standalone);
+
+    let file = first.join("app/src/lib.rs");
+    let item = find_job(&fs::read_to_string(&file).unwrap(), "Standalone");
+    assert_ne!(
+        load::fingerprint_at(Some(&first.join("app")), None, &item),
+        standalone
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn test_measure_reach_over_this_repository() {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("jalari");
+    let workspace = load::load(&package);
+    let index = Index::build(&workspace);
+    let mut measured = 0;
+    for (path, text) in &workspace.crates[0].files {
+        for item in jobs_in(text) {
+            let site = JobSite {
+                item: &item,
+                file: Some(path),
+            };
+            let gated = reach(&index, &site, MemberRule::Gated).expect("job located");
+            let name_only = reach(&index, &site, MemberRule::NameOnly).expect("job located");
+            let own = |unit: usize| index.units[unit].krate == 0;
+            let total = |units: &BTreeSet<usize>, local: bool| {
+                index
+                    .items
+                    .iter()
+                    .filter(|record| units.contains(&record.unit) && own(record.unit) == local)
+                    .count()
+            };
+            let count = |items: &BTreeSet<usize>, local: bool| {
+                items
+                    .iter()
+                    .filter(|&&id| own(index.items[id].unit) == local)
+                    .count()
+            };
+            println!(
+                "{path} {}: own crate gated {}/{} name-only {}/{}, path dependencies gated {}/{} name-only {}/{}",
+                item.self_ty.to_token_stream(),
+                count(&gated.items, true),
+                total(&gated.units, true),
+                count(&name_only.items, true),
+                total(&name_only.units, true),
+                count(&gated.items, false),
+                total(&gated.units, false),
+                count(&name_only.items, false),
+                total(&name_only.units, false),
+            );
+            assert!(gated.items.is_subset(&name_only.items));
+            measured += 1;
+        }
+    }
+    assert!(measured > 0);
 }

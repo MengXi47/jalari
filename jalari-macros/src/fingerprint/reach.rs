@@ -9,6 +9,13 @@ use super::workspace::JobSite;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemberRule {
     Gated,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the precision measurement compares the two rules"
+        )
+    )]
     NameOnly,
 }
 
@@ -35,7 +42,11 @@ enum Event {
     Open(ImplId),
 }
 
-pub(crate) fn reach(index: &Index, site: &JobSite<'_>, rule: MemberRule) -> Option<Reached> {
+pub(crate) fn locates(index: &Index, site: &JobSite<'_>) -> bool {
+    site_units(index, site).is_some()
+}
+
+fn site_units(index: &Index, site: &JobSite<'_>) -> Option<Vec<usize>> {
     let file = site.file?;
     let job = (
         file.to_owned(),
@@ -48,12 +59,14 @@ pub(crate) fn reach(index: &Index, site: &JobSite<'_>, rule: MemberRule) -> Opti
         .filter(|(_, unit)| unit.krate == 0 && unit.files.contains(file))
         .map(|(id, _)| id)
         .collect();
-    if !units
+    units
         .iter()
         .any(|&unit| index.units[unit].jobs.contains(&job))
-    {
-        return None;
-    }
+        .then_some(units)
+}
+
+pub(crate) fn reach(index: &Index, site: &JobSite<'_>, rule: MemberRule) -> Option<Reached> {
+    let units = site_units(index, site)?;
     let mut walk = Walk {
         index,
         rule,

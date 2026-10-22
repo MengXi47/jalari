@@ -16,6 +16,7 @@ pub struct JobRegistration {
     pub max_attempts: i32,
     pub timeout: Option<Duration>,
     pub cron: Option<CronRegistration>,
+    pub fingerprint: Option<&'static str>,
     pub context: fn() -> ContextKey,
     pub run: fn(Provided, &[u8]) -> JobFuture,
 }
@@ -48,13 +49,18 @@ impl ContextKey {
 }
 
 impl JobRegistration {
-    pub const fn new<T: Job>(queue: &'static str, cron: Option<CronRegistration>) -> Self {
+    pub const fn new<T: Job>(
+        queue: &'static str,
+        cron: Option<CronRegistration>,
+        fingerprint: Option<&'static str>,
+    ) -> Self {
         Self {
             name: T::NAME,
             queue,
             max_attempts: T::MAX_ATTEMPTS,
             timeout: T::TIMEOUT,
             cron,
+            fingerprint,
             context: ContextKey::of::<T::Context>,
             run: run_job::<T>,
         }
