@@ -21,6 +21,12 @@ pub type JobResult = std::result::Result<(), JobError>;
 /// A job runs at least once: if its worker dies mid-run, another worker runs it again, so `run`
 /// should be idempotent.
 ///
+/// `#[jalari::job]` also stamps every enqueued job with a fingerprint of the code it reaches. A
+/// worker runs a job only when the job has no fingerprint or when the worker was built from
+/// the same code, so a job enqueued by another build waits the way a job under an unknown
+/// [`NAME`](Self::NAME) does. [`#[jalari::job]`](crate::job) lists what the fingerprint
+/// covers and how to turn it off for a job.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -57,7 +63,8 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// Stable name stored with each job and used to find the type that runs it.
     ///
     /// Must be unique within a binary. Jobs already enqueued under an old name keep waiting
-    /// until a worker that knows that name picks them up.
+    /// until a worker that knows that name picks them up. Jobs enqueued by another build of
+    /// the same name wait the same way, for a worker of that build.
     const NAME: &'static str;
 
     /// Number of attempts before the job is marked failed, including the first; defaults to 10.

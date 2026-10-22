@@ -102,6 +102,16 @@ Version 6 adds a GIN index on the job table's context column for
 [listing jobs](#listing-jobs) by context. Building it reads the whole job table and blocks
 writes to it until the upgrade commits.
 
+Version 7 adds the [code fingerprint](#code-fingerprints) columns: `fingerprint` on the job
+table and `tasks` on the worker table. Both are nullable with no default, so the upgrade is
+instant. Jobs enqueued before it have no fingerprint, and any worker that knows their task
+runs them. A worker of an older release that is still running claims jobs without checking
+fingerprints, so the check holds once every worker runs this release. The fingerprint includes
+the jalari version, so every later jalari upgrade changes the fingerprint of every job. Jobs
+enqueued by the old release then wait for workers of the old release. Let the queues drain
+before you stop the last old worker, or release the jobs with
+[`clear_fingerprint`](#jobs-that-wait-for-another-build) after the upgrade.
+
 ## Defining jobs
 
 A job is a serializable struct with an `impl Job` inside `#[jalari::job]`. Its fields are the
@@ -146,6 +156,7 @@ impl Job for SendEmail {
 | `TIMEOUT` | Longest time one attempt may run | none |
 | `type Context` | Value `run` receives from the worker's middleware; see [Context and middleware](#context-and-middleware) | `()` |
 | `queue = "..."` | Queue the job goes to unless the enqueue says otherwise | `default` |
+| `fingerprint = false` | Enqueue without a [code fingerprint](#code-fingerprints) and run jobs of any build | `true` |
 
 `run` returns `Ok(())` on success. Any error converts into a retryable `jalari::JobError`
 through `?`. Return `jalari::JobError::permanent(e)` when retrying cannot help, for example
@@ -153,6 +164,56 @@ invalid input.
 A panic or a timeout counts as a failed attempt.
 
 A job can run more than once if its worker dies mid-run, so keep `run` idempotent.
+
+### Code fingerprints
+
+`#[jalari::job]` hashes the job's code when the crate compiles, giving a fingerprint of 32 hex
+digits. Every enqueue stores the fingerprint of the build that enqueued the job. A worker takes
+a job only when the job has no fingerprint or when the job's fingerprint equals the worker's
+own fingerprint for that task. A job enqueued by another build of its code waits for a worker of that build, the
+same way a job under an unknown name waits for a worker that knows the name.
+
+The fingerprint covers:
+
+- the `impl Job` block and the definition of the job's struct
+- every function, method, constant, static, type, trait implementation and `macro_rules!` that
+  the job's code reaches, directly or through other items, in the job's crate and in its
+  `path` dependencies
+- the `Cargo.lock` version of each registry crate that the reached code names
+- the jalari version
+
+Formatting, comments and code that the job cannot reach leave it unchanged. The same sources
+and the same `Cargo.lock` give the same fingerprint on every machine and in every directory.
+
+The analysis matches names rather than resolving paths, so it errs toward a change. Editing a
+function with the same name as one the job calls, in any module, changes the fingerprint too.
+A method call reaches the methods of that name on the types the reached code names, and naming
+a trait reaches all of its implementations. Code that a build script generates into `OUT_DIR`
+and names that macros such as `paste!` build are not analysed. When the compiler does not
+report the source file of the job, as in some IDE and non-Cargo builds, the fingerprint covers
+every item of the crate and of its `path` dependencies.
+
+To let a job run on any build, turn the check off for it:
+
+```rust
+#[derive(Serialize, Deserialize, Default)]
+struct VacuumTables;
+
+#[jalari::job(queue = "maintenance", fingerprint = false)]
+impl Job for VacuumTables {
+    const NAME: &'static str = "vacuum_tables";
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+```
+
+Jobs of such a task are enqueued without a fingerprint, and the workers of that build run
+them whatever fingerprint they carry. Use it for jobs whose arguments and behavior stay
+compatible across deploys. [Deployment](#deployment) describes rolling deploys, and
+[Jobs that wait for another build](#jobs-that-wait-for-another-build) shows how to find and
+release them.
 
 ## Enqueueing
 
@@ -224,6 +285,11 @@ There are two kinds of schedules, and they never affect each other.
 | Schedule | Cron only | Cron or interval, with optional end conditions |
 | Arguments | `Default::default()` | Any value you pass |
 | Name | The job's `NAME` | Any name you choose |
+
+Each run carries the [code fingerprint](#code-fingerprints) of the task as registered in the
+process that enqueues it, the scheduler or a `recurring::trigger` call, so a schedule follows
+the deployed code. A `trigger` from a process that does not link the task enqueues the run
+without a fingerprint.
 
 ### Declared in code
 
@@ -720,6 +786,16 @@ The same jobs can run in several shapes; pick per process.
   schedules firing if one stops. Turn it off with `.scheduler(false)` on workers that should
   only process jobs, but keep at least one with it on.
 
+A worker runs only the jobs enqueued by its own build of each task's code, as
+[code fingerprints](#code-fingerprints) describes. A task whose code a deploy did not change
+keeps its fingerprint, so both builds run its jobs. For a task whose code changed, jobs that
+the old build enqueued wait for an old worker, and jobs that the new build enqueued wait for a
+new worker. During a rolling deploy, keep at least one old worker running until the old build's
+jobs have drained. Jobs left behind after the last old worker stops wait until you release them
+with `jalari::admin::clear_fingerprint`. Every worker logs a warning every five minutes while
+due jobs in its queues have no live worker that can run them, and
+`jalari::admin::stranded()` lists those jobs.
+
 ## Cluster settings and cleanup
 
 Settings shared by every worker live in the `config` table and change at runtime:
@@ -776,6 +852,31 @@ If no listed worker has `scheduler` set, recurring schedules are not firing. `st
 the jobs in every queue by state; `throughput` sums up the job history of the last window,
 so it only sees as far back as the retention housekeeping keeps.
 
+### Jobs that wait for another build
+
+```rust
+for group in jalari::admin::stranded().await? {
+    println!("{} {} jobs in {} wait for fingerprint {:?} since {}",
+        group.count, group.task, group.queue, group.fingerprint, group.since);
+}
+
+let filter = jalari::admin::JobFilter::new().task("send_email");
+let released = jalari::admin::clear_fingerprint(&filter).await?;
+```
+
+`stranded` lists the due jobs that no live worker can run, grouped by queue, task and
+[code fingerprint](#code-fingerprints). A job is listed when no worker with a recent heartbeat
+both processes its queue and runs its task at a matching fingerprint. A job whose task no
+running binary knows is listed too. Jobs that only wait for a busy worker are not listed. A worker of
+a release before migration 7 counts as able to run every task of its queues. Each worker logs
+a warning for the groups in its own queues when it starts and every five minutes after.
+
+`clear_fingerprint` removes the fingerprint from every scheduled, enqueued or stopped job that
+matches the filter, so any worker that knows the task runs it, and notifies the workers of
+their queues. Use it when the build those jobs wait for will not run again. `JobInfo` carries
+each job's `fingerprint`, and `WorkerInfo::tasks` maps every task a worker runs to its
+fingerprint, `None` for a task declared with `fingerprint = false`.
+
 ### Listing jobs
 
 ```rust
@@ -827,7 +928,9 @@ jalari::admin::run_now(id).await?;
 the history, and the queue's workers are notified. A failed job whose `job_key` is held by a
 waiting, running or stopped job stays failed and the outcome names that job. `retry_failed`
 does the same for every failed job matching the filter, in batches of 100 that each commit on
-their own. `run_now` makes a scheduled job, or a retry waiting for its backoff, due now; a
+their own. Both give each job the [code fingerprint](#code-fingerprints) of the caller's build
+when the caller links the job's task, and keep the stored one otherwise. `run_now` makes a
+scheduled job, or a retry waiting for its backoff, due now; a
 running job, or one interrupted less than 6 seconds ago, is reported as `Running` and left
 alone. To delete a job, [`cancel`](#stopping-restarting-and-cancelling) it: a waiting or stopped
 job is marked deleted at once, a running one once it stops.

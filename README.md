@@ -35,6 +35,8 @@ jalari = "0.5"
 - **Stop, restart and cancel** — stop a job to free everything it holds, restart it later from
   the progress it saved at its last checkpoint, or cancel it for good.
 - **Graceful shutdown** — running jobs finish before a worker exits.
+- **Code fingerprints** — each job is stamped with a hash of the code it reaches, and a worker
+  runs it only when the worker was built from the same code.
 - **Monitoring and management** — a live list of workers, counts and throughput per queue,
   job listing by state, queue, key, time or tenant context, each job's history, retrying
   failed jobs and running scheduled ones now; optional deletion of finished jobs.

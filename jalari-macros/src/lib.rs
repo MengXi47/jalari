@@ -22,6 +22,7 @@ use syn::{
 /// * `cron` - Cron expression with five or six fields; makes the job recurring. `T` must
 ///   implement `Default`, which provides the arguments of every run
 /// * `timezone` - IANA time zone for `cron`; `UTC` when omitted. Only valid with `cron`
+/// * `fingerprint` - `false` turns the code fingerprint off for this job; `true` when omitted
 ///
 /// A schedule declared with `cron` follows the deployed code: workers sync it at startup, remove
 /// it when the declaration is gone, and it cannot be changed at runtime. Use
@@ -29,6 +30,30 @@ use syn::{
 ///
 /// When the impl leaves out `type Context`, it is set to `()`. When `run` takes only `self`,
 /// the context parameter is added for it, so jobs that need no context stay short.
+///
+/// # Code fingerprint
+///
+/// The attribute hashes the job's code at compile time into 32 hex digits. The hash covers the
+/// `impl` block, the job's struct, every item that the job's code reaches by name in its crate
+/// and in its `path` dependencies, the `Cargo.lock` version of each registry crate that the
+/// reached code names, and the jalari version. Formatting, comments and unreachable code do not
+/// change it, and neither does the directory the sources are in.
+///
+/// Every enqueue stores the fingerprint with the job, and a worker takes a job only when the
+/// stored fingerprint is empty or equals its own build's. A job enqueued by another build of
+/// its code waits for a worker of that build. With `fingerprint = false` the job is enqueued
+/// without a fingerprint and its workers take its jobs from any build.
+///
+/// ```rust,ignore
+/// #[jalari::job(queue = "maintenance", fingerprint = false)]
+/// impl Job for VacuumTables {
+///     const NAME: &'static str = "vacuum_tables";
+///
+///     async fn run(self) -> JobResult {
+///         Ok(())
+///     }
+/// }
+/// ```
 ///
 /// # Examples
 ///
