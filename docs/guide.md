@@ -170,8 +170,8 @@ A job can run more than once if its worker dies mid-run, so keep `run` idempoten
 `#[jalari::job]` hashes the job's code when the crate compiles, giving a fingerprint of 32 hex
 digits. Every enqueue stores the fingerprint of the build that enqueued the job. A worker takes
 a job only when the job has no fingerprint or when the job's fingerprint equals the worker's
-own fingerprint for that task. A job enqueued by another build of its code waits for a worker of that build, the
-same way a job under an unknown name waits for a worker that knows the name.
+own fingerprint for that task. A job enqueued by another build of its code waits for a worker
+of that build, the same way a job under an unknown name waits for a worker that knows the name.
 
 The fingerprint covers:
 

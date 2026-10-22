@@ -65,7 +65,8 @@ pub enum RunNowOutcome {
 /// waiting, running or stopped job stays failed, because two such jobs cannot share a key. A
 /// job that failed because its last attempt was interrupted waits out the 6 seconds after the
 /// interruption first, like any interrupted job, so the lost run has stopped before the new
-/// one starts.
+/// one starts. When the calling process links the job's task with a fingerprint, the job gets
+/// that fingerprint, so it runs on the caller's build; otherwise it keeps the one it has.
 ///
 /// # Errors
 ///
@@ -115,8 +116,9 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
 
 /// Retries every failed job matching `filter`, in batches of 100 that commit separately.
 ///
-/// Each job is handled as by [`retry`]; the filter's states are ignored, only failed jobs are
-/// considered. A batch that fails leaves the earlier batches retried and returns the error.
+/// Each job is handled as by [`retry`], including its fingerprint; the filter's states are
+/// ignored, only failed jobs are considered. A batch that fails leaves the earlier batches
+/// retried and returns the error.
 ///
 /// # Errors
 ///
@@ -264,8 +266,9 @@ pub async fn run_now(id: JobId) -> Result<RunNowOutcome> {
 /// It removes the fingerprint from every scheduled, enqueued or stopped job that matches and
 /// has one, then notifies the workers of their queues. Use it when jobs wait for a build that
 /// will not be deployed again, such as after a rollback or a change you know is compatible.
-/// Running jobs are skipped. A failed job keeps its fingerprint; [`retry`] gives it the
-/// caller's. The filter's states narrow the jobs further.
+/// Running jobs are skipped. A failed job keeps its fingerprint; [`retry`] replaces it with the
+/// caller's when the caller links the task with one. The filter's states narrow the jobs
+/// further.
 ///
 /// # Errors
 ///

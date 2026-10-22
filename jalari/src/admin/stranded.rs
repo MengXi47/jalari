@@ -21,7 +21,7 @@ pub struct StrandedJobs {
     pub fingerprint: Option<String>,
     /// How many jobs are in the group.
     pub count: i64,
-    /// Earliest `run_at` in the group, which is how long the oldest has been waiting.
+    /// Earliest `run_at` in the group: when the oldest job became due.
     pub since: DateTime<Utc>,
 }
 
@@ -40,8 +40,7 @@ struct StrandedRow {
 /// [`worker_timeout`](crate::ClusterConfig::worker_timeout) processes its queue and runs its
 /// task at a matching fingerprint. Jobs that only wait for a busy worker are not listed. A
 /// worker on a jalari release without fingerprints counts as able to run any task of its
-/// queues. Each worker also logs a warning for the groups in its own queues at startup and
-/// every five minutes.
+/// queues.
 ///
 /// # Errors
 ///
