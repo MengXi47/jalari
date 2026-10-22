@@ -451,12 +451,7 @@ fn find_lock(manifest_dir: &Path) -> Option<Lock> {
 }
 
 fn relative(manifest_dir: &Path, file: &Path) -> Option<String> {
-    let absolute = if file.is_absolute() {
-        file.to_path_buf()
-    } else {
-        env::current_dir().ok()?.join(file)
-    };
-    let rest = canonical(&absolute)
+    let rest = canonical(file)
         .strip_prefix(canonical(manifest_dir))
         .ok()?
         .to_path_buf();
