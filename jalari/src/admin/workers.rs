@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::AssertSqlSafe;
@@ -30,6 +32,11 @@ pub struct WorkerInfo {
     pub queues: Vec<QueueInfo>,
     /// Whether the worker runs the recurring scheduler.
     pub scheduler: bool,
+    /// Each task the worker runs, with the fingerprint of its build.
+    ///
+    /// The fingerprint is `None` for a task declared with `fingerprint = false`. The map is
+    /// empty for a worker on a jalari release without fingerprints.
+    pub tasks: BTreeMap<String, Option<String>>,
     /// When the worker registered.
     pub started_at: DateTime<Utc>,
     /// Last heartbeat.
@@ -43,6 +50,7 @@ struct WorkerRow {
     pid: i32,
     queues: Json<Vec<QueueInfo>>,
     scheduler: bool,
+    tasks: Option<Json<BTreeMap<String, Option<String>>>>,
     started_at: DateTime<Utc>,
     heartbeat_at: DateTime<Utc>,
 }
@@ -55,6 +63,7 @@ impl From<WorkerRow> for WorkerInfo {
             pid: row.pid,
             queues: row.queues.0,
             scheduler: row.scheduler,
+            tasks: row.tasks.map(|tasks| tasks.0).unwrap_or_default(),
             started_at: row.started_at,
             heartbeat_at: row.heartbeat_at,
         }
@@ -85,7 +94,7 @@ impl From<WorkerRow> for WorkerInfo {
 pub async fn workers() -> Result<Vec<WorkerInfo>> {
     let config = config()?;
     let rows: Vec<WorkerRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT id::text AS id, hostname, pid, queues, scheduler, started_at, heartbeat_at
+        "SELECT id::text AS id, hostname, pid, queues, scheduler, tasks, started_at, heartbeat_at
          FROM {worker}
          WHERE heartbeat_at >= now() - (SELECT worker_timeout FROM {config})
          ORDER BY started_at, id",

@@ -2,6 +2,7 @@ mod checkpoint;
 pub(crate) mod context;
 mod definition;
 mod error;
+pub(crate) mod fingerprint;
 mod id;
 pub(crate) mod registry;
 pub(crate) mod run;

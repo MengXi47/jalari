@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::pool::PoolConnection;
+use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, Connection, PgConnection, Postgres, Transaction};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -14,6 +15,7 @@ use super::close::{Closing, Ending, Outcome, close, decide};
 use super::middleware::{JobMeta, Next};
 use super::runner::Shared;
 use crate::job::context::{self, Captured};
+use crate::job::fingerprint::compatible;
 use crate::job::registry::JobRegistration;
 use crate::job::{Command, JobState, RunControl, run};
 use crate::{Error, ErrorKind, JobError, JobId, JobResult, JobRun, Result, Schema};
@@ -187,20 +189,21 @@ impl Shared {
         let schema = &self.config.schema;
         let sql = format!(
             "SELECT id, task, payload, attempts, max_attempts, timeout_ms, queue_key, context
-             FROM {job}
+             FROM {job} AS job
              WHERE queue = $1
                  AND state IN ('scheduled', 'enqueued')
                  AND run_at <= now()
-                 AND task = ANY($2)
+                 AND {compatible}
                  AND (queue_key IS NULL OR queue_key <> ALL($3))
              ORDER BY priority DESC, run_at, id
              LIMIT 1
              FOR UPDATE SKIP LOCKED",
             job = schema.table("job"),
+            compatible = compatible("$2::jsonb"),
         );
         let job = sqlx::query_as(AssertSqlSafe(sql))
             .bind(queue)
-            .bind(&self.task_names)
+            .bind(Json(&self.served))
             .bind(excluded_keys)
             .fetch_optional(connection)
             .await?;

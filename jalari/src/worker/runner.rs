@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -61,6 +62,7 @@ pub(super) struct Shared {
     pub(super) config: &'static Config,
     pub(super) jobs: HashMap<&'static str, &'static JobRegistration>,
     pub(super) task_names: Vec<String>,
+    pub(super) served: Value,
     pub(super) crons: Vec<DeclaredCron>,
     pub(super) settings: WorkerConfig,
     pub(super) retry_policy: Arc<dyn RetryPolicy>,

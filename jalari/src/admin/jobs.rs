@@ -13,8 +13,8 @@ const JSON_CODEC: &str = "json";
 const MAX_PAGE: u32 = 1000;
 
 pub(crate) const JOB_COLUMNS: &str = "id, queue, task, state, codec, payload, job_key, queue_key, \
-     priority, attempts, max_attempts, run_at, timeout_ms, last_error, context, created_at, \
-     updated_at";
+     priority, attempts, max_attempts, run_at, timeout_ms, last_error, context, fingerprint, \
+     created_at, updated_at";
 
 pub(crate) const FILTER_SQL: &str = "($1::text[] IS NULL OR state = ANY($1))
     AND ($2::text IS NULL OR queue = $2)
@@ -170,6 +170,13 @@ pub struct JobInfo {
     pub last_error: Option<String>,
     /// Context stored when the job was enqueued.
     pub context: Option<Value>,
+    /// Fingerprint of the build that enqueued the job; only a worker of that build runs it.
+    ///
+    /// `None` for a job enqueued without one: before migration 7, by a task declared with
+    /// `fingerprint = false`, by a process that does not link the task, or after
+    /// [`clear_fingerprint`](super::clear_fingerprint). Any worker that runs the task takes
+    /// such a job.
+    pub fingerprint: Option<String>,
     /// When the job was enqueued.
     pub created_at: DateTime<Utc>,
     /// When the state last changed.
@@ -216,6 +223,7 @@ pub(crate) struct JobRow {
     timeout_ms: Option<i32>,
     last_error: Option<String>,
     context: Option<Value>,
+    fingerprint: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -240,6 +248,7 @@ impl JobRow {
                 .map(|ms| Duration::from_millis(u64::try_from(ms).unwrap_or(0))),
             last_error: self.last_error,
             context: self.context,
+            fingerprint: self.fingerprint,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

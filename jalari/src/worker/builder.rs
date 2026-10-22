@@ -8,6 +8,7 @@ use super::flusher::RunBook;
 use super::middleware::ErasedMiddleware;
 use super::runner::{DeclaredCron, QueueConfig, Shared, Worker};
 use crate::init::{Config, config};
+use crate::job::fingerprint;
 use crate::job::registry::{JobRegistration, registrations};
 use crate::{
     Cron, Error, ErrorKind, ExponentialBackoff, JobMiddleware, Result, RetryPolicy, WorkerConfig,
@@ -121,11 +122,13 @@ impl WorkerBuilder {
         check_worker_timeout(config, &self.settings).await?;
         check_middlewares(&self.middlewares).await?;
         let task_names = jobs.keys().map(|name| (*name).to_owned()).collect();
+        let served = fingerprint::served(jobs.values().copied());
         Ok(Worker {
             shared: Arc::new(Shared {
                 config,
                 jobs,
                 task_names,
+                served,
                 crons,
                 settings: self.settings,
                 retry_policy: self.retry_policy,

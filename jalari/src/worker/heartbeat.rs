@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sqlx::AssertSqlSafe;
@@ -8,11 +9,15 @@ use tracing::warn;
 
 use super::runner::{QueueConfig, Shared};
 use crate::Result;
+use crate::admin::{StrandedJobs, stranded_in};
+
+const STRANDED_CHECK: Duration = Duration::from_secs(300);
 
 pub(super) struct WorkerRegistration {
     hostname: String,
     pid: i32,
     queues: Value,
+    queue_names: Vec<String>,
     scheduler: bool,
 }
 
@@ -25,6 +30,7 @@ impl WorkerRegistration {
                 .iter()
                 .map(|queue| json!({ "name": queue.name, "concurrency": queue.concurrency }))
                 .collect(),
+            queue_names: queues.iter().map(|queue| queue.name.clone()).collect(),
             scheduler,
         }
     }
@@ -36,10 +42,15 @@ pub(super) async fn heartbeat(
     shutdown: CancellationToken,
 ) {
     let mut worker_id: Option<String> = None;
+    let mut checked_at: Option<Instant> = None;
     loop {
         match shared.beat(&registration, worker_id.as_deref()).await {
             Ok(id) => worker_id = Some(id),
             Err(e) => warn!(error = %e, "failed to record the worker heartbeat"),
+        }
+        if worker_id.is_some() && checked_at.is_none_or(|at| at.elapsed() >= STRANDED_CHECK) {
+            checked_at = Some(Instant::now());
+            shared.warn_stranded(&registration.queue_names).await;
         }
         tokio::select! {
             () = shutdown.cancelled() => break,
@@ -75,14 +86,15 @@ impl Shared {
             Some(id) => id,
             None => {
                 sqlx::query_scalar(AssertSqlSafe(format!(
-                    "INSERT INTO {worker} (hostname, pid, queues, scheduler)
-                     VALUES ($1, $2, $3, $4)
+                    "INSERT INTO {worker} (hostname, pid, queues, scheduler, tasks)
+                     VALUES ($1, $2, $3, $4, $5)
                      RETURNING id::text"
                 )))
                 .bind(&registration.hostname)
                 .bind(registration.pid)
                 .bind(Json(&registration.queues))
                 .bind(registration.scheduler)
+                .bind(Json(&self.served))
                 .fetch_one(&pool)
                 .await?
             }
@@ -96,6 +108,36 @@ impl Shared {
         .execute(&pool)
         .await?;
         Ok(id)
+    }
+
+    async fn warn_stranded(&self, queues: &[String]) {
+        let groups = match self.stranded(queues).await {
+            Ok(groups) => groups,
+            Err(e) => {
+                warn!(error = %e, "failed to check for jobs no worker can run");
+                return;
+            }
+        };
+        for group in groups {
+            let message = if self.jobs.contains_key(group.task.as_str()) {
+                "no live worker runs these jobs, enqueued by another build of the task"
+            } else {
+                "no live worker knows this task"
+            };
+            warn!(
+                queue = %group.queue,
+                task = %group.task,
+                fingerprint = group.fingerprint.as_deref().unwrap_or("none"),
+                count = group.count,
+                since = %group.since,
+                "{message}"
+            );
+        }
+    }
+
+    async fn stranded(&self, queues: &[String]) -> Result<Vec<StrandedJobs>> {
+        let mut connection = self.config.pool.pool().acquire().await?;
+        stranded_in(&mut connection, &self.config.schema, Some(queues)).await
     }
 
     async fn unregister(&self, worker_id: &str) -> Result<()> {

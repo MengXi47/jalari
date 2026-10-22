@@ -1,10 +1,14 @@
 use std::collections::BTreeSet;
 
+use serde_json::Value;
+use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, Connection, PgConnection, Postgres, Transaction};
 
 use super::jobs::{FILTER_SQL, JobFilter, bind_filter};
 use crate::init::config;
 use crate::job::JOB_KEY_STATES;
+use crate::job::fingerprint;
+use crate::job::registry::registrations;
 use crate::storage::JOB_CHANNEL;
 use crate::worker::{INTERRUPTED, TAKEOVER_DELAY};
 use crate::{Error, ErrorKind, JobId, JobState, Result, Schema};
@@ -93,11 +97,12 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
     .bind(id.0)
     .fetch_optional(&mut *transaction)
     .await?;
+    let served = fingerprint::served(registrations());
     let outcome = match locked {
         None => RetryOutcome::NotFound,
         Some((state, _)) if state != JobState::Failed.as_str() => RetryOutcome::NotFailed,
         Some((_, queue)) => {
-            let outcome = retry_locked(&mut transaction, schema, id).await?;
+            let outcome = retry_locked(&mut transaction, schema, id, &served).await?;
             if outcome == RetryOutcome::Retried {
                 notify(&mut transaction, schema, &queue).await?;
             }
@@ -132,6 +137,7 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
     let schema = &config.schema;
     let pool = config.pool.pool();
     let filter = filter.only_failed();
+    let served = fingerprint::served(registrations());
     let mut summary = RetrySummary::default();
     let mut after = 0_i64;
     loop {
@@ -160,7 +166,7 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
         .await?;
         let mut queues = BTreeSet::new();
         for (id, queue) in locked {
-            match retry_locked(&mut transaction, schema, JobId(id)).await? {
+            match retry_locked(&mut transaction, schema, JobId(id), &served).await? {
                 RetryOutcome::Retried => {
                     summary.retried += 1;
                     queues.insert(queue);
@@ -252,13 +258,63 @@ pub async fn run_now(id: JobId) -> Result<RunNowOutcome> {
     Ok(outcome)
 }
 
+/// Lets any worker that runs their task take the waiting jobs matching `filter`, whichever build
+/// enqueued them, and returns how many it released.
+///
+/// It removes the fingerprint from every scheduled, enqueued or stopped job that matches and
+/// has one, then notifies the workers of their queues. Use it when jobs wait for a build that
+/// will not be deployed again, such as after a rollback or a change you know is compatible.
+/// Running jobs are skipped. A failed job keeps its fingerprint; [`retry`] gives it the
+/// caller's. The filter's states narrow the jobs further.
+///
+/// # Errors
+///
+/// Returns an error if [`init`](crate::init) has not completed or the database query fails.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// let filter = jalari::admin::JobFilter::new().task("send_email");
+/// let released = jalari::admin::clear_fingerprint(&filter).await?;
+/// println!("{released} jobs can now run on any build");
+/// # Ok(())
+/// # }
+/// ```
+pub async fn clear_fingerprint(filter: &JobFilter) -> Result<u64> {
+    let config = config()?;
+    let schema = &config.schema;
+    let mut transaction = config.pool.pool().begin().await?;
+    let query = sqlx::query_scalar(AssertSqlSafe(format!(
+        "UPDATE {job} SET fingerprint = NULL
+         WHERE id IN (
+             SELECT id FROM {job}
+             WHERE {FILTER_SQL}
+                 AND fingerprint IS NOT NULL
+                 AND state IN ('scheduled', 'enqueued', 'stopped')
+             FOR UPDATE SKIP LOCKED
+         )
+         RETURNING queue",
+        job = schema.table("job"),
+    )));
+    let queues: Vec<String> = bind_filter!(query, filter)
+        .fetch_all(&mut *transaction)
+        .await?;
+    for queue in queues.iter().collect::<BTreeSet<_>>() {
+        notify(&mut transaction, schema, queue).await?;
+    }
+    transaction.commit().await?;
+    Ok(u64::try_from(queues.len()).unwrap_or(u64::MAX))
+}
+
 async fn retry_locked(
     transaction: &mut Transaction<'_, Postgres>,
     schema: &Schema,
     id: JobId,
+    served: &Value,
 ) -> Result<RetryOutcome> {
     for _ in 0..MAX_KEY_RETRIES {
-        if let Some(outcome) = try_retry(transaction, schema, id).await? {
+        if let Some(outcome) = try_retry(transaction, schema, id, served).await? {
             return Ok(outcome);
         }
     }
@@ -272,6 +328,7 @@ async fn try_retry(
     transaction: &mut Transaction<'_, Postgres>,
     schema: &Schema,
     id: JobId,
+    served: &Value,
 ) -> Result<Option<RetryOutcome>> {
     let mut attempt = Connection::begin(&mut **transaction).await?;
     let retried = sqlx::query(AssertSqlSafe(format!(
@@ -280,6 +337,7 @@ async fn try_retry(
              SET state = CASE WHEN last_error = $2 AND updated_at + $3 > statement_timestamp()
                      THEN 'scheduled' ELSE 'enqueued' END,
                  attempts = 0,
+                 fingerprint = COALESCE($4::jsonb ->> task, fingerprint),
                  run_at = CASE WHEN last_error = $2
                      THEN greatest(statement_timestamp(), updated_at + $3)
                      ELSE statement_timestamp() END,
@@ -295,6 +353,7 @@ async fn try_retry(
     .bind(id.0)
     .bind(INTERRUPTED)
     .bind(TAKEOVER_DELAY)
+    .bind(Json(served))
     .execute(&mut *attempt)
     .await;
     match retried {

@@ -5,7 +5,7 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::init::config;
-use crate::job::{JOB_KEY_STATES, context, registry};
+use crate::job::{JOB_KEY_STATES, context, fingerprint, registry};
 use crate::storage::{JOB_CHANNEL, interval};
 use crate::worker::{INTERRUPTED, mark_interrupted};
 use crate::{
@@ -46,6 +46,7 @@ pub(crate) struct EnqueueRequest {
     queue_key: Option<String>,
     on_conflict: OnConflict,
     context: Option<Value>,
+    fingerprint: Option<&'static str>,
     inherit_when_submitted: bool,
 }
 
@@ -97,6 +98,7 @@ impl EnqueueRequest {
             queue_key: options.queue_key,
             on_conflict: options.on_conflict,
             context,
+            fingerprint: fingerprint::of_task(T::NAME),
         })
     }
 
@@ -110,6 +112,7 @@ impl EnqueueRequest {
         context: Option<Value>,
     ) -> Self {
         Self {
+            fingerprint: fingerprint::of_task(&task),
             task,
             payload,
             max_attempts,
@@ -199,9 +202,9 @@ impl EnqueueRequest {
     ) -> Result<Option<JobId>> {
         let sql = format!(
             "INSERT INTO {job} (queue, task, payload, state, job_key, queue_key, max_attempts, \
-                 run_at, timeout_ms, context)
+                 run_at, timeout_ms, context, fingerprint)
              SELECT $1, $2, $3, CASE WHEN input.run_at > now() THEN 'scheduled' ELSE 'enqueued' END,
-                 $4, $5, $6, input.run_at, $7, $10
+                 $4, $5, $6, input.run_at, $7, $10, $11
              FROM (SELECT COALESCE($8::timestamptz, now() + COALESCE($9::interval, interval '0'))
                  AS run_at) AS input
              ON CONFLICT (job_key) WHERE job_key IS NOT NULL AND state IN {JOB_KEY_STATES}
@@ -220,6 +223,7 @@ impl EnqueueRequest {
             .bind(self.run_at)
             .bind(self.delay)
             .bind(&self.context)
+            .bind(self.fingerprint)
             .fetch_optional(connection)
             .await?;
         Ok(id.map(JobId))
@@ -253,7 +257,7 @@ impl EnqueueRequest {
                      queue_key = $4, attempts = 0, max_attempts = $5, run_at = input.run_at,
                      timeout_ms = $6,
                      last_error = CASE WHEN locked.takeover_at IS NOT NULL THEN $11 END,
-                     context = $10, updated_at = statement_timestamp()
+                     context = $10, fingerprint = $12, updated_at = statement_timestamp()
                  FROM locked, LATERAL (
                      SELECT greatest(
                          COALESCE($7::timestamptz, now() + COALESCE($8::interval, interval '0')),
@@ -296,6 +300,7 @@ impl EnqueueRequest {
                 .bind(job_key)
                 .bind(&self.context)
                 .bind(INTERRUPTED)
+                .bind(self.fingerprint)
                 .fetch_optional(&mut *connection)
                 .await?;
             match row {

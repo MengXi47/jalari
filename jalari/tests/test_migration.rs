@@ -127,6 +127,33 @@ async fn test_migrate_creates_schema_and_records_version() {
 }
 
 #[tokio::test]
+async fn test_version_7_adds_the_fingerprint_columns() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    let columns = [
+        "job.fingerprint:text:YES:".to_owned(),
+        "worker.tasks:jsonb:YES:".to_owned(),
+    ];
+
+    assert_eq!(SCHEMA_VERSION, 7);
+    jalari::migrate_to(&pool, &schema, 6).await.unwrap();
+    let before = snapshot(&pool, &name).await;
+    assert!(columns.iter().all(|column| !before.contains(column)));
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let after = snapshot(&pool, &name).await;
+    assert!(columns.iter().all(|column| after.contains(column)));
+    assert_eq!(
+        jalari::schema_version(&pool, &schema).await.unwrap(),
+        Some(7)
+    );
+
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
 async fn test_migrate_is_idempotent() {
     let Some(pool) = test_pool().await else {
         return;
