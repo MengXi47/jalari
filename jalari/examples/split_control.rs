@@ -2,7 +2,26 @@ use std::time::Duration;
 
 use jalari::{CancelOutcome, JobId, StopOutcome};
 
-const USAGE: &str = "usage: split_control <stop|restart|cancel|status> <job id>";
+const USAGE: &str = "usage: split_control <stop|restart|cancel|status> <job id>
+       split_control stranded
+       split_control release <task>";
+
+enum Command<'a> {
+    Job(&'a str, JobId),
+    Stranded,
+    Release(&'a str),
+}
+
+fn parse<'a>(args: &[&'a str]) -> Option<Command<'a>> {
+    match args {
+        ["stranded"] => Some(Command::Stranded),
+        ["release", task] => Some(Command::Release(task)),
+        [command @ ("stop" | "restart" | "cancel" | "status"), id] => {
+            Some(Command::Job(command, JobId(id.parse().ok()?)))
+        }
+        _ => None,
+    }
+}
 
 async fn status(pool: &jalari::sqlx::PgPool, id: JobId) -> jalari::sqlx::Result<()> {
     let row: Option<(String, String, i32, Option<String>)> = jalari::sqlx::query_as(
@@ -24,20 +43,12 @@ async fn status(pool: &jalari::sqlx::PgPool, id: JobId) -> jalari::sqlx::Result<
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [command, id] = args.as_slice() else {
-        return Err(USAGE.into());
-    };
-    let id = JobId(id.parse().map_err(|_| USAGE)?);
-
-    let pool = jalari::sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    jalari::init(pool.clone())
-        .schema(jalari::Schema::default())
-        .await?;
-
-    match command.as_str() {
+async fn control(
+    pool: &jalari::sqlx::PgPool,
+    command: &str,
+    id: JobId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
         "stop" => loop {
             match jalari::stop(id).await? {
                 StopOutcome::Requested => {
@@ -57,9 +68,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         "restart" => println!("restart: {:?}", jalari::restart(id).await?),
-        "status" => {}
-        _ => return Err(USAGE.into()),
+        _ => {}
     }
-    status(&pool, id).await?;
+    status(pool, id).await?;
+    Ok(())
+}
+
+async fn stranded() -> jalari::Result<()> {
+    let groups = jalari::admin::stranded().await?;
+    if groups.is_empty() {
+        println!("every due job has a live worker that can run it");
+    }
+    for group in groups {
+        let needed = match &group.fingerprint {
+            Some(fingerprint) => format!("a worker built with fingerprint {fingerprint}"),
+            None => "a worker that knows the task".to_owned(),
+        };
+        println!(
+            "{} {} job(s) in queue {} wait for {needed} since {}",
+            group.count, group.task, group.queue, group.since
+        );
+    }
+    Ok(())
+}
+
+async fn release(task: &str) -> jalari::Result<()> {
+    let filter = jalari::admin::JobFilter::new().task(task);
+    let released = jalari::admin::clear_fingerprint(&filter).await?;
+    println!("{released} {task} job(s) can now run on any build that knows the task");
+    Ok(())
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(command) = parse(&args) else {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
+    };
+
+    let pool = jalari::sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    jalari::init(pool.clone())
+        .schema(jalari::Schema::default())
+        .await?;
+
+    match command {
+        Command::Job(command, id) => control(&pool, command, id).await?,
+        Command::Stranded => stranded().await?,
+        Command::Release(task) => release(task).await?,
+    }
     Ok(())
 }

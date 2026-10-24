@@ -82,3 +82,19 @@ impl Job for Export {
         Ok(())
     }
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct VacuumTables;
+
+#[jalari::job(queue = "maintenance", fingerprint = false)]
+impl Job for VacuumTables {
+    const NAME: &'static str = "vacuum_tables";
+
+    async fn run(self) -> JobResult {
+        println!(
+            "[pid {}] vacuuming tables; this task runs on any build",
+            std::process::id()
+        );
+        Ok(())
+    }
+}

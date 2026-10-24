@@ -26,8 +26,10 @@ const UNPINNED: &str = "fp_unpinned";
 const ELSEWHERE: &str = "fp_elsewhere";
 const OTHER: &str = "0123456789abcdef0123456789abcdef";
 const WAIT: Duration = Duration::from_secs(20);
-const ANOTHER_BUILD: &str = "no live worker runs these jobs, enqueued by another build of the task";
-const UNKNOWN_TASK: &str = "no live worker knows this task";
+const ANOTHER_BUILD: &str = "no live worker runs these jobs, enqueued by another build of the task; \
+                             start a worker of that build, or release them with \
+                             jalari::admin::clear_fingerprint";
+const UNKNOWN_TASK: &str = "no live worker knows this task; start a worker that links it";
 
 static RAN: LazyLock<Mutex<BTreeSet<String>>> = LazyLock::new(|| Mutex::new(BTreeSet::new()));
 static WARNINGS: LazyLock<Mutex<Vec<BTreeMap<String, String>>>> =

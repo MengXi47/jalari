@@ -120,9 +120,10 @@ impl Shared {
         };
         for group in groups {
             let message = if self.jobs.contains_key(group.task.as_str()) {
-                "no live worker runs these jobs, enqueued by another build of the task"
+                "no live worker runs these jobs, enqueued by another build of the task; start a \
+                 worker of that build, or release them with jalari::admin::clear_fingerprint"
             } else {
-                "no live worker knows this task"
+                "no live worker knows this task; start a worker that links it"
             };
             warn!(
                 queue = %group.queue,

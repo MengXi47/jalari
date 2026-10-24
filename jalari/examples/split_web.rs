@@ -1,7 +1,7 @@
 #[path = "common/jobs.rs"]
 mod jobs;
 
-use jobs::{DailyReport, Export, SendEmail};
+use jobs::{DailyReport, Export, SendEmail, VacuumTables};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,11 +32,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let export = jalari::enqueue(&Export { rows: 120 }).await?.id();
+    jalari::enqueue(&VacuumTables).await?;
 
-    println!("enqueued 12 jobs and scheduled \"promo\"; no worker runs in this process");
+    println!("enqueued 13 jobs and scheduled \"promo\"; no worker runs in this process");
     println!("export job {export} runs for a minute; control it from another process with");
     println!("  cargo run -p jalari --example split_control -- stop {export}");
     println!("  cargo run -p jalari --example split_control -- restart {export}");
     println!("  cargo run -p jalari --example split_control -- cancel {export}");
+    println!("every job but vacuum_tables carries the fingerprint of this build, so a worker");
+    println!("built from a changed common/jobs.rs leaves them waiting; list and release them with");
+    println!("  cargo run -p jalari --example split_control -- stranded");
+    println!("  cargo run -p jalari --example split_control -- release send_email");
     Ok(())
 }

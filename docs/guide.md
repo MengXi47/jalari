@@ -176,9 +176,9 @@ of that build, the same way a job under an unknown name waits for a worker that 
 The fingerprint covers:
 
 - the `impl Job` block and the definition of the job's struct
-- every function, method, constant, static, type, trait implementation and `macro_rules!` that
-  the job's code reaches, directly or through other items, in the job's crate and in its
-  `path` dependencies
+- every function, method, constant, static, type, trait implementation, `use` declaration and
+  `macro_rules!` that the job's code reaches, directly or through other items, in the job's
+  crate and in its `path` dependencies
 - the `Cargo.lock` version of each registry crate that the reached code names
 - the jalari version
 
@@ -192,6 +192,13 @@ a trait reaches all of its implementations. Code that a build script generates i
 and names that macros such as `paste!` build are not analysed. When the compiler does not
 report the source file of the job, as in some IDE and non-Cargo builds, the fingerprint covers
 every item of the crate and of its `path` dependencies.
+
+This holds on your own machine as much as in production. After you edit a job and restart its
+worker, the jobs that the earlier build enqueued, before the edit or from a process that still
+runs the old code, wait, and the worker logs `no live worker runs these jobs, enqueued by
+another build of the task` when it starts and every five minutes after. Restart every process
+that enqueues the task too, or release the waiting jobs with
+[`jalari::admin::clear_fingerprint`](#jobs-that-wait-for-another-build).
 
 To let a job run on any build, turn the check off for it:
 
@@ -869,7 +876,10 @@ let released = jalari::admin::clear_fingerprint(&filter).await?;
 both processes its queue and runs its task at a matching fingerprint. A job whose task no
 running binary knows is listed too. Jobs that only wait for a busy worker are not listed. A worker of
 a release before migration 7 counts as able to run every task of its queues. Each worker logs
-a warning for the groups in its own queues when it starts and every five minutes after.
+a warning for the groups in its own queues when it starts and every five minutes after: `no
+live worker runs these jobs, enqueued by another build of the task` when the worker knows the
+task, and `no live worker knows this task` when no running binary links it. Both carry the
+queue, the task, the fingerprint, the count and since when the oldest job is due.
 
 `clear_fingerprint` removes the fingerprint from every scheduled, enqueued or stopped job that
 matches the filter, so any worker that knows the task runs it, and notifies the workers of
@@ -963,6 +973,7 @@ cargo run -p jalari --example middleware
 cargo run -p jalari --example split_worker
 cargo run -p jalari --example split_web
 cargo run -p jalari --example split_control -- stop 42
+cargo run -p jalari --example split_control -- stranded
 ```
 
 | Example | Shows |
@@ -971,7 +982,7 @@ cargo run -p jalari --example split_control -- stop 42
 | [`basic`](../jalari/examples/basic.rs) | Defining, enqueueing and running jobs in one process: errors and retries, `job_key` with `KeepExisting` and `Replace`, `queue_key`, delays, transactions, recurring schedules, `current_job`, `shutdown_requested`, cluster settings and monitoring. It runs until Ctrl-C |
 | [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
 | [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, and a job that passes its context to the jobs it enqueues. It exits when done |
-| [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job from yet another process |
+| [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job, lists the jobs no live worker can run (`stranded`) or releases a task's jobs to any build (`release <task>`) from yet another process. `vacuum_tables` is declared with `fingerprint = false`; edit `common/jobs.rs` and rebuild only `split_worker` to see the other jobs wait for the build that enqueued them |
 
 The examples use `jalari::Schema::default()`, so they share the `jalari` schema of the
 database they run against.

@@ -219,6 +219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "worker {}@{} scheduler={} queues={:?}",
             worker.pid, worker.hostname, worker.scheduler, worker.queues
         );
+        for (task, fingerprint) in &worker.tasks {
+            match fingerprint {
+                Some(fingerprint) => println!("  {task}: fingerprint {fingerprint}"),
+                None => println!("  {task}: any build"),
+            }
+        }
     }
 
     println!("press Ctrl-C to stop");

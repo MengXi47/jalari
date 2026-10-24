@@ -56,7 +56,7 @@ jalari = "0.6"
         │       PostgreSQL        │
         │   jobs wait in a table  │
         └────────────┬────────────┘
-                     │  wake a worker, lock one job
+                     │  wake a worker, lock one job of its own build
                      ▼
         ┌─────────────────────────┐
         │         Workers         │
