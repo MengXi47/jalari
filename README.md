@@ -16,7 +16,7 @@ jalari keeps jobs, schedules and workers in PostgreSQL tables. Declare a job wit
 
 ```toml
 [dependencies]
-jalari = "0.5"
+jalari = "0.6"
 ```
 
 ## Features
