@@ -8,7 +8,7 @@ use jalari::{SCHEMA_VERSION, Schema};
 #[command(
     name = "jalari",
     version,
-    about = "Create, export and inspect the jalari tables"
+    about = "Create, export and inspect the jalari tables, and pause queues"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -21,8 +21,12 @@ pub(crate) enum Command {
     Sql(SqlArgs),
     #[command(about = "Apply the missing migrations to a database")]
     Migrate(MigrateArgs),
-    #[command(about = "Show the installed and the latest schema version")]
+    #[command(about = "Show the installed and the latest schema version and the paused queues")]
     Status(StatusArgs),
+    #[command(about = "Stop workers from starting new jobs of a queue")]
+    Pause(QueueArgs),
+    #[command(about = "Let workers start jobs of a paused queue again")]
+    Resume(QueueArgs),
 }
 
 #[derive(Debug, Args)]
@@ -92,6 +96,16 @@ pub(crate) struct StatusArgs {
     pub(crate) database: DatabaseArgs,
     #[command(flatten)]
     pub(crate) schema: SchemaArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct QueueArgs {
+    #[command(flatten)]
+    pub(crate) database: DatabaseArgs,
+    #[command(flatten)]
+    pub(crate) schema: SchemaArgs,
+    #[arg(help = "Name of the queue")]
+    pub(crate) queue: String,
 }
 
 fn version_parser() -> clap::builder::RangedI64ValueParser<i32> {

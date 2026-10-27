@@ -8,7 +8,7 @@ use jalari::{Migration, SCHEMA_VERSION, Schema};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgConnection, PgPool};
 
-use crate::args::{MigrateArgs, SqlArgs, StatusArgs};
+use crate::args::{MigrateArgs, QueueArgs, SqlArgs, StatusArgs};
 
 type CommandResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -90,6 +90,48 @@ pub(crate) async fn status(args: &StatusArgs) -> CommandResult {
     println!("installed: {}", version_label(installed));
     println!("latest:    {SCHEMA_VERSION}");
     println!("status:    {state}");
+    if installed == Some(SCHEMA_VERSION) {
+        jalari::init(pool).schema(schema).await?;
+        let paused = jalari::admin::paused_queues().await?;
+        if paused.is_empty() {
+            println!("paused:    none");
+        }
+        for (i, queue) in paused.iter().enumerate() {
+            let label = if i == 0 { "paused:" } else { "" };
+            println!(
+                "{label:<10} {} since {}",
+                queue.queue,
+                queue.paused_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn pause(args: &QueueArgs) -> CommandResult {
+    init(args).await?;
+    if jalari::admin::pause_queue(&args.queue).await? {
+        println!("{}: paused", args.queue);
+    } else {
+        println!("{}: already paused", args.queue);
+    }
+    Ok(())
+}
+
+pub(crate) async fn resume(args: &QueueArgs) -> CommandResult {
+    init(args).await?;
+    if jalari::admin::resume_queue(&args.queue).await? {
+        println!("{}: resumed", args.queue);
+    } else {
+        println!("{}: was not paused", args.queue);
+    }
+    Ok(())
+}
+
+async fn init(args: &QueueArgs) -> CommandResult {
+    let schema = args.schema.build()?;
+    let pool = connect(&args.database.database_url).await?;
+    jalari::init(pool).schema(schema).await?;
     Ok(())
 }
 

@@ -144,6 +144,82 @@ async fn test_migrate_and_status() {
 }
 
 #[tokio::test]
+async fn test_cli_pause_and_resume() {
+    let Some(url) = database_url() else {
+        return;
+    };
+    let pool = PgPool::connect(&url).await.unwrap();
+    let name = unique_name();
+    let common = ["--database-url", url.as_str(), "--schema", name.as_str()];
+    let with = |command: &str, extra: &[&str]| {
+        let mut args = vec![command];
+        args.extend(common);
+        args.extend(extra);
+        jalari(&args)
+    };
+    let paused_lines = |status: &str| -> Vec<String> {
+        status
+            .lines()
+            .skip_while(|line| !line.starts_with("paused:"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let before_migrate = with("pause", &["exports"]);
+    assert!(!before_migrate.status.success());
+    let stderr = String::from_utf8_lossy(&before_migrate.stderr);
+    assert!(stderr.contains("SchemaVersionMismatch"), "{stderr}");
+    let status = stdout(&with("status", &[]));
+    assert!(paused_lines(&status).is_empty(), "{status}");
+
+    stdout(&with("migrate", &[]));
+    let status = stdout(&with("status", &[]));
+    assert_eq!(paused_lines(&status), ["paused:    none"], "{status}");
+
+    assert_eq!(stdout(&with("pause", &["exports"])), "exports: paused\n");
+    assert_eq!(
+        stdout(&with("pause", &["exports"])),
+        "exports: already paused\n"
+    );
+    assert_eq!(stdout(&with("pause", &["billing"])), "billing: paused\n");
+    let stored: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT queue FROM \"{name}\".queue_pause ORDER BY queue"
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, ["billing", "exports"]);
+
+    let status = stdout(&with("status", &[]));
+    let lines = paused_lines(&status);
+    assert_eq!(lines.len(), 2, "{status}");
+    assert!(
+        lines[0].starts_with("paused:    billing since "),
+        "{status}"
+    );
+    assert!(
+        lines[1].starts_with("           exports since "),
+        "{status}"
+    );
+    assert!(lines.iter().all(|line| line.ends_with(" UTC")), "{status}");
+
+    assert_eq!(stdout(&with("resume", &["exports"])), "exports: resumed\n");
+    assert_eq!(
+        stdout(&with("resume", &["exports"])),
+        "exports: was not paused\n"
+    );
+    let status = stdout(&with("status", &[]));
+    let lines = paused_lines(&status);
+    assert_eq!(lines.len(), 1, "{status}");
+    assert!(
+        lines[0].starts_with("paused:    billing since "),
+        "{status}"
+    );
+
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
 async fn test_migrate_reads_database_url_from_env() {
     let Some(url) = database_url() else {
         return;

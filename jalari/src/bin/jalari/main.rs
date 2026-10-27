@@ -14,6 +14,8 @@ async fn main() -> ExitCode {
         Command::Sql(args) => command::sql(args),
         Command::Migrate(args) => command::migrate(args).await,
         Command::Status(args) => command::status(args).await,
+        Command::Pause(args) => command::pause(args).await,
+        Command::Resume(args) => command::resume(args).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
