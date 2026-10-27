@@ -52,9 +52,10 @@ use syn::{
 /// # Checks
 ///
 /// The job's constants are checked at compile time, computed values included: `NAME` must not
-/// be empty, `MAX_ATTEMPTS` must be at least 1, and `TIMEOUT`, when set, must be longer than
-/// zero and at most `i32::MAX` milliseconds. A violation is a compile error that names the job
-/// and points at the constant, or at the argument that set it.
+/// be empty, `MAX_ATTEMPTS` must be at least 1, `TIMEOUT`, when set, must be longer than zero
+/// and at most `i32::MAX` milliseconds, and no entry of `ALIASES` may be empty, equal `NAME`
+/// or repeat another. A violation is a compile error that names the job and points at the
+/// constant, or at the argument that set it.
 ///
 /// # Code fingerprint
 ///
@@ -320,12 +321,21 @@ fn constant_checks(item_impl: &ItemImpl) -> TokenStream2 {
             #message
         );
     };
+    let message =
+        format!("{label}: Job::ALIASES must not contain an empty name, NAME or a repeated name");
+    let aliases = quote_spanned! {span_of("ALIASES")=>
+        ::core::assert!(
+            ::jalari::__private::aliases_are_distinct(#job::NAME, #job::ALIASES),
+            #message
+        );
+    };
 
     quote! {
         const _: () = {
             #max_attempts
             #name
             #timeout
+            #aliases
         };
     }
 }

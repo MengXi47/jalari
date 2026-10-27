@@ -65,6 +65,7 @@ struct Report {
 impl Job for Report {
     const NAME: &'static str = "r_report";
     const PRIORITY: Priority = Priority::Urgent;
+    const ALIASES: &'static [&'static str] = &["r_report_before"];
 
     async fn run(self) -> JobResult {
         record_execution(&format!("report:{}", self.title));
@@ -224,6 +225,7 @@ async fn test_recurring() {
     check_trigger_runs_now().await;
     check_runtime_schedule_stores_the_type_priority().await;
     check_trigger_uses_the_stored_priority_without_the_registration(&fixture).await;
+    check_runtime_schedule_under_alias_fires_and_is_renamed(&fixture).await;
     check_recomputed_schedule_never_repeats_a_fired_run(&fixture).await;
     check_each_run_is_enqueued_once_under_contention(&fixture).await;
 
@@ -599,4 +601,25 @@ async fn check_trigger_uses_the_stored_priority_without_the_registration(fixture
     );
     let id = inserted(recurring::trigger("unlinked_priority").await.unwrap());
     assert_eq!(priority_of(id).await, Priority::High);
+}
+
+async fn check_runtime_schedule_under_alias_fires_and_is_renamed(fixture: &Fixture) {
+    fixture
+        .insert_row("aliased_report", "* * * * * *", "r_report_before", false)
+        .await;
+    wait_until("the aliased schedule to fire and be renamed", async || {
+        info("aliased_report").await.unwrap().task == "r_report"
+    })
+    .await;
+    let fired = admin::jobs(
+        &JobFilter::new().job_key("recurring:aliased_report"),
+        10,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!fired.is_empty());
+    assert!(fired.iter().all(|job| job.task == "r_report"), "{fired:?}");
+    assert!(info("aliased_report").await.unwrap().run_count >= 1);
+    recurring::remove("aliased_report").await.unwrap();
 }

@@ -11,7 +11,7 @@ use super::runner::{DeclaredCron, QueueConfig, Shared, Worker};
 use super::runs::RunBook;
 use crate::init::{Config, config};
 use crate::job::fingerprint;
-use crate::job::registry::{JobRegistration, registrations};
+use crate::job::registry::{JobRegistration, entries};
 use crate::{
     Cron, Error, ErrorKind, ExponentialBackoff, JobMiddleware, Result, RetryPolicy, WorkerConfig,
 };
@@ -106,7 +106,7 @@ impl WorkerBuilder {
     ///   ([`NoQueueConfigured`](ErrorKind::NoQueueConfigured),
     ///   [`DuplicateQueue`](ErrorKind::DuplicateQueue),
     ///   [`InvalidConcurrency`](ErrorKind::InvalidConcurrency))
-    /// - The binary contains no job, or two jobs share a name
+    /// - The binary contains no job, or two jobs share a name or an alias
     ///   ([`NoJobRegistered`](ErrorKind::NoJobRegistered),
     ///   [`DuplicateJobName`](ErrorKind::DuplicateJobName))
     /// - A declared cron expression or time zone is invalid
@@ -208,16 +208,23 @@ fn validate_queues(queues: &[QueueConfig]) -> Result<()> {
 
 fn collect_jobs() -> Result<HashMap<&'static str, &'static JobRegistration>> {
     let mut jobs = HashMap::new();
-    for registration in registrations() {
-        if jobs.insert(registration.name, registration).is_some() {
-            return Err(Error::new(
-                ErrorKind::DuplicateJobName,
-                format!(
-                    "more than one #[jalari::job] uses the name {:?}",
-                    registration.name
-                ),
+    let mut collisions = Vec::new();
+    for (name, registration) in entries() {
+        if let Some(owner) = jobs.insert(name, registration) {
+            let mut owners = [owner.name, registration.name];
+            owners.sort_unstable();
+            collisions.push(format!(
+                "{name:?} is the NAME or an alias of both {:?} and {:?}",
+                owners[0], owners[1]
             ));
         }
+    }
+    if !collisions.is_empty() {
+        collisions.sort();
+        return Err(Error::new(
+            ErrorKind::DuplicateJobName,
+            collisions.join("; "),
+        ));
     }
     if jobs.is_empty() {
         return Err(Error::new(
@@ -256,7 +263,9 @@ fn select_jobs(
         let key = (registration.context)();
         if key.is_unit() || provided.contains(&key.id) {
             selected.insert(name, registration);
-        } else if queues.iter().any(|queue| queue.name == registration.queue) {
+        } else if name == registration.name
+            && queues.iter().any(|queue| queue.name == registration.queue)
+        {
             missing.push(format!(
                 "{name} (queue {:?}) needs {}",
                 registration.queue, key.name
@@ -293,7 +302,10 @@ fn parse_crons(
     jobs: &HashMap<&'static str, &'static JobRegistration>,
 ) -> Result<Vec<DeclaredCron>> {
     let mut crons = Vec::new();
-    for registration in jobs.values() {
+    for (name, registration) in jobs {
+        if *name != registration.name {
+            continue;
+        }
         let Some(declaration) = &registration.cron else {
             continue;
         };

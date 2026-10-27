@@ -79,6 +79,9 @@ fn test_expansion_asserts_job_constants() {
         "< J as :: jalari :: Job > :: TIMEOUT",
         "timeout . is_zero ()",
         "timeout . as_millis () <= :: core :: primitive :: i32 :: MAX",
+        ":: jalari :: __private :: aliases_are_distinct (< J as :: jalari :: Job > :: NAME , \
+         < J as :: jalari :: Job > :: ALIASES)",
+        "\"J: Job::ALIASES must not contain an empty name, NAME or a repeated name\"",
     ] {
         assert!(checks.contains(expected), "the checks contain {expected}");
     }

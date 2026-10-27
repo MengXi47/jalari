@@ -108,6 +108,41 @@ pub fn find(name: &str) -> Option<&'static JobRegistration> {
         .map(|(_, registration)| registration)
 }
 
+#[doc(hidden)]
+pub const fn aliases_are_distinct(name: &str, aliases: &[&str]) -> bool {
+    let mut index = 0;
+    while index < aliases.len() {
+        let alias = aliases[index];
+        if alias.is_empty() || same_text(alias, name) {
+            return false;
+        }
+        let mut earlier = 0;
+        while earlier < index {
+            if same_text(aliases[earlier], alias) {
+                return false;
+            }
+            earlier += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+const fn same_text(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 fn run_job<T: Job>(provided: Provided, payload: &[u8]) -> JobFuture {
     match serde_json::from_slice::<T>(payload) {
         Ok(job) => Box::pin(async move {
@@ -126,4 +161,26 @@ fn run_job<T: Job>(provided: Provided, payload: &[u8]) -> JobFuture {
 
 fn default_payload<T: Job + Default>() -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(&T::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aliases_are_distinct;
+
+    #[test]
+    fn test_aliases_are_distinct_rejects_name_empty_and_repeats() {
+        assert!(aliases_are_distinct("send_email", &[]));
+        assert!(aliases_are_distinct("send_email", &["mail", "send_mail"]));
+        assert!(aliases_are_distinct(
+            "send_email",
+            &["send_emai", "send_emails"]
+        ));
+        assert!(!aliases_are_distinct("send_email", &[""]));
+        assert!(!aliases_are_distinct("send_email", &["mail", "send_email"]));
+        assert!(!aliases_are_distinct(
+            "send_email",
+            &["mail", "old", "mail"]
+        ));
+        assert!(!aliases_are_distinct("send_email", &["old", "old"]));
+    }
 }

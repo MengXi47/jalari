@@ -65,9 +65,10 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// `#[jalari::job(name = "...")]` can set it instead of the impl. When neither sets it,
     /// `#[jalari::job]` uses the type's name as written, so renaming the type renames the job.
     ///
-    /// Must be unique within a binary. Jobs already enqueued under an old name keep waiting
-    /// until a worker that knows that name picks them up. Jobs enqueued by another build of
-    /// the same name wait the same way, for a worker of that build.
+    /// Must be unique within a binary, among the names and [`ALIASES`](Self::ALIASES) of every
+    /// linked job. Jobs stored under a name no linked job declares wait until a worker that
+    /// knows it picks them up; to rename a job, keep the old name in `ALIASES`. Jobs enqueued
+    /// by another build of the same name wait the same way, for a worker of that build.
     ///
     /// Must not be empty; `#[jalari::job]` rejects an empty name at compile time:
     ///
@@ -192,9 +193,65 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
 
     /// Earlier names of this job whose waiting jobs and schedules this type still runs.
     ///
-    /// New jobs are always enqueued under [`NAME`](Self::NAME). An alias must not be empty, equal
-    /// `NAME` or repeat, and must not be the `NAME` or an alias of another job linked into the
-    /// same binary.
+    /// New jobs are always enqueued under [`NAME`](Self::NAME). Jobs stored under an alias run
+    /// through this type, and [`JobRun::name`](crate::JobRun::name) reports `NAME` for them. A
+    /// runtime schedule stored under an alias is moved to `NAME` the next time it fires. Once
+    /// no job and no schedule uses an alias, it can be removed.
+    ///
+    /// An alias must not be empty, equal `NAME` or repeat; `#[jalari::job]` rejects such a list
+    /// at compile time:
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct SendEmail;
+    /// #[jalari::job]
+    /// impl Job for SendEmail {
+    ///     const NAME: &'static str = "send_email";
+    ///     const ALIASES: &'static [&'static str] = &["send_email"];
+    ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct SendEmail;
+    /// #[jalari::job(name = "send_email", aliases = ["old", "old"])]
+    /// impl Job for SendEmail {
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// An alias must also not be the `NAME` or an alias of another job linked into the same
+    /// binary; [`WorkerBuilder::build`](crate::WorkerBuilder::build) rejects that.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use jalari::{Job, JobResult};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize)]
+    /// struct SendWelcome;
+    ///
+    /// #[jalari::job(queue = "emails")]
+    /// impl Job for SendWelcome {
+    ///     const NAME: &'static str = "send_welcome";
+    ///     const ALIASES: &'static [&'static str] = &["welcome_email"];
+    ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
     const ALIASES: &'static [&'static str] = &[];
 
     /// Retry policy for this job type, used instead of the worker's; `None`, the default, uses

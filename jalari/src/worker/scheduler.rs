@@ -153,10 +153,14 @@ impl Shared {
             .bind(&self.task_names)
             .fetch_optional(&mut *transaction)
             .await?;
-            let Some(due) = due else {
+            let Some(mut due) = due else {
                 transaction.rollback().await?;
                 break;
             };
+            if let Some(registration) = self.jobs.get(due.job.task.as_str()) {
+                due.job.task = registration.name.to_owned();
+            }
+            let task = due.job.task.clone();
 
             let after = due.now.max(due.scheduled_at);
             let planned = due
@@ -175,7 +179,7 @@ impl Shared {
                     let next_run_at = schedule.unless_ended(next, run_count);
                     sqlx::query(AssertSqlSafe(format!(
                         "UPDATE {recurring}
-                         SET next_run_at = $2, last_run_at = $3, run_count = $4,
+                         SET next_run_at = $2, last_run_at = $3, run_count = $4, task = $5,
                              finished_at = CASE WHEN $2::timestamptz IS NULL THEN now() END
                          WHERE name = $1",
                         recurring = schema.table("recurring"),
@@ -184,6 +188,7 @@ impl Shared {
                     .bind(next_run_at)
                     .bind(due.scheduled_at)
                     .bind(run_count)
+                    .bind(&task)
                     .execute(&mut *transaction)
                     .await?;
                     match next_run_at {
