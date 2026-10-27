@@ -360,7 +360,7 @@ async fn test_enqueue_on_success() {
     check_crossing_keys_do_not_deadlock(&fixture).await;
     check_uncommitted_key_bounds_the_close(&fixture).await;
     check_stale_close_inserts_no_children(&fixture).await;
-    check_abandoned_close_inserts_no_children(&fixture).await;
+    check_cut_close_inserts_children_once(&fixture).await;
     check_stop_after_buffering_inserts_nothing(&fixture).await;
 
     parents.stop().await;
@@ -792,15 +792,15 @@ async fn check_stale_close_inserts_no_children(fixture: &Fixture) {
     assert_eq!(jalari::cancel(id).await.unwrap(), CancelOutcome::Cancelled);
 }
 
-async fn check_abandoned_close_inserts_no_children(fixture: &Fixture) {
+async fn check_cut_close_inserts_children_once(fixture: &Fixture) {
     let id = parent(
-        "abandoned",
+        "cut",
         vec![spec("os_idle")],
         Then::WaitRelease,
         EnqueueOptions::new().max_attempts(1),
     )
     .await;
-    buffered("abandoned").await;
+    buffered("cut").await;
     let holder_pool = fixture.database.connect("row_holder", 1).await;
     let mut holder = holder_pool.begin().await.unwrap();
     let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -815,7 +815,7 @@ async fn check_abandoned_close_inserts_no_children(fixture: &Fixture) {
     .execute(&mut *holder)
     .await
     .unwrap();
-    release("abandoned");
+    release("cut");
     for close in 1..=5 {
         let blocked = blocked_by(fixture.pool(), holder_pid, close).await;
         let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
@@ -828,7 +828,7 @@ async fn check_abandoned_close_inserts_no_children(fixture: &Fixture) {
     holder.rollback().await.unwrap();
     holder_pool.close().await;
     fixture
-        .wait_state(id, "failed", Duration::from_secs(10))
+        .wait_state(id, "succeeded", Duration::from_secs(10))
         .await;
     let history: Vec<(String, i32, Option<String>)> = fixture
         .history(id)
@@ -836,11 +836,8 @@ async fn check_abandoned_close_inserts_no_children(fixture: &Fixture) {
         .into_iter()
         .map(|(state, attempt, error, _)| (state, attempt, error))
         .collect();
-    assert_eq!(
-        history,
-        [("failed".to_owned(), 1, Some(INTERRUPTED.to_owned()))]
-    );
-    assert!(fixture.children(id).await.is_empty());
+    assert_eq!(history, [("succeeded".to_owned(), 1, None)]);
+    assert_eq!(fixture.children(id).await.len(), 1);
 }
 
 async fn check_stop_after_buffering_inserts_nothing(fixture: &Fixture) {

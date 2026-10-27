@@ -112,7 +112,7 @@ impl From<&Outcome> for Finished {
     }
 }
 
-pub(super) fn children_refused(error: &Error) -> bool {
+pub(super) fn answered(error: &Error) -> bool {
     !matches!(
         error.kind,
         ErrorKind::ConnectionFailed
@@ -553,7 +553,7 @@ mod tests {
             ErrorKind::LockTimeout,
             "55P03: canceling statement".to_owned(),
         );
-        assert!(children_refused(&error));
+        assert!(answered(&error));
         let message = format!("could not enqueue the jobs buffered for success: {error}");
         assert_eq!(
             decide(&refused(&error), None, 1, 3, &policy()),
@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_errors_do_not_refuse_children() {
+    fn test_connection_errors_go_unanswered() {
         for kind in [
             ErrorKind::ConnectionFailed,
             ErrorKind::ConnectionTerminated,
@@ -582,14 +582,14 @@ mod tests {
             ErrorKind::TlsFailed,
             ErrorKind::ProtocolViolation,
         ] {
-            assert!(!children_refused(&Error::new(kind, String::new())));
+            assert!(!answered(&Error::new(kind, String::new())));
         }
         for kind in [
             ErrorKind::Deadlock,
             ErrorKind::QueryCanceled,
             ErrorKind::QueryFailed,
         ] {
-            assert!(children_refused(&Error::new(kind, String::new())));
+            assert!(answered(&Error::new(kind, String::new())));
         }
     }
 

@@ -2,24 +2,28 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sqlx::PgPool;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info_span, warn};
 
-use super::close::{Closing, Ending, children_refused, decide, refused};
+use super::close::{Closing, Ending, answered, decide, refused};
 use super::lifeline::Incarnation;
 use super::middleware::{Finished, JobMeta, Next, report_finished};
 use super::ownership::{Claimed, Closed, close};
 use super::runner::Shared;
-use super::runs::{PendingClaim, Registration};
+use super::runs::{Hold, PendingClaim, Registration};
 use crate::enqueue::Columns;
 use crate::job::context::{self, Captured};
 use crate::job::registry::{ContextKey, JobRegistration};
 use crate::job::{RunControl, run};
-use crate::{JobError, JobId, JobResult, JobRun, Priority, Result};
+use crate::{JobError, JobId, JobResult, JobRun, Priority, Result, Schema};
 
 const MAX_CLOSE_TRIES: u32 = 5;
 const CLOSE_RETRY: Duration = Duration::from_secs(1);
+const CLOSE_WINDOW: Duration = Duration::from_secs(30);
+const CLOSE_BACKOFF: Duration = Duration::from_millis(100);
+const CLOSE_BACKOFF_LIMIT: Duration = Duration::from_millis(500);
 
 struct AbortOnDrop(JoinHandle<JobResult>);
 
@@ -159,6 +163,7 @@ impl Shared {
         let buffered = control.take_children();
         let mut children = (!buffered.is_empty()).then(|| Arc::new(Columns::from(buffered)));
         let mut refusal = None;
+        let deadline = Instant::now() + CLOSE_WINDOW;
         for tries in 1..=MAX_CLOSE_TRIES {
             let outcome = decide(
                 refusal.as_ref().unwrap_or(ending),
@@ -175,7 +180,15 @@ impl Shared {
                 control.latest(),
                 children.clone(),
             );
-            match close(&pool, &self.config.schema, &claimed.hold, &closing).await {
+            match close_until_answered(
+                &pool,
+                &self.config.schema,
+                &claimed.hold,
+                &closing,
+                deadline,
+            )
+            .await
+            {
                 Ok(Closed::Written { children_inserted }) => {
                     registration.close();
                     closing.log(claimed.hold.job_id);
@@ -204,17 +217,23 @@ impl Shared {
                     warn!("another worker took the job over, dropping the outcome of this run");
                     return;
                 }
-                Err(e) if closing.children().is_some() && children_refused(&e) => {
+                Err(e) if !answered(&e) => {
+                    warn!(
+                        error = %e,
+                        "the database did not answer for {CLOSE_WINDOW:?}, giving up on the job \
+                         outcome"
+                    );
+                    registration.abandon();
+                    return;
+                }
+                Err(e) if closing.children().is_some() => {
                     warn!(error = %e, "could not enqueue the jobs buffered for success");
                     refusal = Some(refused(&e));
                     children = None;
                 }
-                Err(e) if tries < MAX_CLOSE_TRIES && !control.lost().is_cancelled() => {
+                Err(e) if tries < MAX_CLOSE_TRIES => {
                     warn!(error = %e, "failed to record the job outcome, retrying");
-                    tokio::select! {
-                        () = tokio::time::sleep(CLOSE_RETRY) => {}
-                        () = control.lost().cancelled() => {}
-                    }
+                    tokio::time::sleep(CLOSE_RETRY).await;
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to record the job outcome, giving up");
@@ -225,6 +244,30 @@ impl Shared {
         }
         warn!("the job outcome kept changing, giving up");
         registration.abandon();
+    }
+}
+
+async fn close_until_answered(
+    pool: &PgPool,
+    schema: &Schema,
+    hold: &Hold,
+    closing: &Closing,
+    deadline: Instant,
+) -> Result<Closed> {
+    let mut backoff = CLOSE_BACKOFF;
+    loop {
+        match close(pool, schema, hold, closing).await {
+            Err(e) if !answered(&e) && Instant::now() + backoff < deadline => {
+                if backoff == CLOSE_BACKOFF {
+                    warn!(error = %e, "the database did not answer the job outcome, retrying");
+                } else {
+                    debug!(error = %e, "the database did not answer the job outcome, retrying");
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(CLOSE_BACKOFF_LIMIT);
+            }
+            closed => return closed,
+        }
     }
 }
 

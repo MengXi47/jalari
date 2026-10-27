@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use common::{Database, LEDGER, RunningWorker, fast_retry, worker_config};
 use jalari::sqlx::{self, AssertSqlSafe};
-use jalari::{Job, JobError, JobResult, Worker};
+use jalari::{Finished, Job, JobError, JobMeta, JobMiddleware, JobResult, Next, Worker};
 use serde::{Deserialize, Serialize};
 
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
@@ -41,6 +41,36 @@ impl Job for Ticker {
         }
         LEDGER.record(&self.label, "done");
         Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Outage {
+    label: String,
+}
+
+#[jalari::job(queue = "lifeline")]
+impl Job for Outage {
+    const NAME: &'static str = "lifeline_outage";
+
+    async fn run(self) -> JobResult {
+        LEDGER.record(&self.label, "start");
+        LEDGER.record(&self.label, "done");
+        Ok(())
+    }
+}
+
+struct Finishes;
+
+impl JobMiddleware for Finishes {
+    type Provides = ();
+
+    async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+        next.run().await
+    }
+
+    async fn finished(&self, job: &JobMeta, _outcome: &Finished) {
+        LEDGER.record(&job.id().0.to_string(), "finished");
     }
 }
 
@@ -104,6 +134,7 @@ async fn spawn_worker() -> RunningWorker {
             .queue("lifeline", 2)
             .config(worker_config(Duration::from_millis(100)))
             .retry_policy(fast_retry())
+            .middleware(Finishes)
             .scheduler(false)
             .build()
             .await
@@ -134,6 +165,8 @@ async fn test_lifeline() {
     check_orphaned_claim_is_released(&database, "orphan", 3).await;
     check_orphaned_claim_is_released(&database, "last_orphan", 1).await;
     check_abandoned_close_counts_the_attempt(&database).await;
+    check_close_outlasts_an_outage(&database).await;
+    check_close_after_takeover_is_fenced(&database).await;
     database.finish().await;
 }
 
@@ -331,5 +364,121 @@ async fn check_abandoned_close_counts_the_attempt(database: &Database) {
             ("failed".to_owned(), 2, Some("boom".to_owned()))
         ]
     );
+    worker.stop().await;
+}
+
+async fn cut_closes(database: &Database, outage: Duration) {
+    let schema = &database.schema_name;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE OR REPLACE FUNCTION \"{schema}\".cut_close() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             IF clock_timestamp() < OLD.locked_at + make_interval(secs => {seconds}) THEN
+                 PERFORM pg_terminate_backend(pg_backend_pid());
+             END IF;
+             RETURN NEW;
+         END $$;
+         DROP TRIGGER IF EXISTS cut_close ON {job};
+         CREATE TRIGGER cut_close BEFORE UPDATE ON {job} FOR EACH ROW
+         WHEN (OLD.task = 'lifeline_outage' AND OLD.attempts = 1 AND NEW.state = 'succeeded')
+         EXECUTE FUNCTION \"{schema}\".cut_close()",
+        seconds = outage.as_secs_f64(),
+        job = database.table("job"),
+    )))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+}
+
+async fn attempts(database: &Database, id: i64) -> i32 {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT attempts FROM {} WHERE id = $1",
+        database.table("job")
+    )))
+    .bind(id)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap()
+}
+
+async fn check_close_outlasts_an_outage(database: &Database) {
+    cut_closes(database, Duration::from_secs(8)).await;
+    let worker = spawn_worker().await;
+    let id = jalari::enqueue(&Outage {
+        label: "outage".to_owned(),
+    })
+    .await
+    .unwrap()
+    .id()
+    .0;
+    common::wait_until("the job to succeed", Duration::from_secs(25), || async {
+        job_shape(database, id).await.0 == "succeeded"
+    })
+    .await;
+    let saved_after = LEDGER.events("outage")[1].1.elapsed();
+    common::wait_until(
+        "the finished hook to run",
+        Duration::from_secs(5),
+        || async { LEDGER.count(&id.to_string(), "finished") == 1 },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    eprintln!("outage: the outcome was saved {saved_after:?} after the body returned");
+    assert!(
+        saved_after >= Duration::from_secs(7),
+        "the close was not cut: {saved_after:?}"
+    );
+    assert_eq!(starts("outage").len(), 1);
+    assert_eq!(attempts(database, id).await, 1);
+    assert_eq!(
+        job_shape(database, id).await,
+        (
+            "succeeded".to_owned(),
+            vec![("succeeded".to_owned(), 1, None)]
+        )
+    );
+    assert_eq!(LEDGER.count(&id.to_string(), "finished"), 1);
+    worker.stop().await;
+}
+
+async fn check_close_after_takeover_is_fenced(database: &Database) {
+    cut_closes(database, Duration::from_secs(20)).await;
+    let worker = spawn_worker().await;
+    let id = jalari::enqueue(&Outage {
+        label: "taken".to_owned(),
+    })
+    .await
+    .unwrap()
+    .id()
+    .0;
+    common::wait_until("the body to return", Duration::from_secs(10), || async {
+        LEDGER.count("taken", "done") == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(database.terminate_running_lifelines().await, 1);
+    common::wait_until("the job to succeed", Duration::from_secs(20), || async {
+        job_shape(database, id).await.0 == "succeeded"
+    })
+    .await;
+    common::wait_until(
+        "the finished hook to run",
+        Duration::from_secs(5),
+        || async { LEDGER.count(&id.to_string(), "finished") == 1 },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(starts("taken").len(), 2);
+    assert_eq!(
+        job_shape(database, id).await,
+        (
+            "succeeded".to_owned(),
+            vec![
+                ("scheduled".to_owned(), 1, Some(INTERRUPTED.to_owned())),
+                ("succeeded".to_owned(), 2, None)
+            ]
+        )
+    );
+    assert_eq!(LEDGER.count(&id.to_string(), "finished"), 1);
     worker.stop().await;
 }
