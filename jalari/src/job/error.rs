@@ -115,10 +115,10 @@ impl JobError {
     /// Retries the job after `delay` instead of the delay the retry policy picks.
     ///
     /// The attempt still counts and `last_error` keeps the message. The retry policy still
-    /// decides whether there is a retry at all, so on the last attempt, or on a
-    /// [`permanent`](Self::permanent) error, it has no effect. Use [`snooze`](crate::snooze) to
-    /// wait without using an attempt. `delay` is measured by the database clock and capped at
-    /// 100 years.
+    /// decides whether there is a retry at all, so on the last attempt it has no effect, and on
+    /// a [`permanent`](Self::permanent), [`discard`](Self::discard) or snooze error it does
+    /// nothing at all. Use [`snooze`](crate::snooze) to wait without using an attempt. `delay` is
+    /// measured by the database clock and capped at 100 years.
     ///
     /// # Examples
     ///
