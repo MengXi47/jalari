@@ -1,7 +1,11 @@
 use std::io;
 
+use std::time::Duration;
+
 use jalari::__private::Provided;
-use jalari::{ErrorKind, Job, JobError, JobResult, Worker};
+use jalari::{
+    ErrorKind, ExponentialBackoff, Job, JobError, JobResult, Priority, RetryPolicy, Worker,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -49,6 +53,60 @@ impl Job for Nightly {
     async fn run(self) -> JobResult {
         Ok(())
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Renamed;
+
+static RENAMED_POLICY: ExponentialBackoff = ExponentialBackoff {
+    base: Duration::from_millis(50),
+    max: Duration::from_secs(1),
+    jitter: 0.0,
+};
+
+#[jalari::job(queue = "renamed", checkpoints = true)]
+impl Job for Renamed {
+    const NAME: &'static str = "test_renamed";
+    const PRIORITY: Priority = Priority::High;
+    const ALIASES: &'static [&'static str] = &["test_renamed_before", "test_renamed_first"];
+    const RETRY_POLICY: Option<&'static dyn RetryPolicy> = Some(&RENAMED_POLICY);
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_job_constants_and_attribute_flags_reach_the_registration() {
+    let renamed = jalari::__private::find("test_renamed").unwrap();
+    assert_eq!(renamed.priority, Priority::High);
+    assert_eq!(
+        renamed.aliases,
+        ["test_renamed_before", "test_renamed_first"]
+    );
+    assert!(renamed.checkpoints);
+    let error = JobError::new("boom".to_owned());
+    let policy = renamed.retry_policy.unwrap();
+    assert_eq!(
+        policy.next_retry(1, 3, &error),
+        Some(Duration::from_millis(50))
+    );
+
+    let greet = jalari::__private::find("test_greet").unwrap();
+    assert_eq!(greet.priority, Priority::Normal);
+    assert!(greet.aliases.is_empty());
+    assert!(greet.retry_policy.is_none());
+    assert!(!greet.checkpoints);
+}
+
+#[test]
+fn test_aliases_find_the_registration() {
+    for alias in ["test_renamed_before", "test_renamed_first"] {
+        let registration = jalari::__private::find(alias).unwrap();
+        assert_eq!(registration.name, "test_renamed", "{alias}");
+        assert_eq!(registration.queue, "renamed");
+    }
+    assert!(jalari::__private::find("test_renamed_never").is_none());
 }
 
 #[test]

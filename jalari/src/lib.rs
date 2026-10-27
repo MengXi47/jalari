@@ -14,13 +14,16 @@ pub mod __private;
 
 pub use cluster::ClusterConfig;
 pub use control::{CancelOutcome, RestartOutcome, StopOutcome, cancel, restart, stop};
-pub use enqueue::{EnqueueOptions, EnqueueOutcome, OnConflict, enqueue, enqueue_in, enqueue_with};
+pub use enqueue::{
+    EnqueueOptions, EnqueueOutcome, OnConflict, enqueue, enqueue_in, enqueue_many, enqueue_many_in,
+    enqueue_on_success, enqueue_on_success_with, enqueue_with,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use init::{InitBuilder, PoolSource, init};
 pub use jalari_macros::job;
 pub use job::{
-    Checkpoint, Command, Job, JobError, JobId, JobResult, JobRun, JobState, checkpoint,
-    current_job, resume, scope, shutdown_requested,
+    Checkpoint, Command, Job, JobError, JobId, JobResult, JobRun, JobState, Priority, checkpoint,
+    current_job, interrupted, resume, scope, shutdown_requested, snooze,
 };
 pub use recurring::{Cron, Interval, IntervalUnit, RecurringInfo, Schedule};
 pub use sqlx;
@@ -29,6 +32,6 @@ pub use storage::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use worker::{
-    ExponentialBackoff, JobMeta, JobMiddleware, Next, RetryPolicy, Worker, WorkerBuilder,
+    ExponentialBackoff, Finished, JobMeta, JobMiddleware, Next, RetryPolicy, Worker, WorkerBuilder,
     WorkerConfig,
 };

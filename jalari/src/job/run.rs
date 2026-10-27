@@ -5,7 +5,7 @@ use tokio::task::futures::TaskLocalFuture;
 use tokio_util::sync::CancellationToken;
 
 use super::checkpoint::RunControl;
-use crate::JobId;
+use crate::{JobError, JobId};
 
 tokio::task_local! {
     static CURRENT_JOB: JobRun;
@@ -122,6 +122,37 @@ pub async fn shutdown_requested() {
         Some(job) => job.cancellation.cancelled().await,
         None => std::future::pending().await,
     }
+}
+
+/// Completes with the error to return once the running job should stop.
+///
+/// It resolves when the job is asked to [`stop`](crate::stop) or [`cancel`](crate::cancel), when
+/// its worker starts shutting down, or when the worker has lost the job. The error is the one
+/// [`checkpoint`](crate::checkpoint) would return, so returning it releases or stops the job
+/// without counting the attempt; returning any other error counts it. Race it against long
+/// `.await`s with `tokio::select!`. Outside a job, and in tasks the job spawns, it never
+/// completes.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn export(id: i64) -> jalari::JobResult { Ok(()) }
+/// # async fn example(ids: Vec<i64>) -> jalari::JobResult {
+/// for id in ids {
+///     tokio::select! {
+///         error = jalari::interrupted() => return Err(error),
+///         result = export(id) => result?,
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[expect(
+    clippy::manual_async_fn,
+    reason = "filled in by W2, which captures the current job before the future starts"
+)]
+pub fn interrupted() -> impl Future<Output = JobError> + Send + 'static {
+    async move { todo!("W2") }
 }
 
 pub(crate) fn within<F: Future>(job: JobRun, future: F) -> TaskLocalFuture<JobRun, F> {

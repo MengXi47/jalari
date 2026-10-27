@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::JobError;
+use crate::{JobError, Priority, RetryPolicy};
 
 const DEFAULT_MAX_ATTEMPTS: i32 = 10;
 
@@ -150,6 +150,54 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// }
     /// ```
     const TIMEOUT: Option<Duration> = None;
+
+    /// Priority of every job of this type unless the enqueue sets one; defaults to
+    /// [`Normal`](Priority::Normal).
+    ///
+    /// Workers take the due jobs of a queue from the highest [`Priority`] down.
+    const PRIORITY: Priority = Priority::Normal;
+
+    /// Earlier names of this job whose waiting jobs and schedules this type still runs.
+    ///
+    /// New jobs are always enqueued under [`NAME`](Self::NAME). An alias must not be empty, equal
+    /// `NAME` or repeat, and must not be the `NAME` or an alias of another job linked into the
+    /// same binary.
+    const ALIASES: &'static [&'static str] = &[];
+
+    /// Retry policy for this job type, used instead of the worker's; `None`, the default, uses
+    /// [`WorkerBuilder::retry_policy`](crate::WorkerBuilder::retry_policy).
+    ///
+    /// Any [`RetryPolicy`] that can be built in a const or named as a `static` works.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    ///
+    /// use jalari::{ExponentialBackoff, Job, JobResult, RetryPolicy};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize)]
+    /// struct DeliverWebhook {
+    ///     url: String,
+    /// }
+    ///
+    /// #[jalari::job(queue = "webhooks")]
+    /// impl Job for DeliverWebhook {
+    ///     const NAME: &'static str = "deliver_webhook";
+    ///     const MAX_ATTEMPTS: i32 = 20;
+    ///     const RETRY_POLICY: Option<&'static dyn RetryPolicy> = Some(&ExponentialBackoff {
+    ///         base: Duration::from_secs(30),
+    ///         max: Duration::from_secs(6 * 60 * 60),
+    ///         jitter: 0.3,
+    ///     });
+    ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    const RETRY_POLICY: Option<&'static dyn RetryPolicy> = None;
 
     /// Value the job receives in [`run`](Self::run), provided by the worker's
     /// [`JobMiddleware`](crate::JobMiddleware).

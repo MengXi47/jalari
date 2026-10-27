@@ -128,7 +128,7 @@ impl WorkerBuilder {
         check_session(config).await?;
         check_middlewares(&self.middlewares).await?;
         let task_names = jobs.keys().map(|name| (*name).to_owned()).collect();
-        let served = fingerprint::served(jobs.values().copied());
+        let served = fingerprint::served(jobs.iter().map(|(name, job)| (*name, *job)));
         Ok(Worker {
             shared: Arc::new(Shared {
                 config,

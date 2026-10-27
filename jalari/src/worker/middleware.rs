@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -110,6 +111,44 @@ pub trait JobMiddleware: Send + Sync + 'static {
 
     /// Wraps one attempt; call `next.run()` to continue, or return an error to reject it.
     fn call(&self, job: &JobMeta, next: Next<'_>) -> impl Future<Output = JobResult> + Send;
+}
+
+/// How an attempt ended, as saved by the worker that ran it.
+///
+/// New outcomes may be added in minor releases, so a `match` needs a `_` arm.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finished {
+    /// The job succeeded.
+    Succeeded,
+    /// The attempt failed and the job runs again after `delay`.
+    Retrying {
+        /// Wait before the next attempt.
+        delay: Duration,
+        /// Message of the error the attempt returned.
+        error: String,
+    },
+    /// The attempt failed and the job will not run again.
+    Failed {
+        /// Message of the error the attempt returned.
+        error: String,
+    },
+    /// The job discarded itself and will not run again.
+    Discarded {
+        /// Message of the error the attempt returned.
+        error: String,
+    },
+    /// The job asked to run again after `delay`, without counting the attempt.
+    Snoozed {
+        /// Wait before the next attempt.
+        delay: Duration,
+    },
+    /// The worker shut down and gave the job back to its queue without counting the attempt.
+    Released,
+    /// The job was stopped and waits for a restart.
+    Stopped,
+    /// The job was cancelled.
+    Cancelled,
 }
 
 /// What a [`JobMiddleware`] knows about the attempt it wraps.

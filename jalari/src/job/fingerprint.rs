@@ -6,14 +6,16 @@ pub(crate) fn of_task(task: &str) -> Option<&'static str> {
     registry::find(task).and_then(|registration| registration.fingerprint)
 }
 
-pub(crate) fn served(registrations: impl Iterator<Item = &'static JobRegistration>) -> Value {
+pub(crate) fn served(
+    entries: impl Iterator<Item = (&'static str, &'static JobRegistration)>,
+) -> Value {
     Value::Object(
-        registrations
-            .map(|registration| {
+        entries
+            .map(|(name, registration)| {
                 let fingerprint = registration.fingerprint.map_or(Value::Null, |fingerprint| {
                     Value::String(fingerprint.to_owned())
                 });
-                (registration.name.to_owned(), fingerprint)
+                (name.to_owned(), fingerprint)
             })
             .collect(),
     )

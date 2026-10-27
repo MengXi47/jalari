@@ -26,6 +26,8 @@ use syn::{
 ///   implement `Default`, which provides the arguments of every run
 /// * `timezone` - IANA time zone for `cron`; `UTC` when omitted. Only valid with `cron`
 /// * `fingerprint` - `true` turns the code fingerprint on for this job; `false` when omitted
+/// * `checkpoints` - `true` declares that the job reaches checkpoints regularly; an abort at
+///   `stop_timeout` or `shutdown_timeout` is then logged as an error. `false` when omitted
 ///
 /// A schedule declared with `cron` follows the deployed code: workers sync it at startup, remove
 /// it when the declaration is gone, and it cannot be changed at runtime. Use
@@ -114,6 +116,7 @@ struct JobArguments {
     timezone: Option<LitStr>,
     queue: Option<LitStr>,
     fingerprint: Option<LitBool>,
+    checkpoints: Option<LitBool>,
 }
 
 fn expand(
@@ -148,6 +151,8 @@ fn expand(
         quote!(::core::option::Option::None)
     };
 
+    let checkpoints = arguments.checkpoints.as_ref().is_some_and(LitBool::value);
+
     fill_in_context(&mut item_impl);
 
     let job_type = &item_impl.self_ty;
@@ -176,7 +181,9 @@ fn expand(
         #item_impl
 
         ::jalari::__private::inventory::submit! {
-            ::jalari::__private::JobRegistration::new::<#job_type>(#queue, #cron, #fingerprint)
+            ::jalari::__private::JobRegistration::new::<#job_type>(
+                #queue, #cron, #fingerprint, #checkpoints
+            )
         }
 
         #checks
@@ -260,16 +267,22 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         timezone: None,
         queue: None,
         fingerprint: None,
+        checkpoints: None,
     };
     for argument in arguments {
-        if argument.path.is_ident("fingerprint") {
-            if parsed.fingerprint.is_some() {
+        if argument.path.is_ident("fingerprint") || argument.path.is_ident("checkpoints") {
+            let slot = if argument.path.is_ident("fingerprint") {
+                &mut parsed.fingerprint
+            } else {
+                &mut parsed.checkpoints
+            };
+            if slot.is_some() {
                 return Err(syn::Error::new_spanned(
                     &argument.path,
                     "duplicate argument",
                 ));
             }
-            parsed.fingerprint = Some(bool_value(&argument)?);
+            *slot = Some(bool_value(&argument)?);
             continue;
         }
         let value = string_value(&argument)?;
@@ -282,7 +295,7 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         } else {
             return Err(syn::Error::new_spanned(
                 &argument.path,
-                "expected `cron`, `timezone`, `queue` or `fingerprint`",
+                "expected `cron`, `timezone`, `queue`, `fingerprint` or `checkpoints`",
             ));
         };
         if slot.is_some() {

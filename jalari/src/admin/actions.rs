@@ -8,7 +8,7 @@ use super::jobs::{FILTER_SQL, JobFilter, bind_filter};
 use crate::init::config;
 use crate::job::JOB_KEY_STATES;
 use crate::job::fingerprint;
-use crate::job::registry::registrations;
+use crate::job::registry::entries;
 use crate::storage::JOB_CHANNEL;
 use crate::worker::INTERRUPTED;
 use crate::{Error, ErrorKind, JobId, JobState, Result, Schema};
@@ -97,7 +97,7 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
     .bind(id.0)
     .fetch_optional(&mut *transaction)
     .await?;
-    let served = fingerprint::served(registrations());
+    let served = fingerprint::served(entries());
     let outcome = match locked {
         None => RetryOutcome::NotFound,
         Some((state, _)) if state != JobState::Failed.as_str() => RetryOutcome::NotFailed,
@@ -138,7 +138,7 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
     let schema = &config.schema;
     let pool = config.pool.pool();
     let filter = filter.only_failed();
-    let served = fingerprint::served(registrations());
+    let served = fingerprint::served(entries());
     let mut summary = RetrySummary::default();
     let mut after = 0_i64;
     loop {

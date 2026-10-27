@@ -74,6 +74,14 @@ pub enum ErrorKind {
     PayloadDecodeFailed,
     /// A timeout does not fit in an `i32` of milliseconds (about 24 days).
     TimeoutTooLong,
+    /// An [`EnqueueOptions`](crate::EnqueueOptions) value cannot be used where it was passed: a
+    /// value out of range, or [`OnConflict::Replace`](crate::OnConflict::Replace) in
+    /// [`enqueue_many`](crate::enqueue_many) or
+    /// [`enqueue_on_success_with`](crate::enqueue_on_success_with).
+    InvalidOptions,
+    /// A function that only works inside a running job's own task, such as
+    /// [`enqueue_on_success`](crate::enqueue_on_success), was called elsewhere.
+    NotInJob,
     /// An enqueue with [`OnConflict::Replace`](crate::OnConflict::Replace) kept racing with
     /// other writers for the same `job_key` and gave up after several attempts, or the waiting
     /// job stayed locked by another transaction for about a second without starting to run.

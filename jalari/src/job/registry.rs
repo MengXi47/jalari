@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::worker::Provided;
-use crate::{Job, JobError, JobResult};
+use crate::{Job, JobError, JobResult, Priority, RetryPolicy};
 
 #[doc(hidden)]
 pub type JobFuture = Pin<Box<dyn Future<Output = JobResult> + Send>>;
@@ -15,6 +15,10 @@ pub struct JobRegistration {
     pub queue: &'static str,
     pub max_attempts: i32,
     pub timeout: Option<Duration>,
+    pub priority: Priority,
+    pub aliases: &'static [&'static str],
+    pub retry_policy: Option<&'static dyn RetryPolicy>,
+    pub checkpoints: bool,
     pub cron: Option<CronRegistration>,
     pub fingerprint: Option<&'static str>,
     pub context: fn() -> ContextKey,
@@ -53,12 +57,17 @@ impl JobRegistration {
         queue: &'static str,
         cron: Option<CronRegistration>,
         fingerprint: Option<&'static str>,
+        checkpoints: bool,
     ) -> Self {
         Self {
             name: T::NAME,
             queue,
             max_attempts: T::MAX_ATTEMPTS,
             timeout: T::TIMEOUT,
+            priority: T::PRIORITY,
+            aliases: T::ALIASES,
+            retry_policy: T::RETRY_POLICY,
+            checkpoints,
             cron,
             fingerprint,
             context: ContextKey::of::<T::Context>,
@@ -84,9 +93,19 @@ pub fn registrations() -> impl Iterator<Item = &'static JobRegistration> {
     inventory::iter::<JobRegistration>.into_iter()
 }
 
+pub(crate) fn entries() -> impl Iterator<Item = (&'static str, &'static JobRegistration)> {
+    registrations().flat_map(|registration| {
+        std::iter::once(registration.name)
+            .chain(registration.aliases.iter().copied())
+            .map(move |name| (name, registration))
+    })
+}
+
 #[doc(hidden)]
 pub fn find(name: &str) -> Option<&'static JobRegistration> {
-    registrations().find(|registration| registration.name == name)
+    entries()
+        .find(|(entry, _)| *entry == name)
+        .map(|(_, registration)| registration)
 }
 
 fn run_job<T: Job>(provided: Provided, payload: &[u8]) -> JobFuture {

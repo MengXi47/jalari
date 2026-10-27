@@ -59,7 +59,7 @@ fn test_expansion_stamps_a_fingerprint_only_when_turned_on() {
         let off = expanded(text, SHORT);
         assert_eq!(stamped(&off), None, "{text:?} stamps no fingerprint");
         assert!(off.contains(
-            ":: core :: option :: Option :: None , :: core :: option :: Option :: None)"
+            ":: core :: option :: Option :: None , :: core :: option :: Option :: None , false)"
         ));
     }
 }
@@ -89,5 +89,63 @@ fn test_fingerprint_covers_the_impl_as_written() {
     assert_ne!(
         stamped(&expanded("fingerprint = true", SHORT)),
         stamped(&expanded("fingerprint = true", FILLED))
+    );
+}
+
+fn registration(expansion: &str) -> String {
+    let call = expansion
+        .split("JobRegistration :: new")
+        .nth(1)
+        .expect("a registration");
+    call[..call.find('}').expect("the end of the submit block")]
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn test_checkpoints_argument_takes_a_boolean() {
+    for text in [
+        "checkpoints = true",
+        "checkpoints = false",
+        "queue = \"q\", fingerprint = true, checkpoints = true",
+    ] {
+        assert!(
+            parse_arguments(arguments(text)).is_ok(),
+            "{text} is accepted"
+        );
+    }
+}
+
+#[test]
+fn test_checkpoints_argument_rejects_a_string() {
+    for text in ["checkpoints = \"true\"", "checkpoints = 1"] {
+        assert!(
+            parse_arguments(arguments(text)).is_err(),
+            "{text} is rejected"
+        );
+    }
+}
+
+#[test]
+fn test_checkpoints_argument_rejects_duplicates() {
+    assert!(parse_arguments(arguments("checkpoints = true, checkpoints = false")).is_err());
+}
+
+#[test]
+fn test_checkpoints_flag_reaches_the_registration() {
+    assert!(registration(&expanded("checkpoints = true", SHORT)).ends_with(", true)"));
+    for text in ["", "checkpoints = false"] {
+        assert!(
+            registration(&expanded(text, SHORT)).ends_with(", false)"),
+            "{text:?} registers no checkpoints"
+        );
+    }
+}
+
+#[test]
+fn test_checkpoints_flag_leaves_the_fingerprint_alone() {
+    assert_eq!(
+        stamped(&expanded("fingerprint = true, checkpoints = true", SHORT)),
+        stamped(&expanded("fingerprint = true", SHORT))
     );
 }
