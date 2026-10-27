@@ -17,8 +17,8 @@ pub(crate) const JOB_KEY_STATES: &str = "('scheduled', 'enqueued', 'running', 's
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobState {
-    /// Waiting for its `run_at` time: a delayed job, a retry waiting for its backoff, or a job
-    /// whose worker died, waiting to run again.
+    /// Waiting for its `run_at` time: a delayed job, a retry waiting for its backoff, a job that
+    /// called [`snooze`](crate::snooze), or a job whose worker died, waiting to run again.
     Scheduled,
     /// Due now and waiting for a worker.
     Enqueued,

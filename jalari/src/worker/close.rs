@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::job::{Command, Halt, JobState};
+use crate::job::{Command, Halt, JobState, SNOOZED};
 use crate::{JobError, JobResult, RetryPolicy};
 
 const LONGEST_DELAY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
@@ -19,6 +19,7 @@ pub(crate) enum Outcome {
     Succeeded,
     Retry { delay: Duration, error: String },
     Failed { error: String },
+    Snoozed { delay: Duration },
     Released { note: String },
     Stopped { note: String },
     Cancelled { note: String },
@@ -37,6 +38,7 @@ impl Outcome {
             Self::Succeeded => JobState::Succeeded,
             Self::Retry { .. } => JobState::Scheduled,
             Self::Failed { .. } => JobState::Failed,
+            Self::Snoozed { .. } => JobState::Scheduled,
             Self::Released { .. } => JobState::Enqueued,
             Self::Stopped { .. } => JobState::Stopped,
             Self::Cancelled { .. } => JobState::Deleted,
@@ -46,7 +48,10 @@ impl Outcome {
     pub(super) fn is_terminal(&self) -> bool {
         match self {
             Self::Succeeded | Self::Failed { .. } | Self::Cancelled { .. } => true,
-            Self::Retry { .. } | Self::Released { .. } | Self::Stopped { .. } => false,
+            Self::Retry { .. }
+            | Self::Snoozed { .. }
+            | Self::Released { .. }
+            | Self::Stopped { .. } => false,
         }
     }
 
@@ -54,7 +59,10 @@ impl Outcome {
         match self {
             Self::Succeeded => Some(None),
             Self::Retry { error, .. } | Self::Failed { error } => Some(Some(error)),
-            Self::Released { .. } | Self::Stopped { .. } | Self::Cancelled { .. } => None,
+            Self::Snoozed { .. }
+            | Self::Released { .. }
+            | Self::Stopped { .. }
+            | Self::Cancelled { .. } => None,
         }
     }
 
@@ -62,6 +70,7 @@ impl Outcome {
         match self {
             Self::Succeeded => None,
             Self::Retry { error, .. } | Self::Failed { error } => Some(error),
+            Self::Snoozed { .. } => Some(SNOOZED),
             Self::Released { note } | Self::Stopped { note } | Self::Cancelled { note } => {
                 Some(note)
             }
@@ -99,6 +108,11 @@ pub(super) fn decide(
             note: error.msg().to_owned(),
         };
     }
+    if let Some(delay) = error.snoozed_for() {
+        return Outcome::Snoozed {
+            delay: delay.min(LONGEST_DELAY),
+        };
+    }
     match retry_policy.next_retry(attempt, max_attempts, error) {
         Some(delay) => Outcome::Retry {
             delay: error.retry_delay().unwrap_or(delay).min(LONGEST_DELAY),
@@ -129,6 +143,7 @@ impl Closing {
     ) -> Self {
         let (attempts, run_at_delay) = match &outcome {
             Outcome::Retry { delay, .. } => (attempt, Some(*delay)),
+            Outcome::Snoozed { delay } => (attempt - 1, Some(*delay)),
             Outcome::Succeeded | Outcome::Failed { .. } => (attempt, None),
             Outcome::Released { .. } | Outcome::Stopped { .. } | Outcome::Cancelled { .. } => {
                 (attempt - 1, Some(Duration::ZERO))
@@ -176,6 +191,7 @@ impl Closing {
                 warn!(error = %error, ?delay, "job failed, retrying");
             }
             Outcome::Failed { error } => warn!(error = %error, "job failed"),
+            Outcome::Snoozed { delay } => info!(job_id, ?delay, "job snoozed"),
             Outcome::Released { note } => info!(job_id, note = %note, "job released"),
             Outcome::Stopped { note } => info!(job_id, note = %note, "job stopped"),
             Outcome::Cancelled { note } => info!(job_id, note = %note, "job cancelled"),
@@ -186,7 +202,7 @@ impl Closing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ExponentialBackoff;
+    use crate::{ExponentialBackoff, snooze};
 
     fn policy() -> ExponentialBackoff {
         ExponentialBackoff {
@@ -249,6 +265,7 @@ mod tests {
                     after: Duration::from_secs(1),
                 },
                 Ending::NotStarted,
+                Ending::Returned(snooze(Duration::from_secs(30))),
             ]
         };
         for ending in endings() {
@@ -361,5 +378,55 @@ mod tests {
             JobError::new("boom".to_owned()).retry_after(Duration::MAX)
         ));
         assert_eq!(decide(&ending, None, 1, 3, &policy()), longest);
+        assert_eq!(
+            decide(
+                &Ending::Returned(snooze(Duration::MAX)),
+                None,
+                1,
+                3,
+                &policy()
+            ),
+            Outcome::Snoozed {
+                delay: LONGEST_DELAY
+            }
+        );
+    }
+
+    #[test]
+    fn test_snooze_schedules_without_counting_the_attempt() {
+        let ending = Ending::Returned(snooze(Duration::from_secs(30)));
+        let outcome = decide(&ending, None, 2, 3, &policy());
+        assert_eq!(
+            outcome,
+            Outcome::Snoozed {
+                delay: Duration::from_secs(30)
+            }
+        );
+        assert_eq!(outcome.state(), JobState::Scheduled);
+        assert_eq!(outcome.last_error(), None);
+        assert!(!outcome.is_terminal());
+        assert_eq!(outcome.note(), Some(SNOOZED));
+        let closing = Closing::after_run(2, outcome, None, Duration::ZERO, None);
+        assert_eq!(closing.attempts, 1);
+        assert_eq!(closing.run_at_delay, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_snooze_on_the_last_attempt_still_snoozes() {
+        let ending = Ending::Returned(snooze(Duration::from_secs(30)));
+        let outcome = decide(&ending, None, 3, 3, &policy());
+        assert!(matches!(outcome, Outcome::Snoozed { .. }));
+        assert_eq!(
+            Closing::after_run(3, outcome, None, Duration::ZERO, None).attempts,
+            2
+        );
+    }
+
+    #[test]
+    fn test_error_reading_like_a_snooze_is_retried() {
+        assert!(matches!(
+            decide(&error(SNOOZED), None, 1, 3, &policy()),
+            Outcome::Retry { .. }
+        ));
     }
 }

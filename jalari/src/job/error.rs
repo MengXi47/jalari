@@ -32,6 +32,7 @@ pub struct JobError {
 enum Disposition {
     Retry { delay: Option<Duration> },
     Permanent,
+    Snooze { delay: Duration },
     Halt(Halt),
 }
 
@@ -62,7 +63,7 @@ impl JobError {
     pub(crate) fn halt(&self) -> Option<Halt> {
         match self.disposition {
             Disposition::Halt(halt) => Some(halt),
-            Disposition::Retry { .. } | Disposition::Permanent => None,
+            Disposition::Retry { .. } | Disposition::Permanent | Disposition::Snooze { .. } => None,
         }
     }
 
@@ -104,7 +105,15 @@ impl JobError {
     pub fn retry_delay(&self) -> Option<Duration> {
         match self.disposition {
             Disposition::Retry { delay } => delay,
-            Disposition::Permanent | Disposition::Halt(_) => None,
+            Disposition::Permanent | Disposition::Snooze { .. } | Disposition::Halt(_) => None,
+        }
+    }
+
+    /// The delay passed to [`snooze`], or `None` for any other error.
+    pub fn snoozed_for(&self) -> Option<Duration> {
+        match self.disposition {
+            Disposition::Snooze { delay } => Some(delay),
+            Disposition::Retry { .. } | Disposition::Permanent | Disposition::Halt(_) => None,
         }
     }
 
@@ -151,9 +160,11 @@ impl JobError {
 ///     download().await
 /// }
 /// ```
-#[expect(unused_variables, reason = "filled in by W1")]
 pub fn snooze(delay: Duration) -> JobResult {
-    todo!("W1")
+    Err(JobError {
+        msg: format!("snoozed for {delay:?}"),
+        disposition: Disposition::Snooze { delay },
+    })
 }
 
 impl<E: std::error::Error> From<E> for JobError {
@@ -200,6 +211,30 @@ mod tests {
                 .retry_delay(),
             None
         );
+        assert_eq!(
+            snooze(delay).unwrap_err().retry_after(delay).retry_delay(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_dispositions_do_not_overlap() {
+        let snoozed = snooze(Duration::from_secs(30)).unwrap_err();
+        assert_eq!(snoozed.snoozed_for(), Some(Duration::from_secs(30)));
+        assert!(!snoozed.is_permanent());
+        assert!(!snoozed.is_interruption());
+        assert_eq!(snoozed.halt(), None);
+        assert_eq!(snoozed.msg(), "snoozed for 30s");
+
+        let permanent = JobError::permanent(std::fmt::Error);
+        assert_eq!(permanent.snoozed_for(), None);
+        assert!(!permanent.is_interruption());
+
+        let halted = JobError::halted(Halt::Shutdown);
+        assert_eq!(halted.snoozed_for(), None);
+        assert!(!halted.is_permanent());
+
+        assert_eq!(JobError::new("boom".to_owned()).snoozed_for(), None);
     }
 
     #[test]

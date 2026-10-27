@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Database, HistoryRow, JobRow, OCCUPANCY, Rng, RunningWorker};
+use jalari::admin::RunNowOutcome;
 use jalari::recurring::{self, Cron};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{
@@ -35,6 +36,9 @@ const DELAY_QUEUE: &str = "stop_race_delay";
 const SINGLE_QUEUE: &str = "stop_race_single";
 const CRON_QUEUE: &str = "stop_race_cron";
 const IDLE_QUEUE: &str = "stop_race_idle";
+const DOZE_QUEUE: &str = "stop_race_doze";
+const NAP_QUEUE: &str = "stop_race_nap";
+const SNOOZED: &str = "the job asked to run again later";
 
 type StuckRow = (i64, String, i32, Option<String>, Option<String>);
 type LeftoverRow = (i64, String, Option<String>, bool, Option<String>);
@@ -46,6 +50,9 @@ static OPS: LazyLock<Mutex<Vec<Op>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static CHAOS: LazyLock<Mutex<Vec<(Instant, Instant)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static TICKS: LazyLock<Mutex<Vec<Instant>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static RUN_SEQ: AtomicU64 = AtomicU64::new(1);
+static DOZES: LazyLock<Mutex<Vec<Option<u64>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static NAPS: LazyLock<Mutex<HashMap<i64, Vec<Instant>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Default)]
 struct LoggedFields {
@@ -197,6 +204,52 @@ impl Job for Tick {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Dozer;
+
+#[jalari::job(queue = "stop_race_doze")]
+impl Job for Dozer {
+    const NAME: &'static str = "stop_race_dozer";
+    const MAX_ATTEMPTS: i32 = 3;
+
+    async fn run(self) -> JobResult {
+        let (saved, checkpoint) = jalari::resume::<u64>()?;
+        DOZES.lock().unwrap().push(saved);
+        if saved.is_some() {
+            return Ok(());
+        }
+        checkpoint.save(&42).await?;
+        jalari::snooze(Duration::from_secs(3600))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Napper {
+    naps: Vec<u64>,
+    busy: u64,
+}
+
+#[jalari::job(queue = "stop_race_nap")]
+impl Job for Napper {
+    const NAME: &'static str = "stop_race_napper";
+    const MAX_ATTEMPTS: i32 = 2;
+
+    async fn run(self) -> JobResult {
+        let job_id = jalari::current_job().unwrap().id().0;
+        let index = {
+            let mut naps = NAPS.lock().unwrap();
+            let starts = naps.entry(job_id).or_default();
+            starts.push(Instant::now());
+            starts.len() - 1
+        };
+        tokio::time::sleep(Duration::from_millis(self.busy)).await;
+        match self.naps.get(index) {
+            Some(&millis) => jalari::snooze(Duration::from_millis(millis)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -544,6 +597,18 @@ async fn test_race_stop() {
     if selected("recurring") {
         failures.extend(timed("recurring", check_recurring(&database)).await);
     }
+    if selected("stop_while_snoozed") {
+        failures.extend(timed("stop_while_snoozed", check_stop_while_snoozed(&database)).await);
+    }
+    if selected("stop_racing_a_snooze") {
+        failures.extend(
+            timed(
+                "stop_racing_a_snooze",
+                check_stop_racing_a_snooze(&database, seed),
+            )
+            .await,
+        );
+    }
     if selected("command_storm") {
         failures.extend(timed("command_storm", check_command_storm(&database, seed)).await);
     }
@@ -573,6 +638,283 @@ async fn test_race_stop() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+async fn snooze_history(
+    database: &Database,
+    job_id: i64,
+) -> Vec<(String, i32, Option<String>, bool)> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT state, attempt, error, duration_ms IS NOT NULL FROM {} WHERE job_id = $1 ORDER BY id",
+        database.table("job_history")
+    )))
+    .bind(job_id)
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+}
+
+async fn run_at(database: &Database, job_id: i64) -> (String, i32, chrono::DateTime<chrono::Utc>) {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT state, attempts, run_at FROM {} WHERE id = $1",
+        database.table("job")
+    )))
+    .bind(job_id)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap()
+}
+
+async fn check_stop_while_snoozed(database: &Database) -> Vec<String> {
+    let label = "stop_while_snoozed";
+    let mut failures = Vec::new();
+    let worker = spawn_worker(
+        &[(DOZE_QUEUE, 1)],
+        STOP_TIMEOUT,
+        Duration::from_secs(10),
+        false,
+    )
+    .await;
+    let id = jalari::enqueue(&Dozer).await.unwrap().id().0;
+    if !wait_for("the dozer to snooze", Duration::from_secs(20), || {
+        DOZES.lock().unwrap().len() == 1
+    })
+    .await
+    {
+        worker.stop().await;
+        return vec![format!("{label}: job {id} never ran")];
+    }
+    let mut snoozed = run_at(database, id).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while snoozed.0 != "scheduled" && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        snoozed = run_at(database, id).await;
+    }
+    if (snoozed.0.as_str(), snoozed.1) != ("scheduled", 0) {
+        failures.push(format!(
+            "{label}: job {id} is {} with {} attempts after snoozing; expected scheduled with 0",
+            snoozed.0, snoozed.1
+        ));
+    }
+
+    let stopped = stop(id).await;
+    if stopped != Some(StopOutcome::Stopped) {
+        failures.push(format!(
+            "{label}: stop on the snoozed job {id} answered {stopped:?}; expected Stopped at once"
+        ));
+    }
+    let woken = jalari::admin::run_now(jalari::JobId(id)).await.unwrap();
+    if woken != RunNowOutcome::NotWaiting {
+        failures.push(format!(
+            "{label}: run_now on the stopped job {id} answered {woken:?}; expected NotWaiting"
+        ));
+    }
+    let restarted = restart(id).await;
+    if restarted != Some(RestartOutcome::Restarted) {
+        failures.push(format!(
+            "{label}: restart of job {id} answered {restarted:?}; expected Restarted"
+        ));
+    }
+    let after_restart = run_at(database, id).await;
+    if after_restart != snoozed {
+        failures.push(format!(
+            "{label}: restart moved job {id} from {snoozed:?} to {after_restart:?}; main keeps \
+             a future run_at and the scheduled state"
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if DOZES.lock().unwrap().len() != 1 {
+        failures.push(format!(
+            "{label}: job {id} ran again before its snooze time after restart"
+        ));
+    }
+    let woken = jalari::admin::run_now(jalari::JobId(id)).await.unwrap();
+    if woken != RunNowOutcome::Enqueued {
+        failures.push(format!(
+            "{label}: run_now after restart of job {id} answered {woken:?}; expected Enqueued"
+        ));
+    }
+    let finished = wait_for("the dozer to finish", Duration::from_secs(20), || {
+        DOZES.lock().unwrap().len() >= 2
+    })
+    .await;
+    let mut done = run_at(database, id).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while done.0 != "succeeded" && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        done = run_at(database, id).await;
+    }
+    let dozes = DOZES.lock().unwrap().clone();
+    if !finished || dozes != [None, Some(42)] || (done.0.as_str(), done.1) != ("succeeded", 1) {
+        failures.push(format!(
+            "{label}: job {id} ended {} with {} attempts after resuming {dozes:?}; expected \
+             succeeded with 1 attempt, resuming the saved 42",
+            done.0, done.1
+        ));
+    }
+    let history = snooze_history(database, id).await;
+    let expected: Vec<(String, i32, Option<String>, bool)> = vec![
+        ("scheduled".to_owned(), 0, Some(SNOOZED.to_owned()), true),
+        (
+            "stopped".to_owned(),
+            0,
+            Some("the job was asked to stop".to_owned()),
+            false,
+        ),
+        ("scheduled".to_owned(), 0, None, false),
+        ("enqueued".to_owned(), 0, None, false),
+        ("succeeded".to_owned(), 1, None, true),
+    ];
+    if history != expected {
+        failures.push(format!(
+            "{label}: job {id} history is {history:?}; expected {expected:?}"
+        ));
+    }
+    worker.stop().await;
+    failures
+}
+
+async fn check_stop_racing_a_snooze(database: &Database, seed: u64) -> Vec<String> {
+    let label = "stop_racing_a_snooze";
+    let mut failures = Vec::new();
+    let mut rng = Rng::new(seed ^ 0x5a00_2e5a);
+    let workers = vec![
+        spawn_worker(
+            &[(NAP_QUEUE, 8)],
+            STOP_TIMEOUT,
+            Duration::from_secs(10),
+            false,
+        )
+        .await,
+        spawn_worker(
+            &[(NAP_QUEUE, 8)],
+            STOP_TIMEOUT,
+            Duration::from_secs(10),
+            false,
+        )
+        .await,
+    ];
+    let mut ids = Vec::new();
+    let mut targets = Vec::new();
+    for _ in 0..200 {
+        let naps = (0..=rng.below(20)).map(|_| rng.below(31)).collect();
+        let napper = Napper {
+            naps,
+            busy: rng.below(16),
+        };
+        let id = jalari::enqueue(&napper).await.unwrap().id().0;
+        ids.push(id);
+        if rng.chance(50) {
+            targets.push(id);
+        }
+    }
+    let targets = Arc::new(targets);
+    let stoppers: Vec<_> = (0..4)
+        .map(|stream| {
+            let targets = Arc::clone(&targets);
+            let mut rng = rng.fork(stream);
+            tokio::spawn(async move {
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_millis(1500) {
+                    tokio::time::sleep(rng.millis(0, 15)).await;
+                    stop(*rng.pick(&targets)).await;
+                }
+            })
+        })
+        .collect();
+    for stopper in stoppers {
+        stopper.await.unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut rows: Vec<JobRow>;
+    loop {
+        rows = database
+            .jobs()
+            .await
+            .into_iter()
+            .filter(|row| ids.contains(&row.id))
+            .collect();
+        let open = rows
+            .iter()
+            .filter(|row| matches!(row.state.as_str(), "scheduled" | "enqueued" | "running"))
+            .count();
+        if open == 0 || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop_all(workers).await;
+
+    let mut answers: BTreeMap<String, usize> = BTreeMap::new();
+    for row in &rows {
+        let ops = ops_of(row.id);
+        for op in &ops {
+            *answers.entry(op.outcome.clone()).or_default() += 1;
+        }
+        let starts = NAPS
+            .lock()
+            .unwrap()
+            .get(&row.id)
+            .cloned()
+            .unwrap_or_default();
+        match (row.state.as_str(), row.attempts) {
+            ("stopped", 0) | ("succeeded", 1) => {}
+            (state, attempts) => failures.push(format!(
+                "{label}: job {} is {state} with {attempts} attempts; expected stopped with 0 \
+                 or succeeded with 1",
+                row.id
+            )),
+        }
+        for op in ops
+            .iter()
+            .filter(|op| matches!(op.outcome.as_str(), "Stopped" | "Requested"))
+        {
+            if let Some(start) = starts.iter().find(|start| **start > op.end) {
+                failures.push(format!(
+                    "{label}: job {} started a run {:?} after stop answered {}",
+                    row.id,
+                    start.duration_since(op.end),
+                    op.outcome
+                ));
+            }
+        }
+        let history = snooze_history(database, row.id).await;
+        let closes = history.iter().filter(|entry| entry.3).count();
+        if closes != starts.len() {
+            failures.push(format!(
+                "{label}: job {} ran {} times but its history has {closes} closes: {history:?}",
+                row.id,
+                starts.len()
+            ));
+        }
+        let (last, earlier) = history.split_last().unwrap();
+        let earlier_ok = earlier.iter().all(|(state, attempt, error, closed)| {
+            state == "scheduled" && *attempt == 0 && error.as_deref() == Some(SNOOZED) && *closed
+        });
+        let last_ok = match last.0.as_str() {
+            "succeeded" => last.1 == 1 && last.3,
+            "stopped" => last.1 == 0,
+            _ => false,
+        };
+        if !earlier_ok || !last_ok || last.0 != row.state {
+            failures.push(format!(
+                "{label}: job {} ({}) has an invalid history: {history:?}",
+                row.id, row.state
+            ));
+        }
+    }
+    let stopped = rows.iter().filter(|row| row.state == "stopped").count();
+    eprintln!(
+        "{label}: {stopped} of {} jobs stopped, stop answers {answers:?}",
+        rows.len()
+    );
+    if !answers.contains_key("Stopped") || !answers.contains_key("Requested") {
+        failures.push(format!(
+            "{label}: the stops never met both a waiting and a running job: {answers:?}"
+        ));
+    }
+    failures
 }
 
 async fn check_claim_snapshot(database: &Database, seed: u64) -> Vec<String> {

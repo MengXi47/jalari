@@ -5,14 +5,17 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Database, RunningWorker, fast_retry, wait_until, worker_config};
-use jalari::admin::RetryOutcome;
+use jalari::admin::{RetryOutcome, RunNowOutcome};
+use jalari::recurring::{self, Cron};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{
-    EnqueueOptions, ExponentialBackoff, Job, JobError, JobId, JobResult, RetryPolicy, Worker,
+    EnqueueOptions, EnqueueOutcome, ExponentialBackoff, Job, JobError, JobId, JobMeta,
+    JobMiddleware, JobResult, Next, RetryPolicy, Worker,
 };
 use serde::{Deserialize, Serialize};
 
 const SETTLE: Duration = Duration::from_secs(20);
+const SNOOZED: &str = "the job asked to run again later";
 
 static RUNS: LazyLock<Mutex<HashMap<String, Vec<Run>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -20,6 +23,7 @@ static RUNS: LazyLock<Mutex<HashMap<String, Vec<Run>>>> =
 #[derive(Debug, Clone)]
 struct Run {
     attempt: i32,
+    resumed: Option<u64>,
     start: Instant,
     end: Option<Instant>,
 }
@@ -33,6 +37,9 @@ enum Step {
     Succeed,
     Fail,
     RetryAfter(u64),
+    Snooze(u64),
+    SaveThenSnooze(u64),
+    Busy,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,11 +60,13 @@ impl Job for Scripted {
 
 async fn perform(scripted: Scripted) -> JobResult {
     let attempt = jalari::current_job().unwrap().attempt();
+    let (resumed, checkpoint) = jalari::resume::<u64>()?;
     let index = {
         let mut all = RUNS.lock().unwrap();
         let runs = all.entry(scripted.label.clone()).or_default();
         runs.push(Run {
             attempt,
+            resumed,
             start: Instant::now(),
             end: None,
         });
@@ -70,6 +79,12 @@ async fn perform(scripted: Scripted) -> JobResult {
         Step::RetryAfter(millis) => {
             Err(JobError::new("rate limited".to_owned()).retry_after(Duration::from_millis(millis)))
         }
+        Step::Snooze(millis) => jalari::snooze(Duration::from_millis(millis)),
+        Step::SaveThenSnooze(millis) => {
+            checkpoint.save(&7).await?;
+            jalari::snooze(Duration::from_millis(millis))
+        }
+        Step::Busy => Err(JobError::new("busy".to_owned())),
     };
     if let Some(run) = RUNS
         .lock()
@@ -105,6 +120,31 @@ impl Job for Picky {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Ticker;
+
+#[jalari::job(queue = "outcomes_recurring")]
+impl Job for Ticker {
+    const NAME: &'static str = "outcomes_ticker";
+
+    async fn run(self) -> JobResult {
+        perform(scripted("recurring", &[Step::Snooze(3000), Step::Succeed])).await
+    }
+}
+
+struct Snoozer;
+
+impl JobMiddleware for Snoozer {
+    type Provides = ();
+
+    async fn call(&self, _: &JobMeta, next: Next<'_>) -> JobResult {
+        match next.run().await {
+            Err(error) if error.msg() == "busy" => jalari::snooze(Duration::from_millis(200)),
+            result => result,
+        }
+    }
+}
+
 fn scripted(label: &str, steps: &[Step]) -> Scripted {
     Scripted {
         label: label.to_owned(),
@@ -118,6 +158,20 @@ async fn spawn<R: RetryPolicy>(queue: &str, retry_policy: R) -> RunningWorker {
             .queue(queue, 4)
             .config(worker_config(Duration::from_millis(50)))
             .retry_policy(retry_policy)
+            .scheduler(false)
+            .build()
+            .await
+            .unwrap(),
+    )
+}
+
+async fn spawn_snoozer(queue: &str) -> RunningWorker {
+    RunningWorker::spawn(
+        Worker::builder()
+            .queue(queue, 4)
+            .config(worker_config(Duration::from_millis(50)))
+            .retry_policy(fast_retry())
+            .middleware(Snoozer)
             .scheduler(false)
             .build()
             .await
@@ -191,7 +245,13 @@ async fn test_outcomes() {
         check_policy_delay_is_capped(&database),
         check_job_retry_policy_overrides_the_worker_policy(&database),
         check_enqueue_max_attempts_overrides_the_job_constant(&database),
+        check_snooze_runs_again_without_counting_the_attempt(&database),
+        check_snooze_keeps_progress_and_frees_the_queue_key(&database),
+        check_snooze_keeps_the_job_key(&database),
+        check_run_now_wakes_a_snoozed_job(&database),
+        check_middleware_turns_an_error_into_a_snooze(&database),
     );
+    check_snoozed_recurring_run_holds_its_schedule(&database).await;
 
     database.finish().await;
 }
@@ -317,5 +377,204 @@ async fn check_enqueue_max_attempts_overrides_the_job_constant(database: &Databa
     assert_eq!(row(database, id).await.attempts, 2);
     let attempts: Vec<i32> = runs("max_attempts").iter().map(|run| run.attempt).collect();
     assert_eq!(attempts, [1, 2, 1, 2]);
+    worker.stop().await;
+}
+
+fn snooze_row(attempt: i32) -> (String, i32, Option<String>, bool) {
+    (
+        "scheduled".to_owned(),
+        attempt,
+        Some(SNOOZED.to_owned()),
+        true,
+    )
+}
+
+fn succeeded_row(attempt: i32) -> (String, i32, Option<String>, bool) {
+    ("succeeded".to_owned(), attempt, None, true)
+}
+
+async fn check_snooze_runs_again_without_counting_the_attempt(database: &Database) {
+    let queue = "outcomes_snooze";
+    let worker = spawn(queue, fast_retry()).await;
+    let id = enqueue(
+        &scripted("snooze", &[Step::Snooze(300), Step::Succeed]),
+        queue,
+        EnqueueOptions::new(),
+    )
+    .await;
+
+    wait_for_state(database, id, "succeeded").await;
+    let job = row(database, id).await;
+    assert_eq!(job.attempts, 1);
+    assert_eq!(job.last_error, None);
+    assert_eq!(
+        history(database, id).await,
+        vec![snooze_row(0), succeeded_row(1)]
+    );
+    let runs = runs("snooze");
+    assert_eq!(
+        runs.iter().map(|run| run.attempt).collect::<Vec<_>>(),
+        [1, 1]
+    );
+    let gap = runs[1].start - runs[0].end.unwrap();
+    assert!(
+        gap >= Duration::from_millis(290),
+        "second run started {gap:?} after the snooze"
+    );
+    worker.stop().await;
+}
+
+async fn check_snooze_keeps_progress_and_frees_the_queue_key(database: &Database) {
+    let queue = "outcomes_snooze_progress";
+    let worker = spawn(queue, fast_retry()).await;
+    let options = || EnqueueOptions::new().queue_key("outcomes_shared");
+    let id = enqueue(
+        &scripted(
+            "snooze_progress",
+            &[Step::SaveThenSnooze(2000), Step::Succeed],
+        ),
+        queue,
+        options(),
+    )
+    .await;
+    wait_for_state(database, id, "scheduled").await;
+    let sibling = enqueue(
+        &scripted("snooze_sibling", &[Step::Succeed]),
+        queue,
+        options(),
+    )
+    .await;
+
+    wait_for_state(database, sibling, "succeeded").await;
+    wait_for_state(database, id, "succeeded").await;
+    let snoozer = runs("snooze_progress");
+    let sibling_run = &runs("snooze_sibling")[0];
+    assert!(
+        sibling_run.end.unwrap() < snoozer[1].start,
+        "the sibling with the same queue_key ran while the job was snoozed"
+    );
+    assert_eq!(snoozer[0].resumed, None);
+    assert_eq!(snoozer[1].resumed, Some(7));
+    worker.stop().await;
+}
+
+async fn check_snooze_keeps_the_job_key(database: &Database) {
+    let queue = "outcomes_snooze_key";
+    let worker = spawn(queue, fast_retry()).await;
+    let options = || EnqueueOptions::new().job_key("outcomes_snooze_key");
+    let job = scripted("snooze_key", &[Step::Snooze(2000), Step::Succeed]);
+    let id = enqueue(&job, queue, options()).await;
+    wait_for_state(database, id, "scheduled").await;
+
+    let again = jalari::enqueue_with(&job, options().queue(queue))
+        .await
+        .unwrap();
+    assert_eq!(again, EnqueueOutcome::Kept(id));
+    wait_for_state(database, id, "succeeded").await;
+    assert_eq!(runs("snooze_key").len(), 2);
+    worker.stop().await;
+}
+
+async fn check_run_now_wakes_a_snoozed_job(database: &Database) {
+    let queue = "outcomes_run_now";
+    let worker = spawn(queue, fast_retry()).await;
+    let id = enqueue(
+        &scripted("run_now", &[Step::Snooze(3_600_000), Step::Succeed]),
+        queue,
+        EnqueueOptions::new(),
+    )
+    .await;
+    wait_for_state(database, id, "scheduled").await;
+
+    let woken = Instant::now();
+    assert_eq!(
+        jalari::admin::run_now(id).await.unwrap(),
+        RunNowOutcome::Enqueued
+    );
+    wait_until(
+        "the snoozed job to succeed",
+        Duration::from_secs(3),
+        || async { row(database, id).await.state == "succeeded" },
+    )
+    .await;
+    assert!(woken.elapsed() < Duration::from_secs(3));
+    assert_eq!(row(database, id).await.attempts, 1);
+    worker.stop().await;
+}
+
+async fn check_middleware_turns_an_error_into_a_snooze(database: &Database) {
+    let queue = "outcomes_middleware";
+    let worker = spawn_snoozer(queue).await;
+    let id = enqueue(
+        &scripted(
+            "middleware",
+            &[Step::Busy, Step::Busy, Step::Busy, Step::Succeed],
+        ),
+        queue,
+        EnqueueOptions::new(),
+    )
+    .await;
+
+    wait_for_state(database, id, "succeeded").await;
+    assert_eq!(row(database, id).await.attempts, 1);
+    assert_eq!(
+        history(database, id).await,
+        vec![
+            snooze_row(0),
+            snooze_row(0),
+            snooze_row(0),
+            succeeded_row(1)
+        ]
+    );
+    worker.stop().await;
+}
+
+async fn check_snoozed_recurring_run_holds_its_schedule(database: &Database) {
+    let worker = RunningWorker::spawn(
+        Worker::builder()
+            .queue("outcomes_recurring", 2)
+            .config(worker_config(Duration::from_millis(50)))
+            .retry_policy(fast_retry())
+            .build()
+            .await
+            .unwrap(),
+    );
+    recurring::add_or_update(
+        "outcomes_ticker",
+        Cron::new("* * * * * *").unwrap(),
+        &Ticker,
+    )
+    .await
+    .unwrap();
+    wait_until("the first tick to snooze", SETTLE, || async {
+        runs("recurring")
+            .first()
+            .is_some_and(|run| run.end.is_some())
+    })
+    .await;
+
+    let snoozed_at = Instant::now();
+    while snoozed_at.elapsed() < Duration::from_millis(2000) {
+        let (waiting, total): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT count(*) FILTER (WHERE state IN ('scheduled', 'enqueued', 'running')),
+                 count(*)
+             FROM {} WHERE task = 'outcomes_ticker'",
+            database.table("job")
+        )))
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!((waiting, total), (1, 1), "one job row for the schedule");
+        let info = recurring::list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|info| info.name == "outcomes_ticker")
+            .unwrap();
+        assert_eq!(info.run_count, 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(runs("recurring").len(), 1);
+    recurring::remove("outcomes_ticker").await.unwrap();
     worker.stop().await;
 }
