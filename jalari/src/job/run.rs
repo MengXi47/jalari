@@ -106,8 +106,34 @@ impl JobRun {
     }
 
     /// Cancelled when the worker starts shutting down; see [`shutdown_requested`].
+    ///
+    /// It covers shutdown only. [`JobRun::interrupted`] also completes on a stop, a cancel or a
+    /// lost job, with the error to return.
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    /// Same as [`interrupted`] for this attempt; usable from tasks the job spawns.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn upload() {}
+    /// # async fn example() {
+    /// let interrupted = jalari::current_job().map(|run| run.interrupted());
+    /// tokio::spawn(async move {
+    ///     if let Some(interrupted) = interrupted {
+    ///         tokio::select! {
+    ///             error = interrupted => eprintln!("upload interrupted: {error}"),
+    ///             () = upload() => {}
+    ///         }
+    ///     }
+    /// });
+    /// # }
+    /// ```
+    pub fn interrupted(&self) -> impl Future<Output = JobError> + Send + 'static + use<> {
+        let control = Arc::clone(&self.control);
+        async move { control.halted().await }
     }
 }
 
@@ -130,6 +156,10 @@ pub fn current_job() -> Option<JobRun> {
 /// to finish after that; a job can save its progress and return early instead of being aborted.
 /// Outside a job it never completes.
 ///
+/// It covers shutdown only; prefer [`interrupted`], which also completes on a stop, a cancel or
+/// a lost job and hands over the error to return. Return the [`checkpoint`](crate::checkpoint)
+/// error from this branch: any other error counts as a failed attempt.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -137,9 +167,7 @@ pub fn current_job() -> Option<JobRun> {
 /// # async fn example(ids: Vec<i64>) -> jalari::JobResult {
 /// for id in ids {
 ///     tokio::select! {
-///         () = jalari::shutdown_requested() => {
-///             return Err(jalari::JobError::new("stopped for shutdown".to_owned()));
-///         }
+///         () = jalari::shutdown_requested() => jalari::checkpoint().await?,
 ///         result = export(id) => result?,
 ///     }
 /// }
@@ -160,7 +188,7 @@ pub async fn shutdown_requested() {
 /// [`checkpoint`](crate::checkpoint) would return, so returning it releases or stops the job
 /// without counting the attempt; returning any other error counts it. Race it against long
 /// `.await`s with `tokio::select!`. Outside a job, and in tasks the job spawns, it never
-/// completes.
+/// completes; use [`JobRun::interrupted`] there.
 ///
 /// # Examples
 ///
@@ -176,14 +204,37 @@ pub async fn shutdown_requested() {
 /// # Ok(())
 /// # }
 /// ```
-#[expect(
-    clippy::manual_async_fn,
-    reason = "filled in by W2, which captures the current job before the future starts"
-)]
 pub fn interrupted() -> impl Future<Output = JobError> + Send + 'static {
-    async move { todo!("W2") }
+    let control = current_job().map(|job| job.control);
+    async move {
+        match control {
+            Some(control) => control.halted().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 pub(crate) fn within<F: Future>(job: JobRun, future: F) -> TaskLocalFuture<JobRun, F> {
     CURRENT_JOB.scope(job, future)
+}
+
+#[cfg(test)]
+impl JobRun {
+    pub(crate) fn for_test(id: i64, control: Arc<RunControl>) -> Self {
+        Self {
+            id: JobId(id),
+            name: "test_job",
+            queue: Arc::from("default"),
+            attempt: 1,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            priority: Priority::Normal,
+            last_error: None,
+            parent_id: None,
+            root_id: JobId(id),
+            cancellation: control.shutdown().clone(),
+            control,
+        }
+    }
 }

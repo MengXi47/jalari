@@ -71,6 +71,7 @@ impl Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Halt {
     Command(Command),
+    Lost,
     Shutdown,
 }
 
@@ -78,6 +79,7 @@ impl Halt {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::Command(command) => command.message(),
+            Self::Lost => "the worker no longer owns the job",
             Self::Shutdown => "the worker is shutting down",
         }
     }
@@ -97,6 +99,7 @@ pub(crate) struct RunControl {
     saved: Option<Value>,
     shutdown: CancellationToken,
     lost: CancellationToken,
+    halted: CancellationToken,
     command: AtomicU8,
     commanded: Notify,
     slot: Mutex<Slot>,
@@ -114,6 +117,7 @@ impl RunControl {
             job_id,
             lease,
             saved,
+            halted: shutdown.child_token(),
             shutdown,
             lost,
             command: AtomicU8::new(0),
@@ -140,8 +144,17 @@ impl RunControl {
 
     pub(crate) fn request(&self, command: Command) {
         if self.command.fetch_max(command.code(), Ordering::SeqCst) < command.code() {
+            self.halted.cancel();
             self.commanded.notify_one();
         }
+    }
+
+    pub(crate) async fn halted(&self) -> JobError {
+        tokio::select! {
+            () = self.halted.cancelled() => {}
+            () = self.lost.cancelled() => {}
+        }
+        JobError::halted(self.halt().unwrap_or(Halt::Shutdown))
     }
 
     pub(crate) async fn commanded(&self) {
@@ -153,9 +166,12 @@ impl RunControl {
     }
 
     fn halt(&self) -> Option<Halt> {
-        match self.command() {
-            Some(command) => Some(Halt::Command(command)),
-            None => self.shutdown.is_cancelled().then_some(Halt::Shutdown),
+        if let Some(command) = self.command() {
+            Some(Halt::Command(command))
+        } else if self.lost.is_cancelled() {
+            Some(Halt::Lost)
+        } else {
+            self.shutdown.is_cancelled().then_some(Halt::Shutdown)
         }
     }
 
@@ -345,5 +361,146 @@ pub async fn checkpoint() -> JobResult {
     match current_job() {
         Some(job) => stop_point(job.control().halt()).await,
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::run::{self, JobRun, interrupted};
+
+    const PENDING: Duration = Duration::from_millis(100);
+    const PROMPT: Duration = Duration::from_secs(1);
+
+    struct Run {
+        control: Arc<RunControl>,
+        shutdown: CancellationToken,
+        lost: CancellationToken,
+    }
+
+    impl Run {
+        fn new() -> Self {
+            let shutdown = CancellationToken::new();
+            let lost = CancellationToken::new();
+            let control = Arc::new(RunControl::new(
+                7,
+                1,
+                None,
+                shutdown.child_token(),
+                lost.child_token(),
+            ));
+            Self {
+                control,
+                shutdown,
+                lost,
+            }
+        }
+
+        fn job(&self) -> JobRun {
+            JobRun::for_test(7, Arc::clone(&self.control))
+        }
+
+        async fn halts(&self) -> (JobError, JobError) {
+            run::within(self.job(), async {
+                let error = tokio::time::timeout(PROMPT, interrupted())
+                    .await
+                    .expect("interrupted() completes once the job is halted");
+                (error, checkpoint().await.unwrap_err())
+            })
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_returns_the_checkpoint_error_for_a_stop() {
+        let run = Run::new();
+        run.control.request(Command::Stop);
+        let (interrupted, checkpointed) = run.halts().await;
+        assert_eq!(interrupted, checkpointed);
+        assert_eq!(interrupted.msg(), Command::Stop.message());
+        assert!(interrupted.is_interruption());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_outranks_stop_in_interrupted() {
+        for order in [
+            [Command::Stop, Command::Cancel],
+            [Command::Cancel, Command::Stop],
+        ] {
+            let run = Run::new();
+            for command in order {
+                run.control.request(command);
+            }
+            let (interrupted, checkpointed) = run.halts().await;
+            assert_eq!(interrupted.msg(), Command::Cancel.message(), "{order:?}");
+            assert_eq!(interrupted, checkpointed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_shutdown() {
+        let run = Run::new();
+        let waiting = tokio::spawn(run::within(run.job(), async { interrupted().await }));
+        tokio::time::sleep(PENDING).await;
+        assert!(!waiting.is_finished());
+        run.shutdown.cancel();
+        let error = tokio::time::timeout(PROMPT, waiting)
+            .await
+            .expect("interrupted() completes on shutdown")
+            .unwrap();
+        assert_eq!(error, JobError::halted(Halt::Shutdown));
+        assert!(error.is_interruption());
+        assert_eq!(run.halts().await.1, error);
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_lost() {
+        let run = Run::new();
+        let waiting = tokio::spawn(run.job().interrupted());
+        tokio::time::sleep(PENDING).await;
+        assert!(!waiting.is_finished());
+        run.lost.cancel();
+        let error = tokio::time::timeout(PROMPT, waiting)
+            .await
+            .expect("interrupted() completes when the job is lost")
+            .unwrap();
+        assert_eq!(error.msg(), "the worker no longer owns the job");
+        assert!(error.is_interruption());
+        let (interrupted, checkpointed) = run.halts().await;
+        assert_eq!(interrupted, error);
+        assert_eq!(checkpointed, error);
+    }
+
+    #[tokio::test]
+    async fn test_request_before_await_is_not_missed() {
+        let run = Run::new();
+        let error = run::within(run.job(), async {
+            let created = interrupted();
+            run.control.request(Command::Stop);
+            tokio::time::timeout(PROMPT, created)
+                .await
+                .expect("a stop requested before the await still completes it")
+        })
+        .await;
+        assert_eq!(error.msg(), Command::Stop.message());
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_is_pending_outside_a_job() {
+        assert!(tokio::time::timeout(PENDING, interrupted()).await.is_err());
+        let run = Run::new();
+        run.control.request(Command::Cancel);
+        let (spawned, handed) = run::within(run.job(), async {
+            let handed = run::current_job().unwrap().interrupted();
+            tokio::spawn(async move {
+                let spawned = tokio::time::timeout(PENDING, interrupted()).await;
+                (spawned.is_err(), tokio::time::timeout(PROMPT, handed).await)
+            })
+            .await
+            .unwrap()
+        })
+        .await;
+        assert!(spawned, "interrupted() in a spawned task never completes");
+        assert_eq!(handed.unwrap().msg(), Command::Cancel.message());
     }
 }
