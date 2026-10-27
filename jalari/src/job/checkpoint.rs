@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::run::current_job;
+use crate::enqueue::EnqueueRequest;
 use crate::{JobError, JobResult};
 
 const KEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -92,6 +93,17 @@ struct Slot {
     dirty: bool,
 }
 
+#[derive(Default)]
+struct Children(Mutex<Vec<EnqueueRequest>>);
+
+impl fmt::Debug for Children {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Children")
+            .field("buffered", &self.0.lock().unwrap().len())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RunControl {
     job_id: i64,
@@ -106,6 +118,7 @@ pub(crate) struct RunControl {
     reached_millis: AtomicU64,
     checkpoints: bool,
     slot: Mutex<Slot>,
+    children: Children,
 }
 
 impl RunControl {
@@ -130,6 +143,7 @@ impl RunControl {
             reached_millis: AtomicU64::new(0),
             checkpoints,
             slot: Mutex::new(Slot::default()),
+            children: Children::default(),
         }
     }
 
@@ -232,6 +246,15 @@ impl RunControl {
 
     pub(crate) fn is_dirty(&self) -> bool {
         self.slot.lock().unwrap().dirty
+    }
+
+    pub(crate) fn buffer(&self, request: EnqueueRequest) {
+        self.children.0.lock().unwrap().push(request);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_children(&self) -> Vec<EnqueueRequest> {
+        std::mem::take(&mut *self.children.0.lock().unwrap())
     }
 }
 
