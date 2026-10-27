@@ -29,8 +29,13 @@ const UNSETTLED: &str = "state IN ('scheduled', 'enqueued', 'running')";
 const SHOWN_FAILURES: usize = 25;
 const TAKEOVER_LOG: &str = "job was interrupted, running it again";
 const POSTPONE_LOG: &str = "waiting for an interrupted job with the same queue_key";
+const LIMITED_QUEUE: &str = "kappa";
+const DOOMED_QUEUE: &str = "kappa_doomed";
 
 static LOGGED: LazyLock<Mutex<Vec<Logged>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static KEY_LOAD: LazyLock<Mutex<HashMap<String, (usize, usize)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static OPENED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone)]
 struct Logged {
@@ -175,6 +180,123 @@ impl Job for Bounded {
     async fn run(self) -> JobResult {
         perform(self.spec).await
     }
+}
+
+struct KeySeat(String);
+
+impl KeySeat {
+    fn enter(key: &str) -> Self {
+        let mut load = KEY_LOAD.lock().unwrap();
+        let (running, peak) = load.entry(key.to_owned()).or_default();
+        *running += 1;
+        *peak = (*peak).max(*running);
+        Self(key.to_owned())
+    }
+}
+
+impl Drop for KeySeat {
+    fn drop(&mut self) {
+        if let Some((running, _)) = KEY_LOAD.lock().unwrap().get_mut(&self.0) {
+            *running -= 1;
+        }
+    }
+}
+
+fn key_peak(key: &str) -> usize {
+    KEY_LOAD
+        .lock()
+        .unwrap()
+        .get(key)
+        .map_or(0, |(_, peak)| *peak)
+}
+
+fn open_gate(gate: &str) {
+    OPENED.lock().unwrap().insert(gate.to_owned());
+}
+
+#[derive(Serialize, Deserialize)]
+struct Limited {
+    label: String,
+    key: String,
+    millis: u64,
+    gate: Option<String>,
+}
+
+#[jalari::job(queue = "kappa")]
+impl Job for Limited {
+    const NAME: &'static str = "race_claim_limited";
+
+    async fn run(self) -> JobResult {
+        let _seat = KeySeat::enter(&self.key);
+        LEDGER.record(&self.label, "start");
+        if let Some(gate) = &self.gate {
+            let started = Instant::now();
+            while !OPENED.lock().unwrap().contains(gate)
+                && started.elapsed() < Duration::from_secs(30)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(self.millis)).await;
+        LEDGER.record(&self.label, "done");
+        Ok(())
+    }
+}
+
+struct LimitedSpec<'a> {
+    label: &'a str,
+    queue: &'a str,
+    key: &'a str,
+    limit: Option<u16>,
+    millis: u64,
+    gate: Option<&'a str>,
+}
+
+async fn enqueue_limited(spec: LimitedSpec<'_>) -> i64 {
+    let mut options = EnqueueOptions::new().queue(spec.queue).queue_key(spec.key);
+    if let Some(limit) = spec.limit {
+        options = options.queue_key_limit(limit);
+    }
+    let job = Limited {
+        label: spec.label.to_owned(),
+        key: spec.key.to_owned(),
+        millis: spec.millis,
+        gate: spec.gate.map(str::to_owned),
+    };
+    jalari::enqueue_with(&job, options).await.unwrap().id().0
+}
+
+async fn labels_started(labels: &[&str], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !labels.iter().all(|label| LEDGER.count(label, "start") > 0) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+async fn slots_of(database: &Database, ids: &[i64]) -> Vec<(i64, String, Option<i16>)> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT id, state, queue_key_slot FROM {} WHERE id = ANY($1) ORDER BY id",
+        database.table("job")
+    )))
+    .bind(ids)
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+}
+
+async fn succeeded_first_try(database: &Database, ids: &[i64]) -> i64 {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {} WHERE id = ANY($1) AND state = 'succeeded' AND attempts = 1",
+        database.table("job")
+    )))
+    .bind(ids)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap()
 }
 
 fn attempt_label(id: i64, attempt: i32) -> String {
@@ -939,6 +1061,18 @@ async fn test_race_claim() {
     if only.is_empty() || only == "locked_sibling" {
         failures.extend(check_locked_sibling_does_not_hold_key(&database).await);
     }
+    if only.is_empty() || only == "key_limit_caps" {
+        failures.extend(check_key_limit_caps_running(&database).await);
+    }
+    if only.is_empty() || only == "key_limit_race" {
+        failures.extend(check_key_limit_slot_race(&database).await);
+    }
+    if only.is_empty() || only == "mixed_limits" {
+        failures.extend(check_mixed_limits_share_slots(&database).await);
+    }
+    if only.is_empty() || only == "reaped_slot" {
+        failures.extend(check_reaped_job_frees_its_slot(&database).await);
+    }
     database.finish().await;
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
@@ -1523,4 +1657,310 @@ async fn check_locked_sibling_does_not_hold_key(database: &Database) -> Vec<Stri
         started.elapsed()
     );
     cap(failures)
+}
+
+async fn check_key_limit_caps_running(database: &Database) -> Vec<String> {
+    let tag = "[key_limit_caps]";
+    let started = Instant::now();
+    let logs = logged_mark();
+    let mut ids = Vec::new();
+    for index in 0..60 {
+        ids.push(
+            enqueue_limited(LimitedSpec {
+                label: &format!("caps:{index}"),
+                queue: LIMITED_QUEUE,
+                key: "caps",
+                limit: Some(3),
+                millis: 100,
+                gate: None,
+            })
+            .await,
+        );
+    }
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        workers.push(RunningWorker::spawn(
+            build_worker(&[(LIMITED_QUEUE, 8)], false, Duration::from_millis(100), 10).await,
+        ));
+    }
+    let settled = settle(database, &ids, Duration::from_secs(30)).await;
+    stop_all(workers).await;
+    let peak = key_peak("caps");
+    let succeeded = succeeded_first_try(database, &ids).await;
+    let logged = logged_since(logs);
+    report_logged(tag, &logged);
+    eprintln!(
+        "{tag}: peak {peak} running of limit 3, {succeeded} of 60 succeeded, {:?}",
+        started.elapsed()
+    );
+    let mut failures = Vec::new();
+    if peak != 3 {
+        failures.push(format!(
+            "{tag}: 60 jobs of one queue_key with limit 3 on 16 slots peaked at {peak} running \
+             bodies, expected exactly 3"
+        ));
+    }
+    if !settled || succeeded != 60 {
+        failures.push(format!(
+            "{tag}: {succeeded} of 60 jobs succeeded on their first attempt (settled: {settled}): \
+             {:?}",
+            describe_waiting(database, &ids).await
+        ));
+    }
+    if !logged.is_empty() {
+        failures.push(format!("{tag}: the library logged {logged:?}"));
+    }
+    failures
+}
+
+async fn check_key_limit_slot_race(database: &Database) -> Vec<String> {
+    let tag = "[key_limit_race]";
+    let started = Instant::now();
+    let logs = logged_mark();
+    let stop = CancellationToken::new();
+    let sampler = {
+        let stop = stop.clone();
+        let pool = database.pool.clone();
+        let sql = format!(
+            "SELECT count(*) FROM {} WHERE queue_key = 'race' AND state = 'running'",
+            database.table("job")
+        );
+        tokio::spawn(async move {
+            let mut samples = 0_u64;
+            let mut most = 0_i64;
+            while !stop.is_cancelled() {
+                let running: i64 = sqlx::query_scalar(AssertSqlSafe(sql.clone()))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                most = most.max(running);
+                samples += 1;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            (samples, most)
+        })
+    };
+    let mut ids = Vec::new();
+    for index in 0..500 {
+        ids.push(
+            enqueue_limited(LimitedSpec {
+                label: &format!("race:{index}"),
+                queue: LIMITED_QUEUE,
+                key: "race",
+                limit: Some(4),
+                millis: 2,
+                gate: None,
+            })
+            .await,
+        );
+    }
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        workers.push(RunningWorker::spawn(
+            build_worker(&[(LIMITED_QUEUE, 8)], false, Duration::from_millis(100), 10).await,
+        ));
+    }
+    let settled = settle(database, &ids, Duration::from_secs(60)).await;
+    stop_all(workers).await;
+    stop.cancel();
+    let (samples, most) = sampler.await.unwrap();
+    let peak = key_peak("race");
+    let succeeded = succeeded_first_try(database, &ids).await;
+    let logged = logged_since(logs);
+    report_logged(tag, &logged);
+    eprintln!(
+        "{tag}: {samples} samples, at most {most} running rows and {peak} running bodies of \
+         limit 4, {succeeded} of 500 succeeded, {:?}",
+        started.elapsed()
+    );
+    let mut failures = Vec::new();
+    if most > 4 || peak > 4 {
+        failures.push(format!(
+            "{tag}: a queue_key with limit 4 had {most} running rows in one sample and {peak} \
+             running bodies at once"
+        ));
+    }
+    if !settled || succeeded != 500 {
+        failures.push(format!(
+            "{tag}: {succeeded} of 500 jobs succeeded on their first attempt (settled: \
+             {settled}): {:?}",
+            describe_waiting(database, &ids).await
+        ));
+    }
+    if !logged.is_empty() {
+        failures.push(format!("{tag}: the library logged {logged:?}"));
+    }
+    failures
+}
+
+async fn check_mixed_limits_share_slots(database: &Database) -> Vec<String> {
+    let tag = "[mixed_limits]";
+    let mut failures = Vec::new();
+    let worker = RunningWorker::spawn(
+        build_worker(&[(LIMITED_QUEUE, 8)], false, Duration::from_millis(100), 10).await,
+    );
+    let wide = |label: &'static str, gate: &'static str| LimitedSpec {
+        label,
+        queue: LIMITED_QUEUE,
+        key: "mixed",
+        limit: Some(3),
+        millis: 0,
+        gate: Some(gate),
+    };
+    let narrow = |label: &'static str, gate: Option<&'static str>| LimitedSpec {
+        label,
+        queue: LIMITED_QUEUE,
+        key: "mixed",
+        limit: None,
+        millis: 0,
+        gate,
+    };
+    let first_wide = enqueue_limited(wide("mixed:a", "mixed-a")).await;
+    let second_wide = enqueue_limited(wide("mixed:b", "mixed-b")).await;
+    let both = labels_started(&["mixed:a", "mixed:b"], Duration::from_secs(5)).await;
+    let wide_slots = slots_of(database, &[first_wide, second_wide]).await;
+    let mut taken: Vec<Option<i16>> = wide_slots.iter().map(|(_, _, slot)| *slot).collect();
+    taken.sort_unstable();
+    if !both || taken != [Some(1), Some(2)] {
+        failures.push(format!(
+            "{tag}: two limit-3 jobs must run in the highest slots 1 and 2 (both started: \
+             {both}), rows {wide_slots:?}"
+        ));
+    }
+
+    let first_narrow = enqueue_limited(narrow("mixed:c", Some("mixed-c"))).await;
+    let narrow_started = labels_started(&["mixed:c"], Duration::from_secs(3)).await;
+    let narrow_slot = slots_of(database, &[first_narrow]).await;
+    if !narrow_started || narrow_slot[0].2 != Some(0) {
+        failures.push(format!(
+            "{tag}: with two limit-3 jobs running, a limit-1 job must start in slot 0 (started: \
+             {narrow_started}), row {narrow_slot:?}"
+        ));
+    }
+    open_gate("mixed-c");
+
+    let third_wide = enqueue_limited(wide("mixed:d", "mixed-d")).await;
+    let third_started = labels_started(&["mixed:d"], Duration::from_secs(3)).await;
+    let third_slot = slots_of(database, &[third_wide]).await;
+    let second_narrow = enqueue_limited(narrow("mixed:e", None)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let blocked_starts = LEDGER.count("mixed:e", "start");
+    open_gate("mixed-d");
+    let unblocked = labels_started(&["mixed:e"], Duration::from_secs(3)).await;
+    if !third_started || third_slot[0].2 != Some(0) || blocked_starts != 0 || !unblocked {
+        failures.push(format!(
+            "{tag}: with three limit-3 jobs running the limit-1 job must wait and start once one \
+             finishes; third limit-3 job started {third_started} in {third_slot:?}, limit-1 job \
+             started {blocked_starts} times while blocked and {unblocked} after"
+        ));
+    }
+    open_gate("mixed-a");
+    open_gate("mixed-b");
+    let ids = [
+        first_wide,
+        second_wide,
+        first_narrow,
+        third_wide,
+        second_narrow,
+    ];
+    if !settle(database, &ids, Duration::from_secs(10)).await {
+        failures.push(format!(
+            "{tag}: jobs still waiting after 10 s: {:?}",
+            describe_waiting(database, &ids).await
+        ));
+    }
+    worker.stop().await;
+    eprintln!("{tag}: {} failures", failures.len());
+    failures
+}
+
+async fn check_reaped_job_frees_its_slot(database: &Database) -> Vec<String> {
+    let tag = "[reaped_slot]";
+    let mut failures = Vec::new();
+    let job_table = database.table("job");
+    let doomed_worker = RunningWorker::spawn(
+        build_worker(&[(DOOMED_QUEUE, 1)], false, Duration::from_millis(100), 10).await,
+    );
+    let live_worker = RunningWorker::spawn(
+        build_worker(&[(LIMITED_QUEUE, 2)], false, Duration::from_millis(100), 10).await,
+    );
+    let holder = |label: &'static str, queue: &'static str, gate: &'static str| LimitedSpec {
+        label,
+        queue,
+        key: "reaped",
+        limit: Some(2),
+        millis: 0,
+        gate: Some(gate),
+    };
+    let doomed = enqueue_limited(holder("reaped:doomed", DOOMED_QUEUE, "reaped-hold")).await;
+    let live = enqueue_limited(holder("reaped:live", LIMITED_QUEUE, "reaped-hold")).await;
+    let holding = labels_started(&["reaped:doomed", "reaped:live"], Duration::from_secs(5)).await;
+    let waiter = enqueue_limited(holder("reaped:waiter", LIMITED_QUEUE, "reaped-waiter")).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before_crash = LEDGER.count("reaped:waiter", "start");
+
+    doomed_worker.crash().await;
+    let crashed = Instant::now();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let within_grace = LEDGER.count("reaped:waiter", "start");
+    let doomed_row = slots_of(database, &[doomed]).await;
+    let started = labels_started(&["reaped:waiter"], Duration::from_secs(20)).await;
+    let waited = since(crashed, first("reaped:waiter", "start"));
+    let order: Option<(bool, String)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT waiter.locked_at > reap.created_at, (waiter.locked_at - reap.created_at)::text
+         FROM {job_table} AS waiter, {history} AS reap
+         WHERE waiter.id = $1 AND waiter.state = 'running'
+             AND reap.job_id = $2 AND reap.error = $3",
+        history = database.table("job_history")
+    )))
+    .bind(waiter)
+    .bind(doomed)
+    .bind(INTERRUPTED)
+    .fetch_optional(&database.pool)
+    .await
+    .unwrap();
+    eprintln!(
+        "{tag}: holders running {holding}, waiter started {before_crash} times before the \
+         crash and {within_grace} within 2 s of it, doomed row 2 s after the crash \
+         {doomed_row:?}, waiter started {waited:?} after the crash, claim after reap {order:?}"
+    );
+    if !holding || before_crash != 0 || within_grace != 0 {
+        failures.push(format!(
+            "{tag}: with both slots of a limit-2 key held (holders running: {holding}), the \
+             waiter must not start before the dead holder is reaped; it started {before_crash} \
+             times before the crash and {within_grace} within 2 s of it"
+        ));
+    }
+    if doomed_row
+        .first()
+        .is_none_or(|(_, state, _)| state != "running")
+    {
+        failures.push(format!(
+            "{tag}: the dead worker's job must keep its slot until the reap, 2 s after the \
+             crash its row is {doomed_row:?}"
+        ));
+    }
+    if !started || order.as_ref().is_none_or(|(after, _)| !after) {
+        failures.push(format!(
+            "{tag}: the waiter must start once the dead holder is reaped; started {started} \
+             after {waited:?}, claim time against the reap {order:?}"
+        ));
+    }
+    open_gate("reaped-hold");
+    open_gate("reaped-waiter");
+    if !settle(database, &[live, waiter], Duration::from_secs(10)).await {
+        failures.push(format!(
+            "{tag}: jobs still waiting after 10 s: {:?}",
+            describe_waiting(database, &[live, waiter]).await
+        ));
+    }
+    live_worker.stop().await;
+    sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM {job_table} WHERE id = $1"
+    )))
+    .bind(doomed)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    failures
 }

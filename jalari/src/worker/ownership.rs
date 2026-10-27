@@ -111,17 +111,27 @@ impl Shared {
                          WHERE id = $3::uuid AND heartbeat_at >= statement_timestamp() - $6
                      ) AS alive
              ),
+             open AS MATERIALIZED (
+                 SELECT NOT EXISTS (SELECT 1 FROM {queue_pause} WHERE queue = $1) AS open
+             ),
              picked AS (
                  SELECT job.id, job.run_at FROM {job} AS job
-                 WHERE (SELECT alive FROM alive)
+                 WHERE (SELECT alive FROM alive) AND (SELECT open FROM open)
                      AND job.queue = $1
-                     AND job.state IN ('scheduled', 'enqueued')
-                     AND job.run_at <= now()
+                     AND job.state IN ('scheduled', 'enqueued') AND job.run_at <= now()
+                     AND (job.expires_at IS NULL OR job.expires_at > statement_timestamp())
                      AND {compatible}
-                     AND (job.queue_key IS NULL OR NOT EXISTS (
-                         SELECT 1 FROM {job} AS holder
-                         WHERE holder.queue_key = job.queue_key AND holder.state = 'running'
-                     ))
+                     AND (job.queue_key IS NULL
+                         OR (job.queue_key_limit IS NULL AND NOT EXISTS (
+                             SELECT 1 FROM {job} AS holder
+                             WHERE holder.queue_key = job.queue_key AND holder.state = 'running'
+                                 AND holder.queue_key_slot = 0
+                         ))
+                         OR (job.queue_key_limit IS NOT NULL AND (
+                             SELECT count(*) FROM {job} AS holder
+                             WHERE holder.queue_key = job.queue_key AND holder.state = 'running'
+                                 AND holder.queue_key_slot < job.queue_key_limit
+                         ) < job.queue_key_limit))
                  ORDER BY job.priority DESC, job.run_at, job.id
                  LIMIT 1
                  FOR NO KEY UPDATE SKIP LOCKED
@@ -130,7 +140,16 @@ impl Shared {
                  UPDATE {job} AS claimed
                  SET state = 'running', attempts = claimed.attempts + 1,
                      locked_by = $3::uuid, locked_at = statement_timestamp(), lock_token = $4,
-                     queue_key_slot = CASE WHEN claimed.queue_key IS NULL THEN NULL ELSE 0 END,
+                     queue_key_slot = CASE WHEN claimed.queue_key IS NOT NULL THEN (
+                         SELECT max(slot.number)::smallint
+                         FROM generate_series(0, coalesce(claimed.queue_key_limit, 1) - 1)
+                             AS slot (number)
+                         WHERE NOT EXISTS (
+                             SELECT 1 FROM {job} AS holder
+                             WHERE holder.queue_key = claimed.queue_key
+                                 AND holder.queue_key_slot = slot.number AND holder.state = 'running'
+                         )
+                     ) END,
                      updated_at = statement_timestamp()
                  FROM picked
                  WHERE claimed.id = picked.id
@@ -153,6 +172,7 @@ impl Shared {
              LEFT JOIN control ON control.job_id = claimed.id",
             job = schema.table("job"),
             worker = schema.table("worker"),
+            queue_pause = schema.table("queue_pause"),
             job_control = schema.table("job_control"),
             compatible = compatible("$2::jsonb"),
         );

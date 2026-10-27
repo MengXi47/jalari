@@ -31,8 +31,12 @@ pub struct WorkerConfig {
     /// How long [`Worker::run`](crate::Worker::run) waits for running jobs after shutdown is
     /// requested before aborting them; defaults to 30 seconds.
     pub shutdown_timeout: Duration,
-    /// How many times a claim tries again after another worker took the same `queue_key` at the
-    /// same instant; defaults to 10.
+    /// How many times a claim tries again after another worker took the same `queue_key` slot at
+    /// the same instant; defaults to 10.
+    ///
+    /// Every retry follows the winning claim's commit, so when K workers race for the free slots
+    /// of one key, a claim needs at most K - 1 retries. A claim that runs out of tries takes no
+    /// job and waits for the next notification or [`poll_interval`](Self::poll_interval).
     pub max_claim_tries: u32,
     /// How long a running job may take to reach a [`checkpoint`](crate::checkpoint) after
     /// [`stop`](crate::stop) or [`cancel`](crate::cancel) before it is aborted; defaults to 30
