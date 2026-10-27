@@ -45,7 +45,8 @@ jalari = "0.6"
 - **Stop, restart and cancel** — stop a job to free everything it holds, restart it later from
   the progress it saved at its last checkpoint, or cancel it for good; `interrupted()` reaches
   a job blocked in a long `.await`.
-- **Graceful shutdown** — running jobs finish before a worker exits.
+- **Graceful shutdown** — running jobs finish, or go back to their queue at their next
+  checkpoint, before a worker exits.
 - **Code fingerprints** — opt in per job to stamp it with a hash of the code it reaches, so a
   worker runs it only when the worker was built from the same code.
 - **Renaming** — `aliases` keep the jobs and schedules stored under a job's old name running.
@@ -69,7 +70,7 @@ jalari = "0.6"
         │       PostgreSQL        │
         │   jobs wait in a table  │
         └────────────┬────────────┘
-                     │  wake a worker, lock one job of its own build
+                     │  wake a worker, it claims the next due job
                      ▼
         ┌─────────────────────────┐
         │         Workers         │
@@ -81,10 +82,11 @@ Every job moves through the same states:
 
 ```
   waiting ──▶ running ──▶ succeeded
-     ▲           │
-     └── retry ◀─┤  attempt failed, attempts left
-                 ▼
-               failed   out of attempts, or an error that retrying cannot fix
+   │  ▲          │
+   │  └─ retry ◀─┤  attempt failed with attempts left, or the job snoozed
+   │             ├──▶ failed      out of attempts, or an error that retrying cannot fix
+   │             └──▶ discarded   the job gave up on purpose
+   └────────────────▶ discarded   still waiting when it expired
 ```
 
 - A worker marks the job it takes as running under its own name until the job is done, so no
