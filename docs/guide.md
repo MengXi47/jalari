@@ -1476,6 +1476,8 @@ name or alias that two linked jobs share.
 export DATABASE_URL=postgres://localhost/app
 cargo run -p jalari --example migrate
 cargo run -p jalari --example basic
+cargo run -p jalari --example outcomes
+cargo run -p jalari --example queues
 cargo run -p jalari --example stop_restart
 cargo run -p jalari --example middleware
 cargo run -p jalari --example split_worker
@@ -1488,8 +1490,10 @@ cargo run -p jalari --example split_control -- stranded
 |---|---|
 | [`migrate`](../jalari/examples/migrate.rs) | Creating and checking the tables; `--dry-run` prints the SQL instead |
 | [`basic`](../jalari/examples/basic.rs) | Defining, enqueueing and running jobs in one process: errors and retries, `job_key` with `KeepExisting` and `Replace`, `queue_key`, delays, transactions, recurring schedules, `current_job`, `interrupted`, a job that reschedules itself with `enqueue_on_success_with` under its own `job_key`, cluster settings and monitoring. It runs until Ctrl-C |
+| [`outcomes`](../jalari/examples/outcomes.rs) | Every way an attempt ends, printed by a middleware's `finished` hook: `retry_after` for a rate limit, a per-job `RETRY_POLICY` that runs out of attempts, `snooze` on the same attempt, `JobError::discard`, and a job that expires with `expire_after` before it runs next to one with `expires_at` that runs in time. The jobs read `created_at`, `scheduled_at`, `priority` and `last_error` from `current_job`, the middleware marks the last attempt with `is_last_attempt`, and the run ends with the job list and the queue's `throughput`. It exits when done |
+| [`queues`](../jalari/examples/queues.rs) | `pause_queue`, `paused_queues` and `resume_queue`; `enqueue_many` with a key repeated in the batch; priorities from the `priority` attribute and from `EnqueueOptions::priority`, moved with `set_priority` while the queue is paused, then run in priority order; `queue_key_limit` letting two jobs of one key run at once; and a job that enqueues children and a grandchild, listed with `JobFilter::parent` and `JobFilter::root`. It exits when done |
 | [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress and `checkpoints = true`, a job blocked in one long sleep that `interrupted()` stops within a second, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
-| [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, and a job that passes its context to the jobs it enqueues. It exits when done |
+| [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, a job that passes its context to the jobs it enqueues, the `finished` hook with `is_last_attempt`, and a job stored under an old name that runs through `aliases`. It exits when done |
 | [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job, lists the jobs no live worker can run (`stranded`) or releases a task's jobs to any build (`release <task>`) from yet another process. `vacuum_tables` is the only job without `fingerprint = true`; edit `common/jobs.rs` and rebuild only `split_worker` to see the other jobs wait for the build that enqueued them |
 
 The examples use `jalari::Schema::default()`, so they share the `jalari` schema of the

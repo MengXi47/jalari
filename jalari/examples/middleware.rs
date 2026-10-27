@@ -2,9 +2,14 @@ use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
+use jalari::admin::JobFilter;
 use jalari::sqlx::PgPool;
 use jalari::sqlx::postgres::PgPoolOptions;
-use jalari::{EnqueueOptions, Job, JobError, JobId, JobMeta, JobMiddleware, JobResult, Next};
+use jalari::sqlx::types::chrono::{DateTime, Utc};
+use jalari::{
+    EnqueueOptions, Finished, Job, JobError, JobId, JobMeta, JobMiddleware, JobResult, JobState,
+    Next,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -47,6 +52,19 @@ impl JobMiddleware for TracingMiddleware {
             started.elapsed()
         );
         result
+    }
+
+    async fn finished(&self, job: &JobMeta, outcome: &Finished) {
+        let last = if job.is_last_attempt() {
+            ", its last attempt"
+        } else {
+            ""
+        };
+        println!(
+            "  == {} #{} saved as {outcome:?}{last}",
+            job.name(),
+            job.id()
+        );
     }
 }
 
@@ -132,7 +150,7 @@ impl Job for NotifyUser {
 #[derive(Serialize, Deserialize)]
 struct PurgeCache;
 
-#[jalari::job(name = "purge_cache", queue = "reports")]
+#[jalari::job(name = "purge_cache", queue = "reports", aliases = ["clear_cache"])]
 impl Job for PurgeCache {
     async fn run(self) -> JobResult {
         println!("     purging the cache, no tenant needed");
@@ -156,14 +174,15 @@ async fn tenant_pool(url: &str) -> Result<PgPool, jalari::sqlx::Error> {
         .await
 }
 
-async fn wait_until_finished(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
+async fn wait_until_finished(since: DateTime<Utc>) -> Result<(), Box<dyn std::error::Error>> {
+    let unfinished = JobFilter::new()
+        .queue("reports")
+        .created_after(since)
+        .state(JobState::Scheduled)
+        .state(JobState::Enqueued)
+        .state(JobState::Running);
     for _ in 0..300 {
-        let waiting: i64 = jalari::sqlx::query_scalar(
-            "SELECT count(*) FROM jalari.job WHERE state IN ('scheduled', 'enqueued')",
-        )
-        .fetch_one(pool)
-        .await?;
-        if waiting == 0 {
+        if jalari::admin::count(&unfinished).await? == 0 {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -180,6 +199,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .migrate()
         .await?;
 
+    let since: DateTime<Utc> = jalari::sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await?;
+    let legacy: i64 = jalari::sqlx::query_scalar(
+        "INSERT INTO jalari.job (queue, task, payload, state, max_attempts)
+         VALUES ('reports', 'clear_cache', convert_to('null', 'UTF8'), 'enqueued', 10)
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?;
+    println!("job {legacy} waits under clear_cache, the name purge_cache had before a rename");
+
     let databases = HashMap::from([
         ("acme".to_owned(), tenant_pool(&url).await?),
         ("globex".to_owned(), tenant_pool(&url).await?),
@@ -194,11 +225,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let worker_task = tokio::spawn(worker.run(shutdown.child_token()));
 
+    let mut ids: Vec<(&str, JobId)> = vec![(
+        "stored under the alias clear_cache, run by purge_cache",
+        JobId(legacy),
+    )];
+
     let acme = Caller {
         tenant: "acme".to_owned(),
         user_id: 7,
     };
-    let mut ids: Vec<(&str, JobId)> = Vec::new();
 
     let outcome = jalari::scope(&acme, async {
         let mut transaction = pool.begin().await?;
@@ -260,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         outcome.id(),
     ));
 
-    wait_until_finished(&pool).await?;
+    wait_until_finished(since).await?;
     shutdown.cancel();
     worker_task.await?;
 

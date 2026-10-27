@@ -153,9 +153,9 @@ worker.run(shutdown).await;
 
 - [Guide](docs/guide.md) — setup, jobs, enqueueing, schedules, workers, stopping and
   restarting, middleware, deployment and settings
-- [Examples](docs/guide.md#examples) — complete programs: a tour of the basics, stopping and
-  restarting with checkpoints, middleware and context, and split web, worker and control
-  binaries
+- [Examples](docs/guide.md#examples) — complete programs: a tour of the basics, every way an
+  attempt ends, priorities, key limits, paused queues and job trees, stopping and restarting
+  with checkpoints, middleware and context, and split web, worker and control binaries
 - [Contributing](CONTRIBUTING.md)
 
 ## License
