@@ -5,8 +5,11 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Database, RunningWorker, fast_retry, wait_until, worker_config};
+use jalari::admin::RetryOutcome;
 use jalari::sqlx::{self, AssertSqlSafe};
-use jalari::{EnqueueOptions, Job, JobError, JobId, JobResult, RetryPolicy, Worker};
+use jalari::{
+    EnqueueOptions, ExponentialBackoff, Job, JobError, JobId, JobResult, RetryPolicy, Worker,
+};
 use serde::{Deserialize, Serialize};
 
 const SETTLE: Duration = Duration::from_secs(20);
@@ -77,6 +80,29 @@ async fn perform(scripted: Scripted) -> JobResult {
         run.end = Some(Instant::now());
     }
     result
+}
+
+struct Fixed(Duration);
+
+impl RetryPolicy for Fixed {
+    fn next_retry(&self, attempt: i32, max_attempts: i32, error: &JobError) -> Option<Duration> {
+        (!error.is_permanent() && attempt < max_attempts).then_some(self.0)
+    }
+}
+
+static QUICK: Fixed = Fixed(Duration::from_millis(50));
+
+#[derive(Serialize, Deserialize)]
+struct Picky(Scripted);
+
+#[jalari::job(queue = "outcomes")]
+impl Job for Picky {
+    const NAME: &'static str = "outcomes_picky";
+    const RETRY_POLICY: Option<&'static dyn RetryPolicy> = Some(&QUICK);
+
+    async fn run(self) -> JobResult {
+        perform(self.0).await
+    }
 }
 
 fn scripted(label: &str, steps: &[Step]) -> Scripted {
@@ -163,6 +189,8 @@ async fn test_outcomes() {
     tokio::join!(
         check_retry_after_sets_the_next_run(&database),
         check_policy_delay_is_capped(&database),
+        check_job_retry_policy_overrides_the_worker_policy(&database),
+        check_enqueue_max_attempts_overrides_the_job_constant(&database),
     );
 
     database.finish().await;
@@ -230,5 +258,64 @@ async fn check_policy_delay_is_capped(database: &Database) {
         (days - 36_500.0).abs() < 1.0,
         "run_at is {days} days after the close, expected 100 years"
     );
+    worker.stop().await;
+}
+
+async fn check_job_retry_policy_overrides_the_worker_policy(database: &Database) {
+    let queue = "outcomes_job_policy";
+    let worker = spawn(
+        queue,
+        ExponentialBackoff {
+            base: Duration::from_secs(3600),
+            max: Duration::from_secs(3600),
+            jitter: 0.0,
+        },
+    )
+    .await;
+    let started = Instant::now();
+    let id = enqueue(
+        &Picky(scripted(
+            "job_policy",
+            &[Step::Fail, Step::Fail, Step::Succeed],
+        )),
+        queue,
+        EnqueueOptions::new(),
+    )
+    .await;
+
+    wait_until(
+        "the picky job to succeed",
+        Duration::from_secs(3),
+        || async { row(database, id).await.state == "succeeded" },
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(row(database, id).await.attempts, 3);
+    worker.stop().await;
+}
+
+async fn check_enqueue_max_attempts_overrides_the_job_constant(database: &Database) {
+    let queue = "outcomes_max_attempts";
+    let worker = spawn(queue, fast_retry()).await;
+    let id = enqueue(
+        &scripted("max_attempts", &[Step::Fail]),
+        queue,
+        EnqueueOptions::new().max_attempts(2),
+    )
+    .await;
+
+    wait_for_state(database, id, "failed").await;
+    assert_eq!(row(database, id).await.attempts, 2);
+    assert_eq!(runs("max_attempts").len(), 2);
+
+    assert_eq!(
+        jalari::admin::retry(id).await.unwrap(),
+        RetryOutcome::Retried
+    );
+    wait_for_state(database, id, "failed").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(row(database, id).await.attempts, 2);
+    let attempts: Vec<i32> = runs("max_attempts").iter().map(|run| run.attempt).collect();
+    assert_eq!(attempts, [1, 2, 1, 2]);
     worker.stop().await;
 }
