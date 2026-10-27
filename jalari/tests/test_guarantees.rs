@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,11 +9,16 @@ use common::{Database, LEDGER, OCCUPANCY, RunningWorker, fast_retry, wait_until,
 use jalari::admin::{self, JobFilter, RetryOutcome, RunNowOutcome};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{
-    EnqueueOptions, Job, JobId, JobResult, RestartOutcome, StopOutcome, Worker, WorkerConfig,
+    EnqueueOptions, EnqueueOutcome, Job, JobId, JobResult, OnConflict, RestartOutcome, StopOutcome,
+    Worker, WorkerConfig,
 };
 use serde::{Deserialize, Serialize};
 
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
+const SNOOZED: &str = "the job asked to run again later";
+
+static SNOOZER_RUNS: AtomicU32 = AtomicU32::new(0);
+static CLOSE_RELEASED: AtomicBool = AtomicBool::new(false);
 
 static RESUMED: LazyLock<Mutex<HashMap<String, Vec<Option<u64>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -85,6 +91,47 @@ impl Job for Keyed {
         let _seat = OCCUPANCY.enter(vec!["g_key:race".to_owned()], self.label.clone());
         LEDGER.record(&self.label, "start");
         tokio::time::sleep(Duration::from_millis(2)).await;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Snoozer;
+
+#[jalari::job(queue = "g_snooze")]
+impl Job for Snoozer {
+    const NAME: &'static str = "g_snoozer";
+
+    async fn run(self) -> JobResult {
+        if SNOOZER_RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        jalari::snooze(Duration::from_secs(3600))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Closer;
+
+#[jalari::job(queue = "g_close")]
+impl Job for Closer {
+    const NAME: &'static str = "g_closer";
+
+    async fn run(self) -> JobResult {
+        let attempt = jalari::current_job().unwrap().attempt();
+        for index in 0..2 {
+            jalari::enqueue_on_success_with(
+                &Sleeper {
+                    label: format!("closer/{attempt}/{index}"),
+                    millis: 0,
+                },
+                EnqueueOptions::new().queue("g_close_child"),
+            )?;
+        }
+        LEDGER.record("closer", "buffered");
+        while !CLOSE_RELEASED.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         Ok(())
     }
 }
@@ -181,6 +228,8 @@ async fn test_guarantees() {
     check_admin_answers_while_running(&database).await;
     check_key_race().await;
     check_small_pool().await;
+    check_snooze_after_interruption_clears_the_marker(&database).await;
+    check_crash_during_close_inserts_no_children(&database).await;
     check_horizon_free(&database).await;
     database.finish().await;
 }
@@ -644,4 +693,134 @@ async fn check_horizon_free(database: &Database) {
     assert_eq!(pinned, 0);
     assert_eq!(dead, 0);
     worker.stop().await;
+}
+
+async fn last_error(database: &Database, id: JobId) -> Option<String> {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT last_error FROM {} WHERE id = $1",
+        database.table("job")
+    )))
+    .bind(id.0)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap()
+}
+
+async fn check_snooze_after_interruption_clears_the_marker(database: &Database) {
+    let crashed = spawn("g_snooze", 1).await;
+    let options = || EnqueueOptions::new().job_key("g_snooze_key");
+    let id = jalari::enqueue_with(&Snoozer, options())
+        .await
+        .unwrap()
+        .id();
+    wait_until("the first run", Duration::from_secs(15), || async {
+        SNOOZER_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    crashed.crash().await;
+    let rescuer = spawn("g_snooze", 1).await;
+    wait_until("the snoozed rerun", Duration::from_secs(30), || async {
+        history(database, id).await.len() == 2
+    })
+    .await;
+    rescuer.stop().await;
+    assert_eq!(
+        history(database, id).await,
+        [
+            ("scheduled".to_owned(), 1, Some(INTERRUPTED.to_owned())),
+            ("scheduled".to_owned(), 1, Some(SNOOZED.to_owned()))
+        ]
+    );
+    assert_eq!(last_error(database, id).await, None);
+    assert_eq!(admin::run_now(id).await.unwrap(), RunNowOutcome::Enqueued);
+    assert_eq!(state(database, id).await, "enqueued");
+    let replaced = jalari::enqueue_with(&Snoozer, options().on_conflict(OnConflict::Replace))
+        .await
+        .unwrap();
+    assert_eq!(replaced, EnqueueOutcome::Replaced(id));
+    assert_eq!(state(database, id).await, "enqueued");
+    assert_eq!(last_error(database, id).await, None);
+    assert_eq!(
+        jalari::cancel(id).await.unwrap(),
+        jalari::CancelOutcome::Cancelled
+    );
+}
+
+async fn check_crash_during_close_inserts_no_children(database: &Database) {
+    let job = database.table("job");
+    let worker = spawn("g_close", 1).await;
+    let id = jalari::enqueue(&Closer).await.unwrap().id();
+    wait_until("the closer to buffer", Duration::from_secs(15), || async {
+        LEDGER.count("closer", "buffered") > 0
+    })
+    .await;
+    let holder_pool = database.connect("close_holder", 1).await;
+    let mut holder = holder_pool.begin().await.unwrap();
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "SELECT 1 FROM {job} WHERE id = $1 FOR UPDATE"
+    )))
+    .bind(id.0)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    CLOSE_RELEASED.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let closing: i32 = loop {
+        let blocked: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder_pid)
+        .fetch_optional(&database.pool)
+        .await
+        .unwrap();
+        if let Some(blocked) = blocked {
+            break blocked;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the close never waited on the row"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    worker.crash().await;
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(closing)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert!(terminated);
+    holder.rollback().await.unwrap();
+    holder_pool.close().await;
+    let children = || async {
+        sqlx::query_scalar::<_, String>(AssertSqlSafe(format!(
+            "SELECT convert_from(payload, 'UTF8')::jsonb ->> 'label' FROM {job}
+             WHERE parent_id = $1 ORDER BY id"
+        )))
+        .bind(id.0)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(state(database, id).await, "running");
+    assert!(children().await.is_empty());
+    let rescuer = spawn("g_close", 1).await;
+    wait_until(
+        "the crashed close to run again",
+        Duration::from_secs(30),
+        || async { state(database, id).await == "succeeded" },
+    )
+    .await;
+    rescuer.stop().await;
+    assert_eq!(children().await, ["closer/2/0", "closer/2/1"]);
+    assert_eq!(
+        history(database, id).await,
+        [
+            ("scheduled".to_owned(), 1, Some(INTERRUPTED.to_owned())),
+            ("succeeded".to_owned(), 2, None)
+        ]
+    );
 }

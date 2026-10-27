@@ -252,7 +252,6 @@ impl RunControl {
         self.children.0.lock().unwrap().push(request);
     }
 
-    #[cfg(test)]
     pub(crate) fn take_children(&self) -> Vec<EnqueueRequest> {
         std::mem::take(&mut *self.children.0.lock().unwrap())
     }

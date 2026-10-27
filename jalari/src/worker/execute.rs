@@ -4,18 +4,19 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, error, info_span, warn};
+use tracing::{Instrument, debug, error, info_span, warn};
 
-use super::close::{Closing, Ending, decide};
+use super::close::{Closing, Ending, children_refused, decide, refused};
 use super::lifeline::Incarnation;
-use super::middleware::{JobMeta, Next};
+use super::middleware::{Finished, JobMeta, Next, report_finished};
 use super::ownership::{Claimed, Closed, close};
 use super::runner::Shared;
 use super::runs::{PendingClaim, Registration};
+use crate::enqueue::Columns;
 use crate::job::context::{self, Captured};
-use crate::job::registry::JobRegistration;
+use crate::job::registry::{ContextKey, JobRegistration};
 use crate::job::{RunControl, run};
-use crate::{JobError, JobId, JobResult, JobRun, Priority, Result, RetryPolicy};
+use crate::{JobError, JobId, JobResult, JobRun, Priority, Result};
 
 const MAX_CLOSE_TRIES: u32 = 5;
 const CLOSE_RETRY: Duration = Duration::from_secs(1);
@@ -26,6 +27,12 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+struct Report {
+    meta: Arc<JobMeta>,
+    needs: ContextKey,
+    captured: Captured,
 }
 
 impl Shared {
@@ -72,9 +79,7 @@ impl Shared {
             if control.lost().is_cancelled() {
                 return;
             }
-            let retry_policy = registration
-                .and_then(|registration| registration.retry_policy)
-                .unwrap_or(&*self.retry_policy);
+            let mut report = None;
             let ending = match (registration, control.command()) {
                 (_, Some(_)) => Ending::NotStarted,
                 (None, None) => Ending::Returned(Err(JobError::new(format!(
@@ -82,7 +87,14 @@ impl Shared {
                     claimed.task
                 )))),
                 (Some(job), None) => {
-                    let run = claimed.run(self, job, queue, Arc::clone(&control));
+                    let job_run = claimed.job_run(job, queue, Arc::clone(&control));
+                    let meta = Arc::new(JobMeta::new(job_run.clone(), claimed.context.clone()));
+                    report = Some(Report {
+                        meta: Arc::clone(&meta),
+                        needs: (job.context)(),
+                        captured: Captured::from_stored(claimed.context.clone()),
+                    });
+                    let run = claimed.run(self, job, job_run, meta);
                     tokio::pin!(run);
                     let mut deadline = None;
                     let shutdown_abort = ShutdownAbort {
@@ -115,9 +127,9 @@ impl Shared {
                 &claimed,
                 &control,
                 registered,
-                retry_policy,
                 &ending,
                 started.elapsed(),
+                report,
             )
             .await;
         }
@@ -130,32 +142,69 @@ impl Shared {
         claimed: &Claimed,
         control: &RunControl,
         registration: Registration<'_>,
-        retry_policy: &dyn RetryPolicy,
         ending: &Ending,
         duration: Duration,
+        report: Option<Report>,
     ) {
         let pool = self.config.pool.pool();
+        let retry_policy = self
+            .jobs
+            .get(claimed.task.as_str())
+            .and_then(|job| job.retry_policy)
+            .unwrap_or(&*self.retry_policy);
         let mut seen = control.command();
+        let buffered = control.take_children();
+        let mut children = (!buffered.is_empty()).then(|| Arc::new(Columns::from(buffered)));
+        let mut refusal = None;
         for tries in 1..=MAX_CLOSE_TRIES {
             let outcome = decide(
-                ending,
+                refusal.as_ref().unwrap_or(ending),
                 seen,
                 claimed.attempt,
                 claimed.max_attempts,
                 retry_policy,
             );
-            let closing =
-                Closing::after_run(claimed.attempt, outcome, seen, duration, control.latest());
+            let closing = Closing::after_run(
+                claimed.attempt,
+                outcome,
+                seen,
+                duration,
+                control.latest(),
+                children.clone(),
+            );
             match close(&pool, &self.config.schema, &claimed.hold, &closing).await {
-                Ok(Closed::Written) => {
+                Ok(Closed::Written { children_inserted }) => {
                     registration.close();
                     closing.log(claimed.hold.job_id);
+                    if let Some(children) = closing.children() {
+                        let buffered = i64::try_from(children.len()).unwrap_or(i64::MAX);
+                        debug!(
+                            children_inserted,
+                            children_kept = buffered - children_inserted,
+                            "enqueued the jobs buffered for success"
+                        );
+                    }
+                    if let Some(report) = report {
+                        report_finished(
+                            &self.middlewares,
+                            report.meta,
+                            report.needs,
+                            report.captured,
+                            Finished::from(closing.outcome()),
+                        )
+                        .await;
+                    }
                     return;
                 }
                 Ok(Closed::Recommanded(command)) => seen = command,
                 Ok(Closed::Lost) => {
                     warn!("another worker took the job over, dropping the outcome of this run");
                     return;
+                }
+                Err(e) if closing.children().is_some() && children_refused(&e) => {
+                    warn!(error = %e, "could not enqueue the jobs buffered for success");
+                    refusal = Some(refused(&e));
+                    children = None;
                 }
                 Err(e) if tries < MAX_CLOSE_TRIES && !control.lost().is_cancelled() => {
                     warn!(error = %e, "failed to record the job outcome, retrying");
@@ -246,14 +295,13 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 }
 
 impl Claimed {
-    async fn run(
+    fn job_run(
         &self,
-        shared: &Shared,
         registration: &'static JobRegistration,
         queue: &str,
         control: Arc<RunControl>,
-    ) -> JobResult {
-        let job_run = JobRun {
+    ) -> JobRun {
+        JobRun {
             id: JobId(self.hold.job_id),
             name: registration.name,
             queue: Arc::from(queue),
@@ -267,8 +315,16 @@ impl Claimed {
             root_id: JobId(self.root_id.unwrap_or(self.hold.job_id)),
             cancellation: control.shutdown().clone(),
             control,
-        };
-        let meta = JobMeta::new(job_run.clone(), self.context.clone());
+        }
+    }
+
+    async fn run(
+        &self,
+        shared: &Shared,
+        registration: &'static JobRegistration,
+        job_run: JobRun,
+        meta: Arc<JobMeta>,
+    ) -> JobResult {
         let captured = Captured::from_stored(self.context.clone());
         let middlewares = Arc::clone(&shared.middlewares);
         let payload = self.payload.clone();

@@ -1,10 +1,13 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use super::middleware::Finished;
+use crate::enqueue::Columns;
 use crate::job::{Command, Halt, JobState, SNOOZED};
-use crate::{JobError, JobResult, RetryPolicy};
+use crate::{Error, ErrorKind, JobError, JobResult, RetryPolicy};
 
 const LONGEST_DELAY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
@@ -87,6 +90,46 @@ impl Outcome {
     }
 }
 
+impl From<&Outcome> for Finished {
+    fn from(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Succeeded => Self::Succeeded,
+            Outcome::Retry { delay, error } => Self::Retrying {
+                delay: *delay,
+                error: error.clone(),
+            },
+            Outcome::Failed { error } => Self::Failed {
+                error: error.clone(),
+            },
+            Outcome::Discarded { error } => Self::Discarded {
+                error: error.clone(),
+            },
+            Outcome::Snoozed { delay } => Self::Snoozed { delay: *delay },
+            Outcome::Released { .. } => Self::Released,
+            Outcome::Stopped { .. } => Self::Stopped,
+            Outcome::Cancelled { .. } => Self::Cancelled,
+        }
+    }
+}
+
+pub(super) fn children_refused(error: &Error) -> bool {
+    !matches!(
+        error.kind,
+        ErrorKind::ConnectionFailed
+            | ErrorKind::ConnectionTerminated
+            | ErrorKind::PoolTimedOut
+            | ErrorKind::PoolClosed
+            | ErrorKind::TlsFailed
+            | ErrorKind::ProtocolViolation
+    )
+}
+
+pub(super) fn refused(error: &Error) -> Ending {
+    Ending::Returned(Err(JobError::new(format!(
+        "could not enqueue the jobs buffered for success: {error}"
+    ))))
+}
+
 pub(super) fn decide(
     ending: &Ending,
     command: Option<Command>,
@@ -145,6 +188,7 @@ pub(super) struct Closing {
     run_at_delay: Option<Duration>,
     duration_ms: Option<i64>,
     kept: Option<Value>,
+    children: Option<Arc<Columns>>,
 }
 
 impl Closing {
@@ -154,6 +198,7 @@ impl Closing {
         seen: Option<Command>,
         duration: Duration,
         kept: Option<Value>,
+        children: Option<Arc<Columns>>,
     ) -> Self {
         let (attempts, run_at_delay) = match &outcome {
             Outcome::Retry { delay, .. } => (attempt, Some(*delay)),
@@ -166,12 +211,13 @@ impl Closing {
             }
         };
         Self {
-            outcome,
             seen,
             attempts,
             run_at_delay,
             duration_ms: Some(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)),
             kept,
+            children: children.filter(|_| matches!(outcome, Outcome::Succeeded)),
+            outcome,
         }
     }
 
@@ -197,6 +243,10 @@ impl Closing {
 
     pub(super) fn kept(&self) -> Option<&Value> {
         self.kept.as_ref()
+    }
+
+    pub(super) fn children(&self) -> Option<&Columns> {
+        self.children.as_deref()
     }
 
     pub(super) fn log(&self, job_id: i64) {
@@ -303,11 +353,12 @@ mod tests {
     #[test]
     fn test_stopped_run_gives_its_attempt_back() {
         let outcome = decide(&error("boom"), Some(Command::Stop), 2, 3, &policy());
-        let closing = Closing::after_run(2, outcome, Some(Command::Stop), Duration::ZERO, None);
+        let closing =
+            Closing::after_run(2, outcome, Some(Command::Stop), Duration::ZERO, None, None);
         assert_eq!(closing.attempts, 1);
         let retried = decide(&error("boom"), None, 2, 3, &policy());
         assert_eq!(
-            Closing::after_run(2, retried, None, Duration::ZERO, None).attempts,
+            Closing::after_run(2, retried, None, Duration::ZERO, None, None).attempts,
             2
         );
     }
@@ -317,7 +368,7 @@ mod tests {
         let halted = Ending::Returned(Err(JobError::halted(Halt::Shutdown)));
         let outcome = decide(&halted, None, 3, 3, &policy());
         assert!(matches!(outcome, Outcome::Released { .. }));
-        let closing = Closing::after_run(3, outcome, None, Duration::ZERO, None);
+        let closing = Closing::after_run(3, outcome, None, Duration::ZERO, None, None);
         assert_eq!(closing.attempts, 2);
     }
 
@@ -424,7 +475,7 @@ mod tests {
         assert_eq!(outcome.last_error(), None);
         assert!(!outcome.is_terminal());
         assert_eq!(outcome.note(), Some(SNOOZED));
-        let closing = Closing::after_run(2, outcome, None, Duration::ZERO, None);
+        let closing = Closing::after_run(2, outcome, None, Duration::ZERO, None, None);
         assert_eq!(closing.attempts, 1);
         assert_eq!(closing.run_at_delay, Some(Duration::from_secs(30)));
     }
@@ -435,7 +486,7 @@ mod tests {
         let outcome = decide(&ending, None, 3, 3, &policy());
         assert!(matches!(outcome, Outcome::Snoozed { .. }));
         assert_eq!(
-            Closing::after_run(3, outcome, None, Duration::ZERO, None).attempts,
+            Closing::after_run(3, outcome, None, Duration::ZERO, None, None).attempts,
             2
         );
     }
@@ -453,9 +504,120 @@ mod tests {
         assert_eq!(outcome.state(), JobState::Discarded);
         assert!(outcome.is_terminal());
         assert_eq!(outcome.last_error(), Some(Some("gone")));
-        let closing = Closing::after_run(1, outcome, None, Duration::ZERO, None);
+        let closing = Closing::after_run(1, outcome, None, Duration::ZERO, None, None);
         assert_eq!(closing.attempts, 1);
         assert_eq!(closing.run_at_delay, None);
+    }
+
+    fn every_outcome() -> [Outcome; 8] {
+        [
+            Outcome::Succeeded,
+            Outcome::Retry {
+                delay: Duration::from_secs(2),
+                error: "boom".to_owned(),
+            },
+            Outcome::Failed {
+                error: "boom".to_owned(),
+            },
+            Outcome::Discarded {
+                error: "gone".to_owned(),
+            },
+            Outcome::Snoozed {
+                delay: Duration::from_secs(30),
+            },
+            Outcome::Released {
+                note: "shutdown".to_owned(),
+            },
+            Outcome::Stopped {
+                note: "stop".to_owned(),
+            },
+            Outcome::Cancelled {
+                note: "cancel".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_children_only_ride_a_success() {
+        for outcome in every_outcome() {
+            let succeeded = outcome == Outcome::Succeeded;
+            let children = Some(Arc::new(Columns::from(Vec::new())));
+            let closing = Closing::after_run(1, outcome, None, Duration::ZERO, None, children);
+            assert_eq!(closing.children().is_some(), succeeded);
+        }
+    }
+
+    #[test]
+    fn test_refused_children_follow_the_retry_policy() {
+        let error = Error::new(
+            ErrorKind::LockTimeout,
+            "55P03: canceling statement".to_owned(),
+        );
+        assert!(children_refused(&error));
+        let message = format!("could not enqueue the jobs buffered for success: {error}");
+        assert_eq!(
+            decide(&refused(&error), None, 1, 3, &policy()),
+            Outcome::Retry {
+                delay: Duration::from_secs(1),
+                error: message.clone()
+            }
+        );
+        assert_eq!(
+            decide(&refused(&error), None, 3, 3, &policy()),
+            Outcome::Failed { error: message }
+        );
+        assert!(matches!(
+            decide(&refused(&error), Some(Command::Stop), 1, 3, &policy()),
+            Outcome::Stopped { .. }
+        ));
+    }
+
+    #[test]
+    fn test_connection_errors_do_not_refuse_children() {
+        for kind in [
+            ErrorKind::ConnectionFailed,
+            ErrorKind::ConnectionTerminated,
+            ErrorKind::PoolTimedOut,
+            ErrorKind::PoolClosed,
+            ErrorKind::TlsFailed,
+            ErrorKind::ProtocolViolation,
+        ] {
+            assert!(!children_refused(&Error::new(kind, String::new())));
+        }
+        for kind in [
+            ErrorKind::Deadlock,
+            ErrorKind::QueryCanceled,
+            ErrorKind::QueryFailed,
+        ] {
+            assert!(children_refused(&Error::new(kind, String::new())));
+        }
+    }
+
+    #[test]
+    fn test_finished_mirrors_every_outcome() {
+        let finished: Vec<Finished> = every_outcome().iter().map(Finished::from).collect();
+        assert_eq!(
+            finished,
+            [
+                Finished::Succeeded,
+                Finished::Retrying {
+                    delay: Duration::from_secs(2),
+                    error: "boom".to_owned()
+                },
+                Finished::Failed {
+                    error: "boom".to_owned()
+                },
+                Finished::Discarded {
+                    error: "gone".to_owned()
+                },
+                Finished::Snoozed {
+                    delay: Duration::from_secs(30)
+                },
+                Finished::Released,
+                Finished::Stopped,
+                Finished::Cancelled,
+            ]
+        );
     }
 
     #[test]

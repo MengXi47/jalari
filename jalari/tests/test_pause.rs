@@ -1,11 +1,13 @@
 mod common;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use common::{Database, RunningWorker, wait_until, worker_config};
 use jalari::admin::{self, PausedQueue};
+use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{EnqueueOptions, Job, JobId, JobResult, JobState, Worker};
 use serde::{Deserialize, Serialize};
 
@@ -16,11 +18,14 @@ const RESUME_WITHIN: Duration = Duration::from_secs(1);
 const WAIT: Duration = Duration::from_secs(15);
 
 static RELEASE: AtomicBool = AtomicBool::new(false);
+static CLOCK: OnceLock<(PgPool, String)> = OnceLock::new();
+static CLAIMED_AT: Mutex<Vec<DateTime<Utc>>> = Mutex::new(Vec::new());
 
 #[derive(Serialize, Deserialize)]
 enum Pausable {
     Quick,
     Hold,
+    Clocked,
 }
 
 #[jalari::job(queue = "pause_default")]
@@ -28,9 +33,22 @@ impl Job for Pausable {
     const NAME: &'static str = "pausable";
 
     async fn run(self) -> JobResult {
-        if let Self::Hold = self {
-            while !RELEASE.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        match self {
+            Self::Quick => {}
+            Self::Hold => {
+                while !RELEASE.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            Self::Clocked => {
+                let (pool, job) = CLOCK.get().unwrap();
+                let locked_at: DateTime<Utc> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT locked_at FROM {job} WHERE id = $1"
+                )))
+                .bind(jalari::current_job().unwrap().id().0)
+                .fetch_one(pool)
+                .await?;
+                CLAIMED_AT.lock().unwrap().push(locked_at);
             }
         }
         Ok(())
@@ -86,6 +104,7 @@ async fn test_pause() {
     check_paused_queue_claims_nothing().await;
     check_running_job_finishes_while_paused().await;
     check_pause_survives_worker_restart().await;
+    check_pause_is_exact(&database).await;
 
     database.finish().await;
 }
@@ -157,4 +176,50 @@ async fn check_pause_survives_worker_restart() {
     assert!(admin::resume_queue(queue).await.unwrap());
     wait_state(job, JobState::Succeeded, RESUME_WITHIN).await;
     second.stop().await;
+}
+
+async fn clock(database: &Database) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+}
+
+async fn check_pause_is_exact(database: &Database) {
+    let queue = "pause_exact";
+    CLOCK
+        .set((database.pool.clone(), database.table("job")))
+        .unwrap();
+    let jobs: Vec<_> = (0..20_000)
+        .map(|_| (Pausable::Clocked, EnqueueOptions::new().queue(queue)))
+        .collect();
+    jalari::enqueue_many(&jobs).await.unwrap();
+    let worker = start_worker(queue, 4, POLL_INTERVAL).await;
+    let mut windows = Vec::new();
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(admin::pause_queue(queue).await.unwrap());
+        let paused = clock(database).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let resumed = clock(database).await;
+        assert!(admin::resume_queue(queue).await.unwrap());
+        windows.push((paused, resumed));
+    }
+    worker.stop().await;
+    let claimed = CLAIMED_AT.lock().unwrap().clone();
+    let inside: Vec<_> = claimed
+        .iter()
+        .filter(|at| {
+            windows
+                .iter()
+                .any(|(paused, resumed)| *at > paused && *at < resumed)
+        })
+        .collect();
+    eprintln!(
+        "pause_exact: {} claims over 10 pauses, {} started inside a pause",
+        claimed.len(),
+        inside.len()
+    );
+    assert!(claimed.len() > 100);
+    assert!(inside.is_empty(), "claims during a pause: {inside:?}");
 }

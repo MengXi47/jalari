@@ -21,10 +21,12 @@ use tracing::{Event, Level, Metadata, Subscriber};
 use common::{Database, RunningWorker, wait_until, worker_config};
 
 const EXPIRED: &str = "the job expired while waiting to run";
+const SNOOZED: &str = "the job asked to run again later";
 const UNKNOWN_TASK: &str = "no live worker knows this task; start a worker that links it";
 const WAIT: Duration = Duration::from_secs(15);
-const QUEUES: [&str; 7] = [
+const QUEUES: [&str; 8] = [
     "expiry",
+    "expiry_snooze",
     "expiry_retry",
     "expiry_failed",
     "expiry_batch",
@@ -97,6 +99,7 @@ enum Plan {
     Succeed,
     SaveThenRetry,
     Fail,
+    Snooze,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,6 +131,7 @@ impl Job for Probe {
                 "{} failed for good",
                 self.label
             )))),
+            Plan::Snooze => jalari::snooze(Duration::from_secs(3600)),
         }
     }
 }
@@ -237,6 +241,7 @@ async fn test_expiry() {
     check_retry_failed_counts_expired().await;
     check_restart_refuses_expired_stopped_job().await;
     check_paused_queue_still_expires().await;
+    check_snoozed_job_expires().await;
 
     worker.stop().await;
     database.finish().await;
@@ -406,4 +411,29 @@ async fn check_paused_queue_still_expires() {
     wait_state(id, JobState::Discarded, Duration::from_secs(2)).await;
     assert_eq!(info(id).await.last_error.as_deref(), Some(EXPIRED));
     assert_eq!(runs("paused"), 0);
+}
+
+async fn check_snoozed_job_expires() {
+    let id = enqueue(
+        "snoozed",
+        Plan::Snooze,
+        EnqueueOptions::new()
+            .queue("expiry_snooze")
+            .expire_after(Duration::from_secs(1)),
+    )
+    .await;
+    wait_state(id, JobState::Scheduled, WAIT).await;
+    assert_eq!(info(id).await.attempts, 0);
+    wait_state(id, JobState::Discarded, Duration::from_secs(3)).await;
+    let row = info(id).await;
+    assert_eq!(row.attempts, 0);
+    assert_eq!(row.last_error.as_deref(), Some(EXPIRED));
+    assert_eq!(
+        history(id).await,
+        [
+            (JobState::Scheduled, 0, Some(SNOOZED.to_owned())),
+            (JobState::Discarded, 0, Some(EXPIRED.to_owned()))
+        ]
+    );
+    assert_eq!(runs("snoozed"), 1);
 }

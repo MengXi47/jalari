@@ -381,10 +381,6 @@ fn wraps(middleware: &dyn ErasedMiddleware, needs: TypeId) -> bool {
     provides.is_unit() || provides.id == needs
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the close calls it from the integration unit")
-)]
 pub(crate) async fn report_finished(
     chain: &[Arc<dyn ErasedMiddleware>],
     meta: Arc<JobMeta>,

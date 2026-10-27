@@ -4,13 +4,14 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Json;
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 use tracing::{info, warn};
 
 use super::close::Closing;
 use super::lifeline::{CLAIM_FENCE, Incarnation, TAKEOVER_GRACE};
 use super::runner::Shared;
 use super::runs::{Hold, PendingClaim};
+use crate::enqueue::{bind_columns, insert_sql};
 use crate::job::Command;
 use crate::job::fingerprint::compatible;
 use crate::storage::{JOB_CHANNEL, interval};
@@ -19,6 +20,7 @@ use crate::{JobState, Result, Schema};
 pub(crate) const INTERRUPTED: &str = "the worker stopped during the last attempt";
 const UNIQUE_VIOLATION: &str = "23505";
 const REAP_BATCH: i64 = 100;
+const CHILDREN_LOCK_TIMEOUT: &str = "2s";
 
 #[derive(sqlx::FromRow)]
 struct ClaimedRow {
@@ -58,7 +60,7 @@ pub(super) struct Claimed {
 }
 
 pub(super) enum Closed {
-    Written,
+    Written { children_inserted: i64 },
     Recommanded(Option<Command>),
     Lost,
 }
@@ -232,11 +234,22 @@ pub(super) async fn close(
     let last_error = outcome.last_error();
     let terminal = outcome.is_terminal();
     let kept = closing.kept();
-    let closed: bool = sqlx::query_scalar(AssertSqlSafe(format!(
+    let children = closing.children();
+    let (insert, returned) = match children {
+        Some(_) => (
+            format!(",\n         {}", insert_sql(schema, 16, Some("closed"))),
+            "(SELECT count(*) FROM enqueue_rows) AS children_inserted,
+             (SELECT count(pg_notify($33, woken.queue))
+                 FROM (SELECT DISTINCT queue FROM enqueue_rows) AS woken) AS woken",
+        ),
+        None => (String::new(), "0::bigint AS children_inserted"),
+    };
+    let sql = format!(
         "WITH closed AS (
              UPDATE {job}
              SET state = $4, attempts = $5,
-                 last_error = CASE WHEN $6 THEN $7 ELSE last_error END,
+                 last_error = CASE WHEN $6 THEN $7 WHEN last_error = $15 THEN NULL
+                     ELSE last_error END,
                  run_at = coalesce(statement_timestamp() + $8, run_at),
                  updated_at = statement_timestamp(), command = NULL,
                  locked_by = NULL, locked_at = NULL, lock_token = NULL, queue_key_slot = NULL
@@ -261,30 +274,57 @@ pub(super) async fn close(
                  progress = CASE WHEN $12 THEN NULL ELSE progress END,
                  updated_at = statement_timestamp()
              WHERE job_id IN (SELECT id FROM closed) AND NOT $14
-         )
-         SELECT EXISTS (SELECT 1 FROM closed)",
+         ){insert}
+         SELECT EXISTS (SELECT 1 FROM closed) AS closed, {returned}",
         job = schema.table("job"),
         job_history = schema.table("job_history"),
         job_control = schema.table("job_control"),
-    )))
-    .bind(hold.job_id)
-    .bind(&*hold.worker_id)
-    .bind(hold.token)
-    .bind(outcome.state().as_str())
-    .bind(closing.attempts())
-    .bind(last_error.is_some())
-    .bind(last_error.flatten())
-    .bind(closing.run_at_delay().map(interval))
-    .bind(closing.seen().map(Command::as_str))
-    .bind(outcome.note())
-    .bind(closing.duration_ms())
-    .bind(terminal)
-    .bind(kept.filter(|_| !terminal))
-    .bind(kept.is_some())
-    .fetch_one(pool)
-    .await?;
-    if closed {
-        return Ok(Closed::Written);
+    );
+    let query = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(hold.job_id)
+        .bind(&*hold.worker_id)
+        .bind(hold.token)
+        .bind(outcome.state().as_str())
+        .bind(closing.attempts())
+        .bind(last_error.is_some())
+        .bind(last_error.flatten())
+        .bind(closing.run_at_delay().map(interval))
+        .bind(closing.seen().map(Command::as_str))
+        .bind(outcome.note())
+        .bind(closing.duration_ms())
+        .bind(terminal)
+        .bind(kept.filter(|_| !terminal))
+        .bind(kept.is_some())
+        .bind((outcome.state() == JobState::Scheduled).then_some(INTERRUPTED));
+    let row = match children {
+        None => query.fetch_one(pool).await?,
+        Some(children) => {
+            let query = bind_columns(query, children).bind(schema.notify_channel(JOB_CHANNEL));
+            let mut transaction = pool.begin().await?;
+            let written = async {
+                sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+                    .bind(CHILDREN_LOCK_TIMEOUT)
+                    .execute(&mut *transaction)
+                    .await?;
+                query.fetch_one(&mut *transaction).await
+            }
+            .await;
+            match written {
+                Ok(row) => {
+                    transaction.commit().await?;
+                    row
+                }
+                Err(e) => {
+                    let _ = transaction.rollback().await;
+                    return Err(e.into());
+                }
+            }
+        }
+    };
+    if row.try_get("closed")? {
+        return Ok(Closed::Written {
+            children_inserted: row.try_get("children_inserted")?,
+        });
     }
     let command: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT command FROM {job} WHERE id = $1 AND locked_by = $2::uuid AND lock_token = $3",

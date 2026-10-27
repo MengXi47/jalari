@@ -7,8 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use jalari::sqlx::postgres::PgPoolOptions;
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
-    CancellationToken, Cron, EnqueueOptions, ErrorKind, ExponentialBackoff, Job, JobError, JobId,
-    JobMeta, JobMiddleware, JobResult, Next, OnConflict, Schema, Worker, WorkerConfig,
+    CancelOutcome, CancellationToken, Cron, EnqueueOptions, ErrorKind, ExponentialBackoff,
+    Finished, Job, JobError, JobId, JobMeta, JobMiddleware, JobResult, Next, OnConflict, Schema,
+    StopOutcome, Worker, WorkerConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -330,6 +331,12 @@ async fn test_context() {
     check_nested_enqueue_inherits_context(&fixture).await;
     check_recurring_keeps_scope_context(&fixture).await;
     check_shutdown_reaches_running_job(&fixture).await;
+    check_finished_runs_after_commit(&fixture).await;
+    check_finished_reports_every_outcome(&fixture).await;
+    check_finished_runs_innermost_first(&fixture).await;
+    check_finished_skips_middleware_that_did_not_wrap(&fixture).await;
+    check_finished_panic_is_contained(&fixture).await;
+    check_finished_not_called_out_of_band(&fixture).await;
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(10), running)
@@ -661,4 +668,411 @@ async fn check_shutdown_reaches_running_job(fixture: &Fixture) {
     assert!(SHUTDOWN_SEEN.load(Ordering::SeqCst));
     assert!(started.elapsed() < Duration::from_secs(5));
     fixture.wait_for_state(id, "succeeded").await;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Report {
+    middleware: &'static str,
+    job: i64,
+    outcome: Finished,
+    row: Option<(String, i64)>,
+}
+
+static REPORTS: LazyLock<Mutex<Vec<Report>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn reports(id: JobId) -> Vec<Report> {
+    REPORTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|report| report.job == id.0)
+        .cloned()
+        .collect()
+}
+
+async fn wait_for_reports(id: JobId, count: usize) -> Vec<Report> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let reports = reports(id);
+        if reports.len() >= count {
+            return reports;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job {id} reported {reports:?}, expected {count}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn outcomes(reports: &[Report]) -> Vec<Finished> {
+    reports
+        .iter()
+        .map(|report| report.outcome.clone())
+        .collect()
+}
+
+struct Recorder {
+    name: &'static str,
+    observe: Option<(PgPool, String)>,
+}
+
+impl Recorder {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            observe: None,
+        }
+    }
+}
+
+impl JobMiddleware for Recorder {
+    type Provides = ();
+
+    async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+        next.run().await
+    }
+
+    async fn finished(&self, job: &JobMeta, outcome: &Finished) {
+        let row = match &self.observe {
+            Some((pool, schema)) => Some(
+                sqlx::query_as(AssertSqlSafe(format!(
+                    "SELECT state, (SELECT count(*) FROM \"{schema}\".job_history
+                         WHERE job_id = $1)
+                     FROM \"{schema}\".job WHERE id = $1"
+                )))
+                .bind(job.id().0)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            ),
+            None => None,
+        };
+        REPORTS.lock().unwrap().push(Report {
+            middleware: self.name,
+            job: job.id().0,
+            outcome: outcome.clone(),
+            row,
+        });
+    }
+}
+
+struct Lens;
+
+struct LensProvider;
+
+impl JobMiddleware for LensProvider {
+    type Provides = Lens;
+
+    async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+        next.provide(Lens).run().await
+    }
+
+    async fn finished(&self, job: &JobMeta, outcome: &Finished) {
+        REPORTS.lock().unwrap().push(Report {
+            middleware: "lens",
+            job: job.id().0,
+            outcome: outcome.clone(),
+            row: None,
+        });
+    }
+}
+
+struct Exploding;
+
+impl JobMiddleware for Exploding {
+    type Provides = ();
+
+    async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+        next.run().await
+    }
+
+    async fn finished(&self, _job: &JobMeta, _outcome: &Finished) {
+        panic!("hook exploded");
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+enum Ending {
+    Succeed,
+    Fail,
+    Snooze,
+    Discard,
+    AwaitInterrupt,
+    Block,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Ends {
+    label: String,
+    ending: Ending,
+}
+
+#[jalari::job(queue = "fin")]
+impl Job for Ends {
+    const NAME: &'static str = "c_ends";
+
+    async fn run(self) -> JobResult {
+        record_event(jalari::current_job().unwrap().id(), "started".to_owned());
+        match self.ending {
+            Ending::Succeed => Ok(()),
+            Ending::Fail => Err(JobError::new("boom".to_owned())),
+            Ending::Snooze => jalari::snooze(Duration::from_secs(3600)),
+            Ending::Discard => Err(JobError::discard(io::Error::other("gone"))),
+            Ending::AwaitInterrupt => Err(jalari::interrupted().await),
+            Ending::Block => {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn ends(label: &str, ending: Ending, options: EnqueueOptions) -> JobId {
+    jalari::enqueue_with(
+        &Ends {
+            label: label.to_owned(),
+            ending,
+        },
+        options,
+    )
+    .await
+    .unwrap()
+    .id()
+}
+
+async fn wait_started(id: JobId) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while events(id).is_empty() {
+        assert!(Instant::now() < deadline, "job {id} never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn steady_retry() -> ExponentialBackoff {
+    ExponentialBackoff {
+        base: Duration::from_millis(200),
+        max: Duration::from_millis(200),
+        jitter: 0.0,
+    }
+}
+
+async fn finished_worker(
+    queue: &str,
+    middlewares: Vec<Box<dyn FnOnce(jalari::WorkerBuilder) -> jalari::WorkerBuilder>>,
+) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let mut builder = Worker::builder()
+        .queue(queue, 4)
+        .config(worker_config())
+        .retry_policy(steady_retry())
+        .scheduler(false);
+    for add in middlewares {
+        builder = add(builder);
+    }
+    let worker = builder.build().await.unwrap();
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(worker.run(shutdown.clone()));
+    (shutdown, handle)
+}
+
+async fn stop_worker(worker: (CancellationToken, tokio::task::JoinHandle<()>)) {
+    worker.0.cancel();
+    tokio::time::timeout(Duration::from_secs(15), worker.1)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+fn with(
+    middleware: impl JobMiddleware,
+) -> Box<dyn FnOnce(jalari::WorkerBuilder) -> jalari::WorkerBuilder> {
+    Box::new(move |builder| builder.middleware(middleware))
+}
+
+async fn check_finished_reports_every_outcome(fixture: &Fixture) {
+    let worker = finished_worker("fin", vec![with(Recorder::new("every"))]).await;
+    let succeeded = ends("succeed", Ending::Succeed, EnqueueOptions::new()).await;
+    let failed = ends("fail", Ending::Fail, EnqueueOptions::new().max_attempts(2)).await;
+    let snoozed = ends("snooze", Ending::Snooze, EnqueueOptions::new()).await;
+    let discarded = ends("discard", Ending::Discard, EnqueueOptions::new()).await;
+    let stopped = ends("stop", Ending::AwaitInterrupt, EnqueueOptions::new()).await;
+    let cancelled = ends("cancel", Ending::AwaitInterrupt, EnqueueOptions::new()).await;
+    wait_started(stopped).await;
+    wait_started(cancelled).await;
+    assert_eq!(jalari::stop(stopped).await.unwrap(), StopOutcome::Requested);
+    assert_eq!(
+        jalari::cancel(cancelled).await.unwrap(),
+        CancelOutcome::Requested
+    );
+    let releasing = finished_worker("fin_release", vec![with(Recorder::new("every"))]).await;
+    let released = ends(
+        "release",
+        Ending::AwaitInterrupt,
+        EnqueueOptions::new().queue("fin_release"),
+    )
+    .await;
+    wait_started(released).await;
+    stop_worker(releasing).await;
+
+    let expected = [
+        (succeeded, vec![Finished::Succeeded]),
+        (
+            failed,
+            vec![
+                Finished::Retrying {
+                    delay: Duration::from_millis(200),
+                    error: "boom".to_owned(),
+                },
+                Finished::Failed {
+                    error: "boom".to_owned(),
+                },
+            ],
+        ),
+        (
+            snoozed,
+            vec![Finished::Snoozed {
+                delay: Duration::from_secs(3600),
+            }],
+        ),
+        (
+            discarded,
+            vec![Finished::Discarded {
+                error: "gone".to_owned(),
+            }],
+        ),
+        (stopped, vec![Finished::Stopped]),
+        (cancelled, vec![Finished::Cancelled]),
+        (released, vec![Finished::Released]),
+    ];
+    for (id, outcome) in expected {
+        let reports = wait_for_reports(id, outcome.len()).await;
+        assert_eq!(outcomes(&reports), outcome, "job {id}");
+    }
+    assert_eq!(fixture.state(released).await.0, "enqueued");
+    for id in [snoozed, released] {
+        assert_eq!(jalari::cancel(id).await.unwrap(), CancelOutcome::Cancelled);
+    }
+    stop_worker(worker).await;
+}
+
+async fn check_finished_runs_after_commit(fixture: &Fixture) {
+    let observer = Recorder {
+        name: "observer",
+        observe: Some((fixture.pool.clone(), fixture.schema_name.clone())),
+    };
+    let worker = finished_worker("fin", vec![with(observer)]).await;
+    let succeeded = ends("observed", Ending::Succeed, EnqueueOptions::new()).await;
+    let retried = ends(
+        "observed_retry",
+        Ending::Fail,
+        EnqueueOptions::new().max_attempts(2),
+    )
+    .await;
+    let reports = wait_for_reports(succeeded, 1).await;
+    assert_eq!(reports[0].row, Some(("succeeded".to_owned(), 1)));
+    let reports = wait_for_reports(retried, 2).await;
+    assert_eq!(reports[0].row, Some(("scheduled".to_owned(), 1)));
+    assert_eq!(reports[1].row, Some(("failed".to_owned(), 2)));
+    stop_worker(worker).await;
+}
+
+async fn check_finished_runs_innermost_first(_fixture: &Fixture) {
+    let worker = finished_worker(
+        "fin",
+        vec![with(Recorder::new("outer")), with(Recorder::new("inner"))],
+    )
+    .await;
+    let id = ends("ordered", Ending::Succeed, EnqueueOptions::new()).await;
+    let reports = wait_for_reports(id, 2).await;
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.middleware)
+            .collect::<Vec<_>>(),
+        ["inner", "outer"]
+    );
+    stop_worker(worker).await;
+}
+
+async fn check_finished_skips_middleware_that_did_not_wrap(_fixture: &Fixture) {
+    let worker = finished_worker(
+        "fin",
+        vec![with(LensProvider), with(Recorder::new("wrapping"))],
+    )
+    .await;
+    let id = ends("skipped", Ending::Succeed, EnqueueOptions::new()).await;
+    wait_for_reports(id, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        reports(id)
+            .iter()
+            .map(|report| report.middleware)
+            .collect::<Vec<_>>(),
+        ["wrapping"]
+    );
+    stop_worker(worker).await;
+}
+
+async fn check_finished_panic_is_contained(fixture: &Fixture) {
+    let worker = finished_worker(
+        "fin",
+        vec![with(Recorder::new("survivor")), with(Exploding)],
+    )
+    .await;
+    let first = ends("exploded", Ending::Succeed, EnqueueOptions::new()).await;
+    let reports = wait_for_reports(first, 1).await;
+    assert_eq!(reports[0].middleware, "survivor");
+    let second = ends("after_explosion", Ending::Succeed, EnqueueOptions::new()).await;
+    wait_for_reports(second, 1).await;
+    fixture.wait_for_state(second, "succeeded").await;
+    stop_worker(worker).await;
+}
+
+async fn check_finished_not_called_out_of_band(fixture: &Fixture) {
+    let crashed = finished_worker("fin_crash", vec![with(Recorder::new("band"))]).await;
+    let reaped = ends(
+        "reaped",
+        Ending::Block,
+        EnqueueOptions::new().queue("fin_crash"),
+    )
+    .await;
+    wait_started(reaped).await;
+    crashed.1.abort();
+    let _ = crashed.1.await;
+    assert_eq!(jalari::stop(reaped).await.unwrap(), StopOutcome::Requested);
+    let rescuer = finished_worker("fin_crash", vec![with(Recorder::new("band"))]).await;
+    let worker = finished_worker("fin", vec![with(Recorder::new("band"))]).await;
+    let waiting = ends(
+        "waiting",
+        Ending::Succeed,
+        EnqueueOptions::new().delay(Duration::from_secs(3600)),
+    )
+    .await;
+    assert_eq!(
+        jalari::cancel(waiting).await.unwrap(),
+        CancelOutcome::Cancelled
+    );
+    let expired = ends(
+        "expired",
+        Ending::Succeed,
+        EnqueueOptions::new()
+            .delay(Duration::from_secs(3600))
+            .expire_after(Duration::from_millis(500)),
+    )
+    .await;
+    fixture.wait_for_state(expired, "discarded").await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fixture.state(reaped).await.0 != "stopped" {
+        assert!(
+            Instant::now() < deadline,
+            "the reaper never settled {reaped}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for id in [reaped, waiting, expired] {
+        assert_eq!(reports(id), [], "job {id}");
+    }
+    stop_worker(worker).await;
+    stop_worker(rescuer).await;
 }

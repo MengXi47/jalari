@@ -5,6 +5,7 @@ mod options;
 mod request;
 
 pub use api::{enqueue, enqueue_in, enqueue_with};
+pub(crate) use batch::{Columns, bind_columns, insert_sql};
 pub use batch::{enqueue_many, enqueue_many_in};
 pub use on_success::{enqueue_on_success, enqueue_on_success_with};
 pub use options::{EnqueueOptions, EnqueueOutcome, OnConflict};
