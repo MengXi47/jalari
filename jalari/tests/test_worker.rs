@@ -147,7 +147,7 @@ impl Job for Blocking {
     async fn run(self) -> JobResult {
         if record_execution("blocking") == 1 {
             BLOCKING_STARTED.store(true, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             BLOCKING_FINISHED.store(true, Ordering::SeqCst);
         }
         Ok(())
@@ -166,7 +166,7 @@ impl Job for Keyed {
     async fn run(self) -> JobResult {
         let _running = KeyedRun::enter();
         if record_execution(&self.label) == 1 && self.label == "keyed_first" {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
         Ok(())
     }
@@ -182,7 +182,7 @@ impl Job for Interrupted {
 
     async fn run(self) -> JobResult {
         record_execution("interrupted");
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
         Ok(())
     }
 }
