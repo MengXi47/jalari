@@ -19,6 +19,7 @@ pub(crate) enum Outcome {
     Succeeded,
     Retry { delay: Duration, error: String },
     Failed { error: String },
+    Discarded { error: String },
     Snoozed { delay: Duration },
     Released { note: String },
     Stopped { note: String },
@@ -38,6 +39,7 @@ impl Outcome {
             Self::Succeeded => JobState::Succeeded,
             Self::Retry { .. } => JobState::Scheduled,
             Self::Failed { .. } => JobState::Failed,
+            Self::Discarded { .. } => JobState::Discarded,
             Self::Snoozed { .. } => JobState::Scheduled,
             Self::Released { .. } => JobState::Enqueued,
             Self::Stopped { .. } => JobState::Stopped,
@@ -47,7 +49,10 @@ impl Outcome {
 
     pub(super) fn is_terminal(&self) -> bool {
         match self {
-            Self::Succeeded | Self::Failed { .. } | Self::Cancelled { .. } => true,
+            Self::Succeeded
+            | Self::Failed { .. }
+            | Self::Discarded { .. }
+            | Self::Cancelled { .. } => true,
             Self::Retry { .. }
             | Self::Snoozed { .. }
             | Self::Released { .. }
@@ -58,7 +63,9 @@ impl Outcome {
     pub(super) fn last_error(&self) -> Option<Option<&str>> {
         match self {
             Self::Succeeded => Some(None),
-            Self::Retry { error, .. } | Self::Failed { error } => Some(Some(error)),
+            Self::Retry { error, .. } | Self::Failed { error } | Self::Discarded { error } => {
+                Some(Some(error))
+            }
             Self::Snoozed { .. }
             | Self::Released { .. }
             | Self::Stopped { .. }
@@ -69,7 +76,9 @@ impl Outcome {
     pub(super) fn note(&self) -> Option<&str> {
         match self {
             Self::Succeeded => None,
-            Self::Retry { error, .. } | Self::Failed { error } => Some(error),
+            Self::Retry { error, .. } | Self::Failed { error } | Self::Discarded { error } => {
+                Some(error)
+            }
             Self::Snoozed { .. } => Some(SNOOZED),
             Self::Released { note } | Self::Stopped { note } | Self::Cancelled { note } => {
                 Some(note)
@@ -113,6 +122,11 @@ pub(super) fn decide(
             delay: delay.min(LONGEST_DELAY),
         };
     }
+    if error.is_discarded() {
+        return Outcome::Discarded {
+            error: error.msg().to_owned(),
+        };
+    }
     match retry_policy.next_retry(attempt, max_attempts, error) {
         Some(delay) => Outcome::Retry {
             delay: error.retry_delay().unwrap_or(delay).min(LONGEST_DELAY),
@@ -144,7 +158,9 @@ impl Closing {
         let (attempts, run_at_delay) = match &outcome {
             Outcome::Retry { delay, .. } => (attempt, Some(*delay)),
             Outcome::Snoozed { delay } => (attempt - 1, Some(*delay)),
-            Outcome::Succeeded | Outcome::Failed { .. } => (attempt, None),
+            Outcome::Succeeded | Outcome::Failed { .. } | Outcome::Discarded { .. } => {
+                (attempt, None)
+            }
             Outcome::Released { .. } | Outcome::Stopped { .. } | Outcome::Cancelled { .. } => {
                 (attempt - 1, Some(Duration::ZERO))
             }
@@ -191,6 +207,7 @@ impl Closing {
                 warn!(error = %error, ?delay, "job failed, retrying");
             }
             Outcome::Failed { error } => warn!(error = %error, "job failed"),
+            Outcome::Discarded { error } => info!(job_id, error = %error, "job discarded"),
             Outcome::Snoozed { delay } => info!(job_id, ?delay, "job snoozed"),
             Outcome::Released { note } => info!(job_id, note = %note, "job released"),
             Outcome::Stopped { note } => info!(job_id, note = %note, "job stopped"),
@@ -266,6 +283,7 @@ mod tests {
                 },
                 Ending::NotStarted,
                 Ending::Returned(snooze(Duration::from_secs(30))),
+                Ending::Returned(Err(JobError::discard(std::fmt::Error))),
             ]
         };
         for ending in endings() {
@@ -420,6 +438,24 @@ mod tests {
             Closing::after_run(3, outcome, None, Duration::ZERO, None).attempts,
             2
         );
+    }
+
+    #[test]
+    fn test_discard_ends_the_job_with_attempts_left() {
+        let ending = Ending::Returned(Err(JobError::discard(std::io::Error::other("gone"))));
+        let outcome = decide(&ending, None, 1, 10, &policy());
+        assert_eq!(
+            outcome,
+            Outcome::Discarded {
+                error: "gone".to_owned()
+            }
+        );
+        assert_eq!(outcome.state(), JobState::Discarded);
+        assert!(outcome.is_terminal());
+        assert_eq!(outcome.last_error(), Some(Some("gone")));
+        let closing = Closing::after_run(1, outcome, None, Duration::ZERO, None);
+        assert_eq!(closing.attempts, 1);
+        assert_eq!(closing.run_at_delay, None);
     }
 
     #[test]

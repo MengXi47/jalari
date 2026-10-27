@@ -29,7 +29,8 @@ pub enum JobState {
     Succeeded,
     /// Gave up after its last attempt or a permanent error.
     Failed,
-    /// Gave up on purpose, without retrying; never runs again.
+    /// Gave up on purpose, without retrying; never runs again. See
+    /// [`JobError::discard`](crate::JobError::discard).
     Discarded,
     /// Held by [`stop`](crate::stop) until [`restart`](crate::restart).
     Stopped,

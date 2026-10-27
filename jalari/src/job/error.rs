@@ -9,7 +9,8 @@ pub(crate) const SNOOZED: &str = "the job asked to run again later";
 /// Failure of one attempt of [`Job::run`](crate::Job::run).
 ///
 /// Any `std::error::Error` converts into a retryable `JobError`, so `?` works inside `run`. Use
-/// [`JobError::permanent`] for failures that retrying cannot fix, such as invalid input.
+/// [`JobError::permanent`] for failures that retrying cannot fix, such as invalid input, and
+/// [`JobError::discard`] when the job no longer needs to run at all.
 ///
 /// # Examples
 ///
@@ -21,6 +22,10 @@ pub(crate) const SNOOZED: &str = "the job asked to run again later";
 ///
 /// let permanent = jalari::JobError::permanent(io::Error::from(io::ErrorKind::InvalidInput));
 /// assert!(permanent.is_permanent());
+///
+/// let discarded = jalari::JobError::discard(io::Error::other("order cancelled"));
+/// assert!(discarded.is_discarded());
+/// assert!(!discarded.is_permanent());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobError {
@@ -32,6 +37,7 @@ pub struct JobError {
 enum Disposition {
     Retry { delay: Option<Duration> },
     Permanent,
+    Discard,
     Snooze { delay: Duration },
     Halt(Halt),
 }
@@ -53,6 +59,42 @@ impl JobError {
         }
     }
 
+    /// Creates an error that ends the job as [`Discarded`](crate::JobState::Discarded), without
+    /// further retries.
+    ///
+    /// The attempt counts and `last_error` keeps the message. Unlike
+    /// [`permanent`](Self::permanent), the job is not `failed`: [`retry`](crate::admin::retry)
+    /// and [`retry_failed`](crate::admin::retry_failed) leave it alone, and housekeeping
+    /// removes it after
+    /// [`deleted_retention`](crate::ClusterConfig::deleted_retention). A pending
+    /// [`stop`](crate::stop) or [`cancel`](crate::cancel) still wins.
+    ///
+    /// `JobError` itself is not a `std::error::Error`, so middleware that turns a `JobError`
+    /// into a discard wraps its text, for example in `io::Error::other(error.to_string())`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::io;
+    ///
+    /// use jalari::{JobError, JobResult};
+    ///
+    /// fn ship(order_cancelled: bool) -> JobResult {
+    ///     if order_cancelled {
+    ///         return Err(JobError::discard(io::Error::other("order cancelled before shipping")));
+    ///     }
+    ///     Ok(())
+    /// }
+    ///
+    /// assert!(ship(true).unwrap_err().is_discarded());
+    /// ```
+    pub fn discard<E: std::error::Error>(e: E) -> Self {
+        Self {
+            msg: e.to_string(),
+            disposition: Disposition::Discard,
+        }
+    }
+
     pub(crate) fn halted(halt: Halt) -> Self {
         Self {
             msg: halt.message().to_owned(),
@@ -63,7 +105,10 @@ impl JobError {
     pub(crate) fn halt(&self) -> Option<Halt> {
         match self.disposition {
             Disposition::Halt(halt) => Some(halt),
-            Disposition::Retry { .. } | Disposition::Permanent | Disposition::Snooze { .. } => None,
+            Disposition::Retry { .. }
+            | Disposition::Permanent
+            | Disposition::Discard
+            | Disposition::Snooze { .. } => None,
         }
     }
 
@@ -105,7 +150,10 @@ impl JobError {
     pub fn retry_delay(&self) -> Option<Duration> {
         match self.disposition {
             Disposition::Retry { delay } => delay,
-            Disposition::Permanent | Disposition::Snooze { .. } | Disposition::Halt(_) => None,
+            Disposition::Permanent
+            | Disposition::Discard
+            | Disposition::Snooze { .. }
+            | Disposition::Halt(_) => None,
         }
     }
 
@@ -113,13 +161,21 @@ impl JobError {
     pub fn snoozed_for(&self) -> Option<Duration> {
         match self.disposition {
             Disposition::Snooze { delay } => Some(delay),
-            Disposition::Retry { .. } | Disposition::Permanent | Disposition::Halt(_) => None,
+            Disposition::Retry { .. }
+            | Disposition::Permanent
+            | Disposition::Discard
+            | Disposition::Halt(_) => None,
         }
     }
 
     /// The message stored in `last_error` and in the job history.
     pub fn msg(&self) -> &str {
         &self.msg
+    }
+
+    /// Whether the error ends the job as discarded.
+    pub fn is_discarded(&self) -> bool {
+        matches!(self.disposition, Disposition::Discard)
     }
 
     /// Whether retrying is pointless.
@@ -215,6 +271,12 @@ mod tests {
             snooze(delay).unwrap_err().retry_after(delay).retry_delay(),
             None
         );
+        assert_eq!(
+            JobError::discard(std::fmt::Error)
+                .retry_after(delay)
+                .retry_delay(),
+            None
+        );
     }
 
     #[test]
@@ -225,9 +287,18 @@ mod tests {
         assert!(!snoozed.is_interruption());
         assert_eq!(snoozed.halt(), None);
         assert_eq!(snoozed.msg(), "snoozed for 30s");
+        assert!(!snoozed.is_discarded());
+
+        let discarded = JobError::discard(std::fmt::Error);
+        assert!(discarded.is_discarded());
+        assert!(!discarded.is_permanent());
+        assert!(!discarded.is_interruption());
+        assert_eq!(discarded.snoozed_for(), None);
+        assert_eq!(discarded.halt(), None);
 
         let permanent = JobError::permanent(std::fmt::Error);
         assert_eq!(permanent.snoozed_for(), None);
+        assert!(!permanent.is_discarded());
         assert!(!permanent.is_interruption());
 
         let halted = JobError::halted(Halt::Shutdown);

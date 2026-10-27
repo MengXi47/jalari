@@ -5,12 +5,12 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Database, RunningWorker, fast_retry, wait_until, worker_config};
-use jalari::admin::{RetryOutcome, RunNowOutcome};
+use jalari::admin::{JobFilter, RetryOutcome, RunNowOutcome};
 use jalari::recurring::{self, Cron};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{
     EnqueueOptions, EnqueueOutcome, ExponentialBackoff, Job, JobError, JobId, JobMeta,
-    JobMiddleware, JobResult, Next, RetryPolicy, Worker,
+    JobMiddleware, JobResult, JobState, Next, RetryPolicy, Worker,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,7 @@ enum Step {
     Snooze(u64),
     SaveThenSnooze(u64),
     Busy,
+    Discard,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +86,10 @@ async fn perform(scripted: Scripted) -> JobResult {
             jalari::snooze(Duration::from_millis(millis))
         }
         Step::Busy => Err(JobError::new("busy".to_owned())),
+        Step::Discard => {
+            checkpoint.save(&7).await?;
+            Err(JobError::discard(std::io::Error::other("gone")))
+        }
     };
     if let Some(run) = RUNS
         .lock()
@@ -250,8 +255,12 @@ async fn test_outcomes() {
         check_snooze_keeps_the_job_key(&database),
         check_run_now_wakes_a_snoozed_job(&database),
         check_middleware_turns_an_error_into_a_snooze(&database),
+        check_discard_ends_the_job_without_retrying(&database),
+        check_retry_leaves_discarded_jobs_alone(&database),
+        check_stats_and_throughput_count_snoozes_and_discards_apart(&database),
     );
     check_snoozed_recurring_run_holds_its_schedule(&database).await;
+    check_housekeeping_removes_discarded_jobs_after_deleted_retention(&database).await;
 
     database.finish().await;
 }
@@ -576,5 +585,184 @@ async fn check_snoozed_recurring_run_holds_its_schedule(database: &Database) {
     }
     assert_eq!(runs("recurring").len(), 1);
     recurring::remove("outcomes_ticker").await.unwrap();
+    worker.stop().await;
+}
+
+async fn check_discard_ends_the_job_without_retrying(database: &Database) {
+    let queue = "outcomes_discard";
+    let worker = spawn(queue, fast_retry()).await;
+    let options = || EnqueueOptions::new().job_key("outcomes_discard");
+    let id = enqueue(&scripted("discard", &[Step::Discard]), queue, options()).await;
+
+    wait_for_state(database, id, "discarded").await;
+    let job = row(database, id).await;
+    assert_eq!(job.attempts, 1);
+    assert_eq!(job.last_error.as_deref(), Some("gone"));
+    assert_eq!(
+        history(database, id).await,
+        vec![("discarded".to_owned(), 1, Some("gone".to_owned()), true)]
+    );
+    let progress: Option<Option<serde_json::Value>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT progress FROM {} WHERE job_id = $1",
+        database.table("job_control")
+    )))
+    .bind(id.0)
+    .fetch_optional(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(progress.flatten(), None);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(runs("discard").len(), 1);
+
+    let again = jalari::enqueue_with(
+        &scripted("discard_again", &[Step::Succeed]),
+        options().queue(queue),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(again, EnqueueOutcome::Inserted(new) if new != id));
+    worker.stop().await;
+}
+
+async fn check_retry_leaves_discarded_jobs_alone(database: &Database) {
+    let queue = "outcomes_discard_retry";
+    let worker = spawn(queue, fast_retry()).await;
+    let id = enqueue(
+        &scripted("discard_retry", &[Step::Discard]),
+        queue,
+        EnqueueOptions::new(),
+    )
+    .await;
+    wait_for_state(database, id, "discarded").await;
+
+    assert_eq!(
+        jalari::admin::retry(id).await.unwrap(),
+        RetryOutcome::NotFailed
+    );
+    let summary = jalari::admin::retry_failed(&JobFilter::new().queue(queue))
+        .await
+        .unwrap();
+    assert_eq!(summary.retried, 0);
+    assert_eq!(row(database, id).await.state, "discarded");
+    worker.stop().await;
+}
+
+async fn check_stats_and_throughput_count_snoozes_and_discards_apart(database: &Database) {
+    let queue = "outcomes_counts";
+    let worker = spawn(queue, fast_retry()).await;
+    let jobs = [
+        (
+            scripted("count_retry", &[Step::Fail, Step::Succeed]),
+            None,
+            "succeeded",
+        ),
+        (
+            scripted("count_snooze", &[Step::Snooze(50), Step::Succeed]),
+            None,
+            "succeeded",
+        ),
+        (
+            scripted("count_discard", &[Step::Discard]),
+            None,
+            "discarded",
+        ),
+        (scripted("count_fail", &[Step::Fail]), Some(1), "failed"),
+    ];
+    let mut ids = Vec::new();
+    for (job, max_attempts, end) in &jobs {
+        let options = match max_attempts {
+            Some(max_attempts) => EnqueueOptions::new().max_attempts(*max_attempts),
+            None => EnqueueOptions::new(),
+        };
+        ids.push((enqueue(job, queue, options).await, *end));
+    }
+    for (id, end) in ids {
+        wait_for_state(database, id, end).await;
+    }
+
+    let counts = jalari::admin::throughput(Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|throughput| throughput.queue == queue)
+        .unwrap();
+    assert_eq!(
+        (
+            counts.succeeded,
+            counts.retried,
+            counts.snoozed,
+            counts.discarded,
+            counts.failed
+        ),
+        (2, 1, 1, 1, 1)
+    );
+    let discarded: Vec<i64> = jalari::admin::stats()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|count| count.queue == queue && count.state == JobState::Discarded)
+        .map(|count| count.count)
+        .collect();
+    assert_eq!(discarded, [1]);
+    worker.stop().await;
+}
+
+async fn check_housekeeping_removes_discarded_jobs_after_deleted_retention(database: &Database) {
+    let queue = "outcomes_housekeeping";
+    let worker = spawn(queue, fast_retry()).await;
+    let discarded = enqueue(
+        &scripted("housekeeping_discard", &[Step::Discard]),
+        queue,
+        EnqueueOptions::new(),
+    )
+    .await;
+    let failed = enqueue(
+        &scripted("housekeeping_fail", &[Step::Fail]),
+        queue,
+        EnqueueOptions::new().max_attempts(1),
+    )
+    .await;
+    wait_for_state(database, discarded, "discarded").await;
+    wait_for_state(database, failed, "failed").await;
+    worker.stop().await;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET updated_at = now() - interval '1 hour' WHERE id IN ($1, $2)",
+        database.table("job")
+    )))
+    .bind(discarded.0)
+    .bind(failed.0)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    jalari::cluster::update(|cluster| {
+        cluster.housekeeping_enabled = true;
+        cluster.housekeeping_interval = Duration::from_secs(1);
+        cluster.deleted_retention = Duration::from_secs(1);
+        cluster.failed_retention = Some(Duration::from_secs(86_400));
+    })
+    .await
+    .unwrap();
+    let worker = spawn(queue, fast_retry()).await;
+    let exists = |id: JobId| async move {
+        sqlx::query_scalar::<_, bool>(AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {} WHERE id = $1)",
+            database.table("job")
+        )))
+        .bind(id.0)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+    };
+    wait_until(
+        "housekeeping to remove the discarded job",
+        SETTLE,
+        || async move { !exists(discarded).await },
+    )
+    .await;
+    assert!(exists(failed).await, "the failed job is kept for a day");
+    jalari::cluster::update(|cluster| cluster.housekeeping_enabled = false)
+        .await
+        .unwrap();
     worker.stop().await;
 }
