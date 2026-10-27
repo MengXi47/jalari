@@ -439,7 +439,7 @@ async fn stored_progress(database: &Database, job_id: i64) -> Option<Mark> {
 async fn holder(database: &Database, job_key: &str) -> Option<(i64, String)> {
     sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, state FROM {} WHERE job_key = $1
-             AND state IN ('scheduled', 'enqueued', 'stopped')",
+             AND state IN ('scheduled', 'enqueued', 'running', 'stopped')",
         database.table("job")
     )))
     .bind(job_key)
@@ -799,6 +799,13 @@ async fn check_replace_delay(database: &Database) -> Vec<String> {
         false,
     )
     .await;
+    let reaper = spawn_worker(
+        &[(IDLE_QUEUE, 1)],
+        STOP_TIMEOUT,
+        Duration::from_secs(5),
+        false,
+    )
+    .await;
     let job_key = "stop_race_delay";
     let sleeper = Probe {
         body: Body::Sleeper { millis: 60_000 },
@@ -821,22 +828,16 @@ async fn check_replace_delay(database: &Database) -> Vec<String> {
     )
     .await;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while database
-        .terminate_job_sessions(1, Duration::from_millis(200))
-        .await
-        == 0
-    {
-        assert!(
-            Instant::now() < deadline,
-            "{label}: no running job session to kill"
-        );
+    while database.terminate_running_lifelines().await == 0 {
+        assert!(Instant::now() < deadline, "{label}: no lifeline to kill");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let killed = Instant::now();
     chaos(killed, killed);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    worker.crash().await;
     let mut replaced = None;
-    for _ in 0..20 {
+    for _ in 0..150 {
         replaced = enqueue_probe(
             "replace",
             &Probe {
@@ -860,7 +861,7 @@ async fn check_replace_delay(database: &Database) -> Vec<String> {
         failures.push(format!(
             "{label}: Replace of the crashed job never reported Replaced (last {replaced:?})"
         ));
-        worker.stop().await;
+        reaper.stop().await;
         return failures;
     }
     let row: (String, Option<String>, f64) = sqlx::query_as(AssertSqlSafe(format!(
@@ -906,7 +907,7 @@ async fn check_replace_delay(database: &Database) -> Vec<String> {
     .await
     .unwrap();
     cancel_until_settled(id, Duration::from_secs(15)).await;
-    worker.stop().await;
+    reaper.stop().await;
     failures
 }
 
@@ -918,15 +919,8 @@ async fn crash_running(database: &Database, label: &str, id: i64) -> Instant {
     )
     .await;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while database
-        .terminate_job_sessions(1, Duration::from_millis(200))
-        .await
-        == 0
-    {
-        assert!(
-            Instant::now() < deadline,
-            "{label}: no running job session to kill"
-        );
+    while database.terminate_running_lifelines().await == 0 {
+        assert!(Instant::now() < deadline, "{label}: no lifeline to kill");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let killed = Instant::now();
@@ -1172,7 +1166,8 @@ async fn check_recurring(database: &Database) -> Vec<String> {
         .filter(|at| **at > stopped)
         .count();
     let held: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT count(*) FROM {} WHERE job_key = $1 AND state IN ('scheduled', 'enqueued', 'stopped')",
+        "SELECT count(*) FROM {} WHERE job_key = $1
+             AND state IN ('scheduled', 'enqueued', 'running', 'stopped')",
         database.table("job")
     )))
     .bind(&job_key)
@@ -1387,10 +1382,7 @@ async fn unleash(
         if roll < 55 {
             let at = Instant::now();
             let killed = database
-                .terminate_job_sessions(
-                    usize::try_from(1 + rng.below(2)).unwrap(),
-                    Duration::from_millis(300),
-                )
+                .terminate_lifelines(usize::try_from(1 + rng.below(2)).unwrap())
                 .await;
             if killed > 0 {
                 kills += killed;
@@ -1572,7 +1564,7 @@ async fn check_storm(database: &Database, seed: u64) -> Vec<String> {
     loop {
         let waiting: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT count(*) FROM {} WHERE id = ANY($1)
-                 AND state IN ('scheduled', 'enqueued', 'stopped')",
+                 AND state IN ('scheduled', 'enqueued', 'running', 'stopped')",
             database.table("job")
         )))
         .bind(&ids)
@@ -1586,7 +1578,8 @@ async fn check_storm(database: &Database, seed: u64) -> Vec<String> {
             let rows: Vec<StuckRow> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT job.id, job.state, job.attempts, job.last_error, control.command
                      FROM {job} AS job LEFT JOIN {control} AS control ON control.job_id = job.id
-                     WHERE job.id = ANY($1) AND job.state IN ('scheduled', 'enqueued', 'stopped')",
+                     WHERE job.id = ANY($1)
+                         AND job.state IN ('scheduled', 'enqueued', 'running', 'stopped')",
                 job = database.table("job"),
                 control = database.table("job_control"),
             )))
@@ -2102,9 +2095,19 @@ async fn check_housekeeping(label: &str, database: &Database, ids: &[i64]) -> Ve
             break;
         }
         if Instant::now() >= deadline {
+            let left: Vec<(i64, String, Option<String>, Option<String>)> =
+                sqlx::query_as(AssertSqlSafe(format!(
+                    "SELECT id, state, last_error, locked_by::text FROM {} WHERE id = ANY($1)
+                     ORDER BY id LIMIT 5",
+                    database.table("job"),
+                )))
+                .bind(ids)
+                .fetch_all(&database.pool)
+                .await
+                .unwrap();
             failures.push(format!(
                 "{label}: 20 s of housekeeping left {jobs} finished jobs and {orphans} job_control \
-                 rows without a job"
+                 rows without a job: {left:?}"
             ));
             break;
         }

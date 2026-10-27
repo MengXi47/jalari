@@ -504,31 +504,35 @@ async fn check_replace_discards_saved_progress(database: &Database) {
 
 async fn check_flush_from_a_run_taken_over_by_replace_does_not_land(database: &Database) {
     let worker = spawn("progress_zombie", 1, LONG).await;
+    let rescuer = spawn("progress_rescuer", 1, LONG).await;
     let options = || EnqueueOptions::new().job_key("progress-zombie");
     let id = count("zombie", Counting::Forever, "progress_zombie", options()).await;
     wait_for_resume("zombie", 1).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(
-        database
-            .terminate_job_sessions(1, Duration::from_millis(200))
-            .await,
-        1
-    );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let replaced = jalari::enqueue_with(
-        &Counter {
-            label: "zombie_replacement".to_owned(),
-            counting: Counting::ReportsOnly,
-        },
-        options()
-            .queue("progress_zombie")
-            .on_conflict(OnConflict::Replace)
-            .delay(Duration::from_secs(12)),
-    )
-    .await
-    .unwrap();
+    assert_eq!(database.terminate_running_lifelines().await, 1);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    worker.crash().await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let replaced = loop {
+        let outcome = jalari::enqueue_with(
+            &Counter {
+                label: "zombie_replacement".to_owned(),
+                counting: Counting::ReportsOnly,
+            },
+            options()
+                .queue("progress_zombie")
+                .on_conflict(OnConflict::Replace)
+                .delay(Duration::from_secs(12)),
+        )
+        .await
+        .unwrap();
+        if outcome != EnqueueOutcome::Running(id) || Instant::now() > deadline {
+            break outcome;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(replaced, EnqueueOutcome::Replaced(id));
+    let worker = spawn("progress_zombie", 1, LONG).await;
     wait_until(
         "the replacement to run",
         Duration::from_secs(30),
@@ -545,6 +549,7 @@ async fn check_flush_from_a_run_taken_over_by_replace_does_not_land(database: &D
         "the interrupted run kept saving"
     );
     worker.stop().await;
+    rescuer.stop().await;
 }
 
 async fn check_stop_on_waiting_job_keeps_it_from_running_until_restart(database: &Database) {

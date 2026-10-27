@@ -6,7 +6,6 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::execute::{INTERRUPTED, TAKEOVER_DELAY};
 use super::runner::{ERROR_BACKOFF, Shared, wait};
 use crate::{JobState, Result};
 
@@ -64,9 +63,6 @@ impl Shared {
                                  WHEN 'succeeded' THEN config.succeeded_retention
                                  WHEN 'failed' THEN config.failed_retention
                                  ELSE config.deleted_retention END
-                             AND (job.state <> 'failed' OR job.queue_key IS NULL
-                                 OR job.last_error IS DISTINCT FROM $2
-                                 OR job.updated_at < now() - $3)
                          LIMIT $1
                          FOR UPDATE OF job SKIP LOCKED
                      )",
@@ -74,8 +70,6 @@ impl Shared {
                     finished = JobState::finished_sql(),
                 )))
                 .bind(BATCH_SIZE)
-                .bind(INTERRUPTED)
-                .bind(TAKEOVER_DELAY)
                 .execute(&pool)
                 .await?
                 .rows_affected();

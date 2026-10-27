@@ -24,6 +24,7 @@ const LINK_ENV: &str = "JALARI_RACE_CHILD_LINK";
 const STEP: Duration = Duration::from_millis(100);
 const POLL: Duration = Duration::from_millis(200);
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
+const SESSION_POLL_SLACK: f64 = 0.2;
 
 struct Probe {
     pool: PgPool,
@@ -259,7 +260,6 @@ impl Link {
 
 struct ChildWorker {
     name: String,
-    application: String,
     process: Child,
 }
 
@@ -288,7 +288,6 @@ impl ChildWorker {
             .stderr(Stdio::inherit());
         Self {
             name: name.to_owned(),
-            application: format!("{}_{name}", database.schema_name),
             process: command.spawn().unwrap(),
         }
     }
@@ -656,36 +655,39 @@ async fn db_now(pool: &PgPool) -> f64 {
         .unwrap()
 }
 
-async fn job_transaction(pool: &PgPool, application: &str) -> Option<(i32, String)> {
-    sqlx::query_as(
-        "SELECT pid, xact_start::text FROM pg_stat_activity
-         WHERE application_name = $1 AND xact_start IS NOT NULL
-         ORDER BY xact_start
+async fn lifeline_session(database: &Database, child: &ChildWorker) -> Option<(i32, String)> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT activity.pid, activity.backend_start::text
+         FROM pg_stat_activity AS activity
+         JOIN {} AS worker ON activity.application_name = 'jalari lifeline ' || worker.id::text
+         WHERE worker.pid = $1
+         ORDER BY worker.started_at DESC
          LIMIT 1",
-    )
-    .bind(application)
-    .fetch_optional(pool)
+        database.table("worker")
+    )))
+    .bind(child.pid())
+    .fetch_optional(&database.pool)
     .await
     .unwrap()
 }
 
-fn watch_transaction(
+fn watch_session(
     pool: PgPool,
-    transaction: Option<(i32, String)>,
+    session: Option<(i32, String)>,
     limit: Duration,
 ) -> JoinHandle<Option<f64>> {
     tokio::spawn(async move {
-        let (pid, xact_start) = transaction?;
+        let (pid, backend_start) = session?;
         let deadline = Instant::now() + limit;
         while Instant::now() < deadline {
             let ended: Option<f64> = sqlx::query_scalar(
                 "SELECT extract(epoch FROM clock_timestamp())::float8
                  WHERE NOT EXISTS (
-                     SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND xact_start::text = $2
+                     SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND backend_start::text = $2
                  )",
             )
             .bind(pid)
-            .bind(&xact_start)
+            .bind(&backend_start)
             .fetch_optional(&pool)
             .await
             .unwrap();
@@ -1259,22 +1261,22 @@ async fn freeze_wave(
     rescuer.wait_ready().await;
     tokio::time::sleep(rng.millis(200, 900)).await;
 
-    let mut transactions = Vec::new();
+    let mut sessions = Vec::new();
     for child in &children {
-        transactions.push(job_transaction(&database.pool, &child.application).await);
+        sessions.push(lifeline_session(database, child).await);
     }
     let mut stopped = Vec::new();
     for child in &children {
         child.signal("STOP");
         stopped.push((Instant::now(), db_now(&database.pool).await));
     }
-    let watchers: Vec<JoinHandle<Option<f64>>> = transactions
+    let watchers: Vec<JoinHandle<Option<f64>>> = sessions
         .into_iter()
         .zip(lengths)
-        .map(|(transaction, seconds)| {
-            watch_transaction(
+        .map(|(session, seconds)| {
+            watch_session(
                 database.pool.clone(),
-                transaction,
+                session,
                 Duration::from_secs(seconds + 25),
             )
         })
@@ -1296,9 +1298,9 @@ async fn freeze_wave(
             "{label}: wave {wave} jobs were still waiting 40 s after the last resume"
         ));
     }
-    let mut transaction_ends = Vec::new();
+    let mut lifeline_ends = Vec::new();
     for watcher in watchers {
-        transaction_ends.push(watcher.await.unwrap());
+        lifeline_ends.push(watcher.await.unwrap());
     }
     for child in children {
         child.kill(database).await;
@@ -1344,11 +1346,11 @@ async fn freeze_wave(
             )
         };
         eprintln!(
-            "{trial_label}: job transaction ended {}, takeover started {}{}, resumed {}, \
+            "{trial_label}: lifeline ended {}, takeover started {}{}, resumed {}, \
              old run last worked {} and stopped {}, old run work after takeover {late_effects}, \
              old run alive after takeover {}, sibling started {}, job body finished {finishes} \
              times, {} overlapping runs, {} runs started before another stopped",
-            relative(transaction_ends[trial]),
+            relative(lifeline_ends[trial]),
             relative(takeover.map(|run| run.started)),
             takeover.map_or_else(String::new, |run| format!(" on {}", run.child)),
             relative(Some(resumed[trial])),
@@ -1369,8 +1371,8 @@ async fn freeze_wave(
             failures.extend(audit.alive_overlaps);
             if let Some(takeover) = takeover {
                 failures.push(format!(
-                    "{trial_label}: a {seconds} s freeze is shorter than the 10 s idle session \
-                     timeout (docs/guide.md:332), yet the job was taken over: {}",
+                    "{trial_label}: a {seconds} s freeze is shorter than the 10 s freeze \
+                     tolerance of the lifeline, yet the job was taken over: {}",
                     takeover.describe(base)
                 ));
             }
@@ -1416,21 +1418,13 @@ async fn check_partitions(database: &Database, seed: u64) -> Vec<String> {
     rescuer.wait_ready().await;
     tokio::time::sleep(rng.millis(200, 900)).await;
 
-    let cut_transaction = job_transaction(&database.pool, &cut_child.application).await;
-    let heal_transaction = job_transaction(&database.pool, &heal_child.application).await;
+    let cut_session = lifeline_session(database, &cut_child).await;
+    let heal_session = lifeline_session(database, &heal_child).await;
     cut.set_blocked(true);
     heal.set_blocked(true);
     let partitioned = db_now(&database.pool).await;
-    let cut_watch = watch_transaction(
-        database.pool.clone(),
-        cut_transaction,
-        Duration::from_secs(40),
-    );
-    let heal_watch = watch_transaction(
-        database.pool.clone(),
-        heal_transaction,
-        Duration::from_secs(40),
-    );
+    let cut_watch = watch_session(database.pool.clone(), cut_session, Duration::from_secs(40));
+    let heal_watch = watch_session(database.pool.clone(), heal_session, Duration::from_secs(40));
     tokio::time::sleep(Duration::from_secs(5)).await;
     heal.set_blocked(false);
     let healed = db_now(&database.pool).await;
@@ -1483,7 +1477,7 @@ async fn check_partitions(database: &Database, seed: u64) -> Vec<String> {
             )
         };
         eprintln!(
-            "{case}: old run last worked {} and stopped {}, job transaction ended {}, \
+            "{case}: old run last worked {} and stopped {}, lifeline ended {}, \
              takeover started {}{}, sibling started {}",
             relative(old.map(|run| run.last_effect)),
             relative(old.and_then(|run| run.ended)),
@@ -1519,29 +1513,29 @@ async fn check_partitions(database: &Database, seed: u64) -> Vec<String> {
         if permanent {
             match ended {
                 Some(ended) if (8.0..=12.5).contains(&(ended - partitioned)) => {
-                    let earliest = ended + 5.5;
-                    if takeover.started < earliest || takeover.started - partitioned > 20.0 {
+                    let earliest = ended - SESSION_POLL_SLACK;
+                    if takeover.started < earliest || takeover.started - partitioned > 15.0 {
                         failures.push(format!(
-                            "{case}: takeover should come 6 s after PostgreSQL ends the session, \
-                             about 16 s after the failure (docs/guide.md:333), but the session \
+                            "{case}: takeover should come right after PostgreSQL ends the \
+                             silent lifeline, 10 to 13 s after the failure, but the lifeline \
                              ended {:+.2} s and {}",
                             ended - partitioned,
                             takeover.describe(partitioned)
                         ));
                     }
                     if let Some(run) = sibling_run
-                        && run.started < earliest
+                        && (run.started < earliest || run.started - partitioned < 6.0)
                     {
                         failures.push(format!(
-                            "{case}: a job sharing the queue_key started before the 6 s takeover \
-                             wait (docs/guide.md:325): {}",
+                            "{case}: a job sharing the queue_key started before the partitioned \
+                             run was taken over: {}",
                             run.describe(partitioned)
                         ));
                     }
                 }
                 _ => failures.push(format!(
-                    "{case}: PostgreSQL should end the frozen session about 10 s after the last \
-                     check (docs/guide.md:332), but it ended {}",
+                    "{case}: PostgreSQL should end the silent lifeline about 11 s after its last \
+                     heartbeat, but it ended {}",
                     relative(ended)
                 )),
             }

@@ -10,7 +10,7 @@ use crate::job::JOB_KEY_STATES;
 use crate::job::fingerprint;
 use crate::job::registry::registrations;
 use crate::storage::JOB_CHANNEL;
-use crate::worker::{INTERRUPTED, TAKEOVER_DELAY};
+use crate::worker::INTERRUPTED;
 use crate::{Error, ErrorKind, JobId, JobState, Result, Schema};
 
 const BATCH_SIZE: i64 = 100;
@@ -46,9 +46,8 @@ pub struct RetrySummary {
 pub enum RunNowOutcome {
     /// The job is due now; a worker runs it as soon as it can.
     Enqueued,
-    /// A worker holds the job, or its last run was interrupted less than 6 seconds ago. Another
-    /// call holding the row for an instant, such as [`stop`](crate::stop) or a `Replace`, also
-    /// answers this; call again.
+    /// A worker is running the job, or a worker aborted its last run at shutdown less than
+    /// a few seconds ago and the aborted run may still be stopping.
     Running,
     /// The job is stopped, succeeded, failed, discarded or deleted; [`restart`](crate::restart) a
     /// stopped job and [`retry`] a failed one instead.
@@ -63,10 +62,10 @@ pub enum RunNowOutcome {
 /// again. `last_error` stays until an attempt succeeds, the change is recorded in the job's
 /// history, and workers of its queue are notified. A job whose `job_key` is held by another
 /// waiting, running or stopped job stays failed, because two such jobs cannot share a key. A
-/// job that failed because its last attempt was interrupted waits out the 6 seconds after the
-/// interruption first, like any interrupted job, so the lost run has stopped before the new
-/// one starts. When the calling process links the job's task with a fingerprint, the job gets
-/// that fingerprint, so it runs on the caller's build; otherwise it keeps the one it has.
+/// job a worker aborted at shutdown on its last attempt waits out the few seconds the aborted
+/// run needs to stop, so it never overlaps the new one. When the calling process links the
+/// job's task with a fingerprint, the job gets that fingerprint, so it runs on the caller's
+/// build; otherwise it keeps the one it has.
 ///
 /// # Errors
 ///
@@ -92,7 +91,7 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
     let schema = &config.schema;
     let mut transaction = config.pool.pool().begin().await?;
     let locked: Option<(String, String)> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT state, queue FROM {job} WHERE id = $1 FOR UPDATE",
+        "SELECT state, queue FROM {job} WHERE id = $1 FOR NO KEY UPDATE",
         job = schema.table("job"),
     )))
     .bind(id.0)
@@ -160,7 +159,7 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
         let mut transaction = pool.begin().await?;
         let locked: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT id, queue FROM {job} WHERE id = ANY($1) AND state = 'failed'
-             ORDER BY id FOR UPDATE SKIP LOCKED",
+             ORDER BY id FOR NO KEY UPDATE SKIP LOCKED",
             job = schema.table("job"),
         )))
         .bind(&ids)
@@ -211,9 +210,10 @@ pub async fn run_now(id: JobId) -> Result<RunNowOutcome> {
     let mut transaction = config.pool.pool().begin().await?;
     let queue: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
         "WITH idle AS (
-             SELECT id FROM {job} AS job
-             WHERE id = $1 AND {idle}
-             FOR UPDATE SKIP LOCKED
+             SELECT id FROM {job}
+             WHERE id = $1 AND state IN ('scheduled', 'enqueued')
+                 AND (last_error IS DISTINCT FROM $2 OR run_at <= statement_timestamp())
+             FOR NO KEY UPDATE
          ),
          moved AS (
              UPDATE {job} AS job
@@ -229,11 +229,9 @@ pub async fn run_now(id: JobId) -> Result<RunNowOutcome> {
          SELECT queue FROM moved",
         job = schema.table("job"),
         job_history = schema.table("job_history"),
-        idle = schema.idle_job("job", "$2", "$3"),
     )))
     .bind(id.0)
     .bind(INTERRUPTED)
-    .bind(TAKEOVER_DELAY)
     .fetch_optional(&mut *transaction)
     .await?;
     let outcome = match queue {
@@ -251,7 +249,7 @@ pub async fn run_now(id: JobId) -> Result<RunNowOutcome> {
             .await?;
             match state.as_deref() {
                 None => RunNowOutcome::NotFound,
-                Some("scheduled" | "enqueued") => RunNowOutcome::Running,
+                Some("scheduled" | "enqueued" | "running") => RunNowOutcome::Running,
                 Some(_) => RunNowOutcome::NotWaiting,
             }
         }
@@ -295,7 +293,7 @@ pub async fn clear_fingerprint(filter: &JobFilter) -> Result<u64> {
              WHERE {FILTER_SQL}
                  AND fingerprint IS NOT NULL
                  AND state IN ('scheduled', 'enqueued', 'stopped')
-             FOR UPDATE SKIP LOCKED
+             FOR NO KEY UPDATE SKIP LOCKED
          )
          RETURNING queue",
         job = schema.table("job"),
@@ -337,13 +335,11 @@ async fn try_retry(
     let retried = sqlx::query(AssertSqlSafe(format!(
         "WITH retried AS (
              UPDATE {job}
-             SET state = CASE WHEN last_error = $2 AND updated_at + $3 > statement_timestamp()
-                     THEN 'scheduled' ELSE 'enqueued' END,
+             SET state = CASE WHEN run_at > statement_timestamp() THEN 'scheduled'
+                     ELSE 'enqueued' END,
                  attempts = 0,
-                 fingerprint = COALESCE($4::jsonb ->> task, fingerprint),
-                 run_at = CASE WHEN last_error = $2
-                     THEN greatest(statement_timestamp(), updated_at + $3)
-                     ELSE statement_timestamp() END,
+                 fingerprint = COALESCE($2::jsonb ->> task, fingerprint),
+                 run_at = greatest(run_at, statement_timestamp()),
                  updated_at = statement_timestamp()
              WHERE id = $1 AND state = 'failed'
              RETURNING id, state
@@ -354,8 +350,6 @@ async fn try_retry(
         job_history = schema.table("job_history"),
     )))
     .bind(id.0)
-    .bind(INTERRUPTED)
-    .bind(TAKEOVER_DELAY)
     .bind(Json(served))
     .execute(&mut *attempt)
     .await;

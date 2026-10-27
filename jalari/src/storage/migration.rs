@@ -7,6 +7,8 @@ include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 /// Table structure version this release of jalari needs; [`init`](crate::init) checks it.
 pub const SCHEMA_VERSION: i32 = TEMPLATES[TEMPLATES.len() - 1].0;
 
+const LOCK_MODEL_VERSION: i32 = 8;
+
 const TABLES: [&str; 7] = [
     "job",
     "job_history",
@@ -127,7 +129,8 @@ pub async fn migrate_to(pool: &PgPool, schema: &Schema, version: i32) -> Result<
         if migration.version > current && migration.version <= version {
             sqlx::raw_sql(AssertSqlSafe(migration.sql))
                 .execute(&mut *transaction)
-                .await?;
+                .await
+                .map_err(|e| explain(migration.version, e))?;
         }
     }
 
@@ -158,6 +161,22 @@ async fn current_version(connection: &mut PgConnection, schema: &Schema) -> Resu
         .fetch_optional(&mut *connection)
         .await?;
     Ok(version)
+}
+
+fn explain(version: i32, e: sqlx::Error) -> Error {
+    let error = Error::from(e);
+    if version == LOCK_MODEL_VERSION && error.kind == ErrorKind::LockTimeout {
+        return Error::new(
+            ErrorKind::LockTimeout,
+            format!(
+                "{}; a jalari 0.6 worker is still running a job, stop every 0.6 process, \
+                 workers and enqueuers alike, before upgrading to schema version \
+                 {LOCK_MODEL_VERSION}",
+                error.msg
+            ),
+        );
+    }
+    error
 }
 
 fn render(template: &str, version: i32, schema: &Schema) -> String {

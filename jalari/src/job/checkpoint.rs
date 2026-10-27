@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::run::current_job;
@@ -95,7 +96,9 @@ pub(crate) struct RunControl {
     lease: i64,
     saved: Option<Value>,
     shutdown: CancellationToken,
+    lost: CancellationToken,
     command: AtomicU8,
+    commanded: Notify,
     slot: Mutex<Slot>,
 }
 
@@ -105,13 +108,16 @@ impl RunControl {
         lease: i64,
         saved: Option<Value>,
         shutdown: CancellationToken,
+        lost: CancellationToken,
     ) -> Self {
         Self {
             job_id,
             lease,
             saved,
             shutdown,
+            lost,
             command: AtomicU8::new(0),
+            commanded: Notify::new(),
             slot: Mutex::new(Slot::default()),
         }
     }
@@ -128,12 +134,26 @@ impl RunControl {
         &self.shutdown
     }
 
+    pub(crate) fn lost(&self) -> &CancellationToken {
+        &self.lost
+    }
+
     pub(crate) fn request(&self, command: Command) {
-        self.command.fetch_max(command.code(), Ordering::SeqCst);
+        if self.command.fetch_max(command.code(), Ordering::SeqCst) < command.code() {
+            self.commanded.notify_one();
+        }
+    }
+
+    pub(crate) async fn commanded(&self) {
+        self.commanded.notified().await;
+    }
+
+    pub(crate) fn command(&self) -> Option<Command> {
+        Command::from_code(self.command.load(Ordering::SeqCst))
     }
 
     fn halt(&self) -> Option<Halt> {
-        match Command::from_code(self.command.load(Ordering::SeqCst)) {
+        match self.command() {
             Some(command) => Some(Halt::Command(command)),
             None => self.shutdown.is_cancelled().then_some(Halt::Shutdown),
         }

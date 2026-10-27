@@ -341,7 +341,8 @@ impl Reader {
 
     async fn waiting(&self, queue: &str) -> i64 {
         sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT count(*) FROM {} WHERE queue = $1 AND state IN ('scheduled', 'enqueued')",
+            "SELECT count(*) FROM {} WHERE queue = $1
+             AND state IN ('scheduled', 'enqueued', 'running')",
             self.job
         )))
         .bind(queue)
@@ -746,7 +747,7 @@ async fn watch_job_keys(pool: PgPool, job: String, done: Arc<AtomicBool>) -> (us
     while !done.load(Ordering::SeqCst) {
         let duplicates: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT job_key, count(*) FROM {job}
-             WHERE job_key IS NOT NULL AND state IN ('scheduled', 'enqueued', 'stopped')
+             WHERE job_key IS NOT NULL AND state IN ('scheduled', 'enqueued', 'running', 'stopped')
              GROUP BY job_key HAVING count(*) > 1"
         )))
         .fetch_all(&pool)
@@ -916,7 +917,7 @@ async fn check_retry_vs_replace_and_enqueue(database: &Database, seed: u64) -> V
         sqlx::query_as(AssertSqlSafe(format!(
             "SELECT id, state, attempts, job_key FROM {} WHERE queue = $1
                  AND ((state = 'failed' AND attempts = 0)
-                     OR state IN ('scheduled', 'enqueued', 'stopped'))",
+                     OR state IN ('scheduled', 'enqueued', 'running', 'stopped'))",
             database.table("job")
         )))
         .bind(KEY_QUEUE)
@@ -1259,9 +1260,7 @@ async fn check_run_now_vs_workers(database: &Database, seed: u64) -> Vec<String>
     let mut kills = 0;
     while Instant::now() < until {
         tokio::time::sleep(rng.millis(300, 900)).await;
-        kills += database
-            .terminate_job_sessions(1, Duration::from_millis(200))
-            .await;
+        kills += database.terminate_lifelines(1).await;
     }
     for hammer in hammers {
         hammer.await.unwrap();
@@ -1510,7 +1509,7 @@ async fn inspect_running(
                 continue;
             }
         };
-        if !matches!(detail.job.state, JobState::Scheduled | JobState::Enqueued) {
+        if detail.job.state != JobState::Running {
             failures.push(format!(
                 "{label}: admin::job({id}) reported {} while run {} was running",
                 detail.job.state, run.tag
@@ -1804,7 +1803,7 @@ async fn check_retry_failed_vs_housekeeping(database: &Database, seed: u64) -> V
     let impossible: Vec<(i64, String, i32, i32)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, state, attempts, max_attempts FROM {}
          WHERE (state = 'failed' AND attempts = 0)
-             OR (state IN ('scheduled', 'enqueued') AND attempts > max_attempts)",
+             OR (state IN ('scheduled', 'enqueued', 'running') AND attempts > max_attempts)",
         database.table("job")
     )))
     .fetch_all(&database.pool)

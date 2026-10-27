@@ -14,7 +14,7 @@ const MAX_PAGE: u32 = 1000;
 
 pub(crate) const JOB_COLUMNS: &str = "id, queue, task, state, codec, payload, job_key, queue_key, \
      priority, attempts, max_attempts, run_at, timeout_ms, last_error, context, fingerprint, \
-     created_at, updated_at";
+     locked_by::text AS worker_id, locked_at AS running_since, created_at, updated_at";
 
 pub(crate) const FILTER_SQL: &str = "($1::text[] IS NULL OR state = ANY($1))
     AND ($2::text IS NULL OR queue = $2)
@@ -162,7 +162,7 @@ pub struct JobInfo {
     pub attempts: i32,
     /// Attempts allowed.
     pub max_attempts: i32,
-    /// When the job may run; while running, a short lease ahead of now.
+    /// When the job became or becomes due; a worker taking the job does not change it.
     pub run_at: DateTime<Utc>,
     /// Per-attempt time limit, if any.
     pub timeout: Option<Duration>,
@@ -177,6 +177,11 @@ pub struct JobInfo {
     /// [`clear_fingerprint`](super::clear_fingerprint). Any worker that runs the task takes
     /// such a job.
     pub fingerprint: Option<String>,
+    /// Id of the worker running the job, as listed by [`workers`](super::workers); `None`
+    /// unless the job is [`Running`](JobState::Running).
+    pub worker_id: Option<String>,
+    /// When the current attempt started; `None` unless the job is running.
+    pub running_since: Option<DateTime<Utc>>,
     /// When the job was enqueued.
     pub created_at: DateTime<Utc>,
     /// When the state last changed.
@@ -224,6 +229,8 @@ pub(crate) struct JobRow {
     last_error: Option<String>,
     context: Option<Value>,
     fingerprint: Option<String>,
+    worker_id: Option<String>,
+    running_since: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -249,6 +256,8 @@ impl JobRow {
             last_error: self.last_error,
             context: self.context,
             fingerprint: self.fingerprint,
+            worker_id: self.worker_id,
+            running_since: self.running_since,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

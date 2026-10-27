@@ -3,11 +3,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use sqlx::Connection;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::flusher::RunBook;
 use super::middleware::ErasedMiddleware;
 use super::runner::{DeclaredCron, QueueConfig, Shared, Worker};
+use super::runs::RunBook;
 use crate::init::{Config, config};
 use crate::job::fingerprint;
 use crate::job::registry::{JobRegistration, registrations};
@@ -15,7 +16,7 @@ use crate::{
     Cron, Error, ErrorKind, ExponentialBackoff, JobMiddleware, Result, RetryPolicy, WorkerConfig,
 };
 
-const FIXED_CONNECTIONS: usize = 2;
+const MIN_CONNECTIONS: u32 = 2;
 
 /// Configuration for a [`Worker`], created by [`Worker::builder`].
 #[must_use]
@@ -59,7 +60,9 @@ impl WorkerBuilder {
 
     /// Processes jobs from `name`, running up to `concurrency` of them at once.
     ///
-    /// Call it once per queue. Each running job holds one pooled connection for its whole run.
+    /// Call it once per queue. A running job holds no connection: workers use the pool only for
+    /// the short statements that claim and finish jobs, so `concurrency` is independent of the
+    /// pool size.
     pub fn queue(mut self, name: &str, concurrency: usize) -> Self {
         self.queues.push(QueueConfig {
             name: name.to_owned(),
@@ -81,6 +84,9 @@ impl WorkerBuilder {
     }
 
     /// Validates the configuration and creates the worker.
+    ///
+    /// The worker also opens one session outside the pool, its lifeline, which must be a direct
+    /// or session-pooled connection to PostgreSQL.
     ///
     /// The worker runs every `#[jalari::job]` linked into the binary and skips jobs whose name
     /// it does not know, leaving them to other workers. It also skips jobs whose
@@ -107,7 +113,7 @@ impl WorkerBuilder {
     ///   ([`InvalidCronExpression`](ErrorKind::InvalidCronExpression),
     ///   [`UnknownTimezone`](ErrorKind::UnknownTimezone))
     /// - [`init`](crate::init) has not completed ([`NotInitialized`](ErrorKind::NotInitialized))
-    /// - The pool's `max_connections` is below the total concurrency plus two
+    /// - The pool's `max_connections` is below 2
     ///   ([`InsufficientConnections`](ErrorKind::InsufficientConnections))
     /// - The pool does not keep a session across statements, as behind a transaction pooler
     ///   ([`NoSessionConnection`](ErrorKind::NoSessionConnection))
@@ -118,7 +124,7 @@ impl WorkerBuilder {
         let provided = collect_providers(&self.middlewares)?;
         let jobs = select_jobs(jobs, &provided, &self.queues)?;
         let config = config()?;
-        check_connections(config, &self.queues)?;
+        check_connections(config)?;
         check_session(config).await?;
         check_middlewares(&self.middlewares).await?;
         let task_names = jobs.keys().map(|name| (*name).to_owned()).collect();
@@ -135,6 +141,7 @@ impl WorkerBuilder {
                 middlewares: self.middlewares.into(),
                 job_shutdown: CancellationToken::new(),
                 runs: RunBook::default(),
+                flush_now: Notify::new(),
             }),
             queues: self.queues,
             scheduler: self.scheduler,
@@ -305,18 +312,15 @@ fn parse_crons(
     Ok(crons)
 }
 
-fn check_connections(config: &Config, queues: &[QueueConfig]) -> Result<()> {
-    let concurrency: usize = queues.iter().map(|queue| queue.concurrency).sum();
-    let needed = concurrency.saturating_add(FIXED_CONNECTIONS);
+fn check_connections(config: &Config) -> Result<()> {
     let max_connections = config.pool.pool().options().get_max_connections();
-    let available = usize::try_from(max_connections).unwrap_or(usize::MAX);
-    if available < needed {
+    if max_connections < MIN_CONNECTIONS {
         return Err(Error::new(
             ErrorKind::InsufficientConnections,
             format!(
-                "pool max_connections is {available} but the worker needs {needed}: \
-                 {concurrency} for running jobs, 1 for the listener and 1 for the \
-                 scheduler and housekeeping"
+                "pool max_connections is {max_connections} but a worker needs \
+                 {MIN_CONNECTIONS}: 1 for the notification listener and 1 for claiming and \
+                 finishing jobs"
             ),
         ));
     }

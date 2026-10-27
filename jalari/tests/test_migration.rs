@@ -226,6 +226,112 @@ async fn test_version_8_adds_the_lock_columns_and_constraints() {
     drop_schema(&pool, &name).await;
 }
 
+async fn insert_legacy_job(pool: &PgPool, name: &str, attempts: i32, max_attempts: i32) -> i64 {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "INSERT INTO \"{name}\".job (task, payload, state, attempts, max_attempts, updated_at)
+         VALUES ('legacy', '\\x00', 'enqueued', $1, $2, now() - interval '1 minute')
+         RETURNING id"
+    )))
+    .bind(attempts)
+    .bind(max_attempts)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn legacy_shape(pool: &PgPool, name: &str, id: i64) -> (String, i32, Vec<(String, i32)>) {
+    let (state, attempts): (String, i32) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT state, attempts FROM \"{name}\".job WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let history: Vec<(String, i32)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT state, attempt FROM \"{name}\".job_history
+         WHERE job_id = $1 AND error = 'the worker stopped during the last attempt'
+         ORDER BY id"
+    )))
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (state, attempts, history)
+}
+
+#[tokio::test]
+async fn test_version_8_records_attempts_a_0_6_worker_left_unfinished() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    jalari::migrate_to(&pool, &schema, 7).await.unwrap();
+    let retryable = insert_legacy_job(&pool, &name, 1, 3).await;
+    let exhausted = insert_legacy_job(&pool, &name, 3, 3).await;
+    let finished = insert_legacy_job(&pool, &name, 1, 3).await;
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO \"{name}\".job_history (job_id, state, attempt, error)
+         VALUES ($1, 'enqueued', 1, 'retried after a failure')"
+    )))
+    .bind(finished)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    jalari::migrate(&pool, &schema).await.unwrap();
+    assert_eq!(
+        legacy_shape(&pool, &name, retryable).await,
+        ("scheduled".to_owned(), 1, vec![("scheduled".to_owned(), 1)])
+    );
+    assert_eq!(
+        legacy_shape(&pool, &name, exhausted).await,
+        ("failed".to_owned(), 3, vec![("failed".to_owned(), 3)])
+    );
+    assert_eq!(
+        legacy_shape(&pool, &name, finished).await,
+        ("enqueued".to_owned(), 1, vec![])
+    );
+
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
+async fn test_version_8_refuses_to_run_while_a_0_6_job_runs() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    jalari::migrate_to(&pool, &schema, 7).await.unwrap();
+    let running = insert_legacy_job(&pool, &name, 1, 3).await;
+    let mut old_worker = pool.begin().await.unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "SELECT id FROM \"{name}\".job WHERE id = $1 FOR UPDATE"
+    )))
+    .bind(running)
+    .execute(&mut *old_worker)
+    .await
+    .unwrap();
+
+    let err = jalari::migrate(&pool, &schema).await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::LockTimeout);
+    assert!(err.msg.contains("0.6"), "{}", err.msg);
+    assert_eq!(
+        jalari::schema_version(&pool, &schema).await.unwrap(),
+        Some(7)
+    );
+
+    old_worker.rollback().await.unwrap();
+    jalari::migrate(&pool, &schema).await.unwrap();
+    assert_eq!(
+        legacy_shape(&pool, &name, running).await,
+        ("scheduled".to_owned(), 1, vec![("scheduled".to_owned(), 1)])
+    );
+
+    drop_schema(&pool, &name).await;
+}
+
 #[tokio::test]
 async fn test_migrate_is_idempotent() {
     let Some(pool) = test_pool().await else {

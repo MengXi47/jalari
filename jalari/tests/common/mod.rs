@@ -188,27 +188,6 @@ impl Database {
         .unwrap()
     }
 
-    pub async fn terminate_job_sessions(&self, at_most: usize, older_than: Duration) -> usize {
-        let terminated: Vec<bool> = sqlx::query_scalar(
-            "SELECT pg_terminate_backend(pid) FROM (
-                 SELECT pid FROM pg_stat_activity
-                 WHERE datname = current_database()
-                     AND application_name = $1
-                     AND state = 'idle in transaction'
-                     AND state_change < now() - make_interval(secs => $2)
-                 ORDER BY random()
-                 LIMIT $3
-             ) AS victims",
-        )
-        .bind(&self.schema_name)
-        .bind(older_than.as_secs_f64())
-        .bind(i64::try_from(at_most).unwrap())
-        .fetch_all(&self.pool)
-        .await
-        .unwrap();
-        terminated.into_iter().filter(|ok| *ok).count()
-    }
-
     pub async fn lifelines(&self) -> Vec<(i32, String)> {
         sqlx::query_as(AssertSqlSafe(format!(
             "SELECT activity.pid, worker.id::text
@@ -237,6 +216,21 @@ impl Database {
             self.table("worker")
         )))
         .bind(i64::try_from(at_most).unwrap())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        terminated.into_iter().filter(|ok| *ok).count()
+    }
+
+    pub async fn terminate_running_lifelines(&self) -> usize {
+        let terminated: Vec<bool> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT pg_terminate_backend(activity.pid)
+             FROM pg_stat_activity AS activity
+             JOIN (SELECT DISTINCT locked_by FROM {} WHERE state = 'running') AS owner
+                 ON activity.application_name = 'jalari lifeline ' || owner.locked_by::text
+             WHERE activity.datname = current_database()",
+            self.table("job")
+        )))
         .fetch_all(&self.pool)
         .await
         .unwrap();

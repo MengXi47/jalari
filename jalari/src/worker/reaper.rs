@@ -6,50 +6,72 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::lifeline::Current;
+use super::ownership::{Target, interrupt, reaped_full_batch};
 use super::runner::Shared;
 use crate::Result;
 use crate::admin::{StrandedJobs, stranded_in};
 use crate::storage::interval;
 
-const ROSTER_SWEEP: Duration = Duration::from_secs(60);
+const REAP_INTERVAL: Duration = Duration::from_secs(1);
+const ORPHAN_SWEEP: Duration = Duration::from_secs(60);
 const STRANDED_CHECK: Duration = Duration::from_secs(300);
 const ROSTER_FLOOR: Duration = Duration::from_secs(12);
 
 pub(super) async fn reap(
     shared: Arc<Shared>,
     queues: Vec<String>,
-    mut current: Current,
+    current: Current,
     shutdown: CancellationToken,
 ) {
-    tokio::select! {
-        () = shutdown.cancelled() => return,
-        registered = current.wait_for(Option::is_some) => {
-            if registered.is_err() {
-                return;
-            }
-        }
-    }
-    let mut swept_at: Option<Instant> = None;
+    let mut swept_at = Instant::now();
     let mut checked_at: Option<Instant> = None;
+    let mut forgotten = false;
     while !shutdown.is_cancelled() {
-        if swept_at.is_none_or(|at| at.elapsed() >= ROSTER_SWEEP) {
-            swept_at = Some(Instant::now());
-            if let Err(e) = shared.forget_departed().await {
-                warn!(error = %e, "failed to remove departed workers from the worker list");
+        let sweep_orphans = swept_at.elapsed() >= ORPHAN_SWEEP;
+        if sweep_orphans {
+            swept_at = Instant::now();
+        }
+        if let Err(e) = shared.reap_until_clean(sweep_orphans).await {
+            warn!(error = %e, "failed to take over the jobs of dead workers");
+        }
+        if !forgotten || sweep_orphans {
+            match shared.forget_departed().await {
+                Ok(_) => forgotten = true,
+                Err(e) => {
+                    warn!(error = %e, "failed to remove departed workers from the worker list")
+                }
             }
         }
-        if checked_at.is_none_or(|at| at.elapsed() >= STRANDED_CHECK) {
+        if current.borrow().is_some() && checked_at.is_none_or(|at| at.elapsed() >= STRANDED_CHECK)
+        {
             checked_at = Some(Instant::now());
             shared.warn_stranded(&queues).await;
         }
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = tokio::time::sleep(ROSTER_SWEEP.min(STRANDED_CHECK)) => {}
+            () = tokio::time::sleep(REAP_INTERVAL) => {}
         }
     }
 }
 
 impl Shared {
+    pub(super) async fn reap_until_clean(&self, sweep_orphans: bool) -> Result<usize> {
+        let pool = self.config.pool.pool();
+        let mut reaped = 0;
+        loop {
+            let interrupted = interrupt(
+                &pool,
+                &self.config.schema,
+                Target::DeadOwners { sweep_orphans },
+            )
+            .await?;
+            reaped += interrupted.len();
+            if !reaped_full_batch(&interrupted) {
+                return Ok(reaped);
+            }
+        }
+    }
+
     async fn forget_departed(&self) -> Result<u64> {
         let schema = &self.config.schema;
         let removed = sqlx::query(AssertSqlSafe(format!(

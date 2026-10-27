@@ -178,7 +178,7 @@ async fn test_admin() {
     check_retry(&fixture).await;
     check_retry_failed_in_batches(&fixture).await;
     check_run_now(&fixture).await;
-    check_retry_waits_out_an_interruption(&fixture).await;
+    check_retry_of_an_interrupted_job(&fixture).await;
     check_throughput(&fixture).await;
 
     shutdown.cancel();
@@ -410,7 +410,9 @@ async fn check_detail_follows_a_job(fixture: &Fixture) {
     }
     assert_eq!(jalari::stop(held).await.unwrap(), StopOutcome::Requested);
     let detail = admin::job(held).await.unwrap().unwrap();
-    assert_eq!(detail.job.state, JobState::Enqueued);
+    assert_eq!(detail.job.state, JobState::Running);
+    assert!(detail.job.worker_id.is_some());
+    assert!(detail.job.running_since.is_some());
     assert_eq!(detail.control.unwrap().pending, Some(Command::Stop));
     assert_eq!(admin::run_now(held).await.unwrap(), RunNowOutcome::Running);
     GATE_OPEN.store(true, Ordering::SeqCst);
@@ -604,7 +606,7 @@ async fn check_run_now(fixture: &Fixture) {
     jalari::cancel(stopped).await.unwrap();
 }
 
-async fn check_retry_waits_out_an_interruption(fixture: &Fixture) {
+async fn check_retry_of_an_interrupted_job(fixture: &Fixture) {
     FRAGILE_OPEN.store(false, Ordering::SeqCst);
     let id = jalari::enqueue(&Fragile).await.unwrap().id();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -613,18 +615,19 @@ async fn check_retry_waits_out_an_interruption(fixture: &Fixture) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let terminated: Vec<bool> = sqlx::query_scalar(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-         WHERE datname = current_database()
-             AND state = 'idle in transaction'
-             AND state_change < now() - interval '200 milliseconds'
-             AND application_name = $1",
-    )
-    .bind(&fixture.schema_name)
+    let terminated: Vec<bool> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT pg_terminate_backend(activity.pid)
+             FROM pg_stat_activity AS activity
+             JOIN {job} AS job
+                 ON activity.application_name = 'jalari lifeline ' || job.locked_by::text
+             WHERE job.state = 'running'",
+        job = fixture.table("job"),
+    )))
     .fetch_all(&fixture.pool)
     .await
     .unwrap();
     assert_eq!(terminated, [true]);
+    tokio::time::sleep(Duration::from_secs(3)).await;
     FRAGILE_OPEN.store(true, Ordering::SeqCst);
     fixture.wait_for_state(id, "failed").await;
     let failed = admin::job(id).await.unwrap().unwrap();
@@ -633,26 +636,21 @@ async fn check_retry_waits_out_an_interruption(fixture: &Fixture) {
         Some("the worker stopped during the last attempt")
     );
 
-    let retried_at = Instant::now();
     assert_eq!(admin::retry(id).await.unwrap(), RetryOutcome::Retried);
     let waiting = admin::job(id).await.unwrap().unwrap();
-    assert_eq!(waiting.job.state, JobState::Scheduled);
-    assert_eq!(waiting.job.attempts, 0);
-    let fence = waiting.job.run_at - failed.job.updated_at;
-    assert!(
-        fence >= TimeDelta::seconds(5) && fence <= TimeDelta::seconds(7),
-        "{fence}"
-    );
+    assert!(matches!(
+        waiting.job.state,
+        JobState::Enqueued | JobState::Running | JobState::Succeeded
+    ));
     assert_eq!(
         waiting
             .history
-            .last()
-            .map(|entry| (entry.state, entry.attempt)),
-        Some((JobState::Scheduled, 0))
+            .iter()
+            .find(|entry| entry.attempt == 0 && entry.created_at > failed.job.updated_at)
+            .map(|entry| entry.state),
+        Some(JobState::Enqueued)
     );
-    assert_eq!(admin::run_now(id).await.unwrap(), RunNowOutcome::Running);
     fixture.wait_for_state(id, "succeeded").await;
-    assert!(retried_at.elapsed() >= Duration::from_secs(5));
     assert_eq!(executions("fragile"), 2);
 }
 

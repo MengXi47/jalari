@@ -235,7 +235,10 @@ async fn check_replace_reports_running_job(fixture: &Fixture) {
         .unwrap();
 
     sqlx::query(AssertSqlSafe(format!(
-        "UPDATE \"{}\".job SET attempts = 1 WHERE id = $1",
+        "UPDATE \"{}\".job
+         SET state = 'running', attempts = 1, locked_by = gen_random_uuid(), locked_at = now(),
+             lock_token = 1
+         WHERE id = $1",
         fixture.schema_name
     )))
     .bind(first.id().0)
@@ -243,6 +246,21 @@ async fn check_replace_reports_running_job(fixture: &Fixture) {
     .await
     .unwrap();
 
+    let second = jalari::enqueue_with(&email("b@example.com"), options.clone())
+        .await
+        .unwrap();
+    assert_eq!(second, EnqueueOutcome::Running(first.id()));
+
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE \"{}\".job
+         SET state = 'enqueued', locked_by = NULL, locked_at = NULL, lock_token = NULL
+         WHERE id = $1",
+        fixture.schema_name
+    )))
+    .bind(first.id().0)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
     let mut holder = fixture.pool.begin().await.unwrap();
     sqlx::query(AssertSqlSafe(format!(
         "SELECT id FROM \"{}\".job WHERE id = $1 FOR UPDATE",
@@ -252,11 +270,10 @@ async fn check_replace_reports_running_job(fixture: &Fixture) {
     .execute(&mut *holder)
     .await
     .unwrap();
-
-    let second = jalari::enqueue_with(&email("b@example.com"), options)
+    let contended = jalari::enqueue_with(&email("c@example.com"), options)
         .await
-        .unwrap();
-    assert_eq!(second, EnqueueOutcome::Running(first.id()));
+        .unwrap_err();
+    assert_eq!(contended.kind, ErrorKind::JobKeyContention);
     holder.rollback().await.unwrap();
 }
 
@@ -308,17 +325,9 @@ async fn check_enqueue_notifies_queue(fixture: &Fixture) {
 }
 
 async fn check_worker_build_checks_connections() {
-    let error = Worker::builder()
-        .queue("default", 7)
-        .build()
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.kind, ErrorKind::InsufficientConnections);
-
     Worker::builder()
-        .queue("default", 4)
-        .queue("reports", 2)
+        .queue("default", 64)
+        .queue("reports", 32)
         .build()
         .await
         .unwrap();

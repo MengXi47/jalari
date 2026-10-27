@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -8,90 +8,14 @@ use tracing::warn;
 
 use super::runner::Shared;
 use crate::Result;
-use crate::job::RunControl;
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
-
-struct Entry {
-    control: Arc<RunControl>,
-    retired: bool,
-}
-
-#[derive(Default)]
-pub(super) struct RunBook {
-    entries: Mutex<Vec<Entry>>,
-}
-
-impl RunBook {
-    pub(super) fn register(&self, control: &Arc<RunControl>) -> Registration<'_> {
-        self.entries.lock().unwrap().push(Entry {
-            control: Arc::clone(control),
-            retired: false,
-        });
-        Registration {
-            book: self,
-            control: Arc::clone(control),
-            closed: false,
-        }
-    }
-
-    fn dirty(&self) -> Vec<(Arc<RunControl>, Value)> {
-        let entries = self.entries.lock().unwrap();
-        let mut dirty: Vec<(Arc<RunControl>, Value)> = entries
-            .iter()
-            .filter_map(|entry| {
-                let progress = entry.control.take_dirty()?;
-                Some((Arc::clone(&entry.control), progress))
-            })
-            .collect();
-        dirty.sort_by_key(|(control, _)| control.job_id());
-        dirty
-    }
-
-    fn prune(&self) {
-        self.entries
-            .lock()
-            .unwrap()
-            .retain(|entry| !entry.retired || entry.control.is_dirty());
-    }
-
-    fn release(&self, control: &Arc<RunControl>, closed: bool) {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(position) = entries
-            .iter()
-            .position(|entry| Arc::ptr_eq(&entry.control, control))
-        {
-            if closed {
-                entries.swap_remove(position);
-            } else {
-                entries[position].retired = true;
-            }
-        }
-    }
-}
-
-pub(super) struct Registration<'a> {
-    book: &'a RunBook,
-    control: Arc<RunControl>,
-    closed: bool,
-}
-
-impl Registration<'_> {
-    pub(super) fn close(mut self) {
-        self.closed = true;
-    }
-}
-
-impl Drop for Registration<'_> {
-    fn drop(&mut self) {
-        self.book.release(&self.control, self.closed);
-    }
-}
 
 pub(super) async fn flush_progress(shared: Arc<Shared>, shutdown: CancellationToken) {
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
+            () = shared.flush_now.notified() => {}
             () = tokio::time::sleep(FLUSH_INTERVAL) => {}
         }
         shared.flush_logged().await;
@@ -100,7 +24,7 @@ pub(super) async fn flush_progress(shared: Arc<Shared>, shutdown: CancellationTo
 }
 
 impl Shared {
-    async fn flush_logged(&self) {
+    pub(super) async fn flush_logged(&self) {
         if let Err(e) = self.flush().await {
             warn!(error = %e, "failed to save job progress");
         }

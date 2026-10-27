@@ -25,8 +25,9 @@ const PANIC_MARKER: &str = "race claim panic";
 const UNKNOWN_TASK: &str = "race_claim_unknown";
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
 const WAITING: &str = "state IN ('scheduled', 'enqueued')";
+const UNSETTLED: &str = "state IN ('scheduled', 'enqueued', 'running')";
 const SHOWN_FAILURES: usize = 25;
-const TAKEOVER_LOG: &str = "job was interrupted, running it again after a delay";
+const TAKEOVER_LOG: &str = "job was interrupted, running it again";
 const POSTPONE_LOG: &str = "waiting for an interrupted job with the same queue_key";
 
 static LOGGED: LazyLock<Mutex<Vec<Logged>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -571,7 +572,7 @@ async fn insert_unknown(
 
 async fn waiting(database: &Database, ids: &[i64]) -> i64 {
     sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT count(*) FROM {} WHERE id = ANY($1) AND {WAITING}",
+        "SELECT count(*) FROM {} WHERE id = ANY($1) AND {UNSETTLED}",
         database.table("job")
     )))
     .bind(ids)
@@ -612,7 +613,7 @@ async fn describe_waiting(database: &Database, ids: &[i64]) -> Vec<WaitingRow> {
     sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, state, attempts, queue_key, last_error, (run_at - now())::text AS due_in,
              priority
-         FROM {} WHERE id = ANY($1) AND {WAITING} ORDER BY id LIMIT 10",
+         FROM {} WHERE id = ANY($1) AND {UNSETTLED} ORDER BY id LIMIT 10",
         database.table("job")
     )))
     .bind(ids)
@@ -935,8 +936,8 @@ async fn test_race_claim() {
     if only.is_empty() || only == "locked_rows" {
         failures.extend(check_locked_rows(&database).await);
     }
-    if only.is_empty() || only == "fence_window" {
-        failures.extend(check_fence_window(&database).await);
+    if only.is_empty() || only == "locked_sibling" {
+        failures.extend(check_locked_sibling_does_not_hold_key(&database).await);
     }
     database.finish().await;
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -1245,35 +1246,16 @@ async fn check_front_block(database: &Database) -> Vec<String> {
             .map(|id| since(origin, done_at(*id)))
             .collect();
         let earliest_done = holder_done.iter().flatten().min().copied();
-        let latest_done = holder_done.iter().flatten().max().copied();
         eprintln!(
             "{tag} {part}: unrelated job started at {unrelated_start:?}, holders finished at \
              {holder_done:?}"
         );
-        if holds.len() < usize::try_from(max_claim_tries).unwrap() {
-            if !matches!((unrelated_start, earliest_done), (Some(start), Some(done)) if start < done)
-            {
-                failures.push(format!(
-                    "{tag} {part}: the unrelated ready job {unrelated_id} started at \
-                     {unrelated_start:?}, not before the first busy key freed at \
-                     {earliest_done:?}; {front_per_key} higher-priority jobs per busy key \
-                     should only cost one skip per key"
-                ));
-            }
-        } else {
-            let fenced = matches!(
-                (unrelated_start, earliest_done, latest_done),
-                (Some(start), Some(first_free), Some(last_free)) if first_free < start && start < last_free
-            );
-            if !fenced {
-                failures.push(format!(
-                    "{tag} {part}: with {} busy keys ahead and max_claim_tries {max_claim_tries}, \
-                     the unrelated job {unrelated_id} should wait until one key frees (docs/guide.md:279) \
-                     and then start before the others free; it started at {unrelated_start:?}, \
-                     holders finished at {holder_done:?}",
-                    holds.len()
-                ));
-            }
+        if !matches!((unrelated_start, earliest_done), (Some(start), Some(done)) if start < done) {
+            failures.push(format!(
+                "{tag} {part}: the unrelated ready job {unrelated_id} started at \
+                 {unrelated_start:?}, not before the first busy key freed at {earliest_done:?}; \
+                 a claim skips every busy key in one statement, whatever max_claim_tries is"
+            ));
         }
     }
     worker.stop().await;
@@ -1440,9 +1422,9 @@ async fn check_locked_rows(database: &Database) -> Vec<String> {
     cap(failures)
 }
 
-async fn check_fence_window(database: &Database) -> Vec<String> {
-    let seed = common::seed("fence_window");
-    let tag = format!("[fence_window seed {seed}]");
+async fn check_locked_sibling_does_not_hold_key(database: &Database) -> Vec<String> {
+    let seed = common::seed("locked_sibling");
+    let tag = format!("[locked_sibling seed {seed}]");
     let scale = common::scale();
     let started = Instant::now();
     let deadlocks = database.deadlocks().await;
@@ -1504,9 +1486,8 @@ async fn check_fence_window(database: &Database) -> Vec<String> {
                 "{tag} round {round}: job {} with queue_key {queue_key:?} had not started \
                  {patience:?} after enqueue, while control job {} without a key started after \
                  {control_latency:?}; its only sibling, job {}, was claimed by a session that is \
-                 alive and holds the row lock, so nothing was interrupted \
-                 (docs/guide.md:318-326), yet the key was fenced for the 6 s takeover delay: \
-                 {keyed_row:?}",
+                 alive and holds the row lock but never set it running, so it must not hold the \
+                 key: {keyed_row:?}",
                 keyed.id, control.id, claimed.id
             ));
         }

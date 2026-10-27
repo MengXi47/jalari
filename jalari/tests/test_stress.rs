@@ -995,7 +995,7 @@ async fn stop_children(mut children: Vec<Child>) {
 async fn wait_drained(database: &Database, probe: &PgPool, timeout: Duration) -> Option<Instant> {
     let deadline = Instant::now() + timeout;
     let sql = format!(
-        "SELECT count(*) FROM {} WHERE state IN ('scheduled', 'enqueued')",
+        "SELECT count(*) FROM {} WHERE state IN ('scheduled', 'enqueued', 'running')",
         database.table("job")
     );
     loop {

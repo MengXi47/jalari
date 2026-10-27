@@ -90,8 +90,8 @@ pub enum ErrorKind {
     DuplicateQueue,
     /// A queue was configured with a concurrency of zero.
     InvalidConcurrency,
-    /// The pool's `max_connections` is lower than the worker needs: the sum of all queue
-    /// concurrencies plus two.
+    /// The pool's `max_connections` is below 2, one connection for the notification listener and
+    /// one for the worker's statements.
     InsufficientConnections,
     /// The pool does not keep a PostgreSQL session across statements, as behind a transaction
     /// pooler; a worker needs a real session for its lifeline and its notification listener.

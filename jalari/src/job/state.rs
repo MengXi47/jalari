@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{Error, ErrorKind};
 
-pub(crate) const JOB_KEY_STATES: &str = "('scheduled', 'enqueued', 'stopped')";
+pub(crate) const JOB_KEY_STATES: &str = "('scheduled', 'enqueued', 'running', 'stopped')";
 
 /// Where a job is in its life, as stored in the `state` column.
 ///
@@ -17,11 +17,13 @@ pub(crate) const JOB_KEY_STATES: &str = "('scheduled', 'enqueued', 'stopped')";
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobState {
-    /// Waiting for its `run_at` time; also the state of a retry that waits for its backoff.
+    /// Waiting for its `run_at` time: a delayed job, a retry waiting for its backoff, or a job
+    /// whose worker died, waiting to run again.
     Scheduled,
-    /// Due now, waiting for a worker or being run by one.
+    /// Due now and waiting for a worker.
     Enqueued,
-    /// Being run by a worker.
+    /// Being run by the worker named in
+    /// [`JobInfo::worker_id`](crate::admin::JobInfo::worker_id).
     Running,
     /// Finished successfully.
     Succeeded,

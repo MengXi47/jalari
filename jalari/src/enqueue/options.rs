@@ -14,15 +14,12 @@ pub enum OnConflict {
     KeepExisting,
     /// Overwrite the waiting job's payload, queue, run time and options, and reset its attempts.
     ///
-    /// A job that is already running cannot be replaced; the enqueue returns
-    /// [`EnqueueOutcome::Running`] instead, after waiting about 100 ms to tell a running job
-    /// from one a worker is only inspecting. A job that a worker has claimed but not started
-    /// running yet is replaced: that claim is dropped and the new payload runs.
-    ///
-    /// A job whose worker stopped during its last attempt is replaced too. The interrupted
-    /// attempt is recorded first, and the new payload starts no earlier than 6 seconds after the
-    /// interruption was noticed, like any interrupted job; jobs sharing its `queue_key` wait as
-    /// long. A dropped claim counts as such an interruption, so its new payload waits as well.
+    /// A running job cannot be replaced; the enqueue returns [`EnqueueOutcome::Running`] at
+    /// once. That includes a job whose worker died less than about 8 seconds ago, until another
+    /// worker records the interrupted attempt; after that the job is waiting again and is
+    /// replaced, or, when that attempt was its last, it has failed and a new job is inserted.
+    /// A waiting job that another transaction keeps locked for about a second ends the enqueue
+    /// with [`JobKeyContention`](crate::ErrorKind::JobKeyContention).
     ///
     /// A [stopped](crate::stop) job, or one with a pending [`stop`](crate::stop) or
     /// [`cancel`](crate::cancel), is never replaced; the enqueue returns

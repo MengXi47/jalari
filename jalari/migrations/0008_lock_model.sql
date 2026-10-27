@@ -1,3 +1,12 @@
+SELECT job.id FROM {job} AS job
+WHERE job.state IN ('scheduled', 'enqueued') AND job.attempts > 0
+    AND NOT EXISTS (
+        SELECT 1 FROM {job_history} AS history
+        WHERE history.job_id = job.id AND history.attempt = job.attempts
+            AND history.created_at >= job.updated_at
+    )
+FOR UPDATE OF job NOWAIT;
+
 ALTER TABLE {job} ADD COLUMN IF NOT EXISTS locked_by UUID;
 
 ALTER TABLE {job} ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
@@ -7,6 +16,40 @@ ALTER TABLE {job} ADD COLUMN IF NOT EXISTS lock_token BIGINT;
 ALTER TABLE {job} ADD COLUMN IF NOT EXISTS queue_key_slot SMALLINT;
 
 ALTER TABLE {job} ADD COLUMN IF NOT EXISTS command TEXT;
+
+WITH unfinished AS (
+    SELECT job.id,
+        EXISTS (
+            SELECT 1 FROM {job_control} AS control
+            WHERE control.job_id = job.id AND control.command IS NOT NULL
+        ) AS commanded
+    FROM {job} AS job
+    WHERE job.state IN ('scheduled', 'enqueued') AND job.attempts > 0
+        AND NOT EXISTS (
+            SELECT 1 FROM {job_history} AS history
+            WHERE history.job_id = job.id AND history.attempt = job.attempts
+                AND history.created_at >= job.updated_at
+        )
+),
+interrupted AS (
+    UPDATE {job} AS job
+    SET state = CASE WHEN job.attempts >= job.max_attempts AND NOT unfinished.commanded
+            THEN 'failed' ELSE 'scheduled' END,
+        attempts = CASE WHEN unfinished.commanded THEN job.attempts - 1 ELSE job.attempts END,
+        last_error = 'the worker stopped during the last attempt',
+        run_at = now(),
+        updated_at = now()
+    FROM unfinished
+    WHERE job.id = unfinished.id
+    RETURNING job.id, job.state, job.attempts
+),
+cleared AS (
+    UPDATE {job_control} SET lease = lease + 1, progress = NULL, updated_at = now()
+    WHERE job_id IN (SELECT id FROM interrupted WHERE state = 'failed')
+)
+INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
+SELECT id, state, attempts, 'the worker stopped during the last attempt', now()
+FROM interrupted;
 
 ALTER TABLE {job} DROP CONSTRAINT IF EXISTS job_state_check;
 
@@ -47,6 +90,10 @@ DROP INDEX IF EXISTS {schema}."{prefix}job_finished_idx";
 
 CREATE INDEX IF NOT EXISTS "{prefix}job_finished_idx" ON {job} (state, updated_at)
     WHERE state IN ('succeeded', 'failed', 'discarded', 'deleted');
+
+DROP INDEX IF EXISTS {schema}."{prefix}job_queue_key_started_idx";
+
+DROP INDEX IF EXISTS {schema}."{prefix}job_queue_key_failed_idx";
 
 INSERT INTO {schema_version} AS existing (id, version) VALUES (TRUE, {version})
     ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, updated_at = now()

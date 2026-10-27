@@ -579,10 +579,7 @@ async fn check_sweep_keeps_queue_key_fence(database: &Database, sweep: bool) -> 
     let zombie_started = LEDGER.events(&zombie_label)[0].1;
     tokio::time::sleep_until((zombie_started + Duration::from_millis(1700)).into()).await;
     let killed = eventually(Duration::from_secs(3), || async {
-        database
-            .terminate_job_sessions(1, Duration::from_millis(200))
-            .await
-            == 1
+        database.terminate_running_lifelines().await == 1
     })
     .await;
     let lost = Instant::now();
@@ -647,11 +644,11 @@ async fn check_sweep_keeps_queue_key_fence(database: &Database, sweep: bool) -> 
     if zombie_ended.is_none_or(|ended| ended > lost + Duration::from_secs(3)) {
         eprintln!("{label}: the zombie outlived the 3 s abort bound, overlap is inconclusive");
     }
-    let waited = follower_started.saturating_duration_since(failed_seen);
-    if waited + Duration::from_millis(500) < Duration::from_secs(6) {
+    let waited = follower_started.saturating_duration_since(lost);
+    if waited < Duration::from_secs(6) {
         violations.push(format!(
-            "a job with the interrupted job's queue_key started {waited:?} after the interruption \
-             was recorded, expected at least 6 s (docs/guide.md:324-326); {timeline}"
+            "a job with the interrupted job's queue_key started {waited:?} after the zombie lost \
+             its lifeline, expected at least 6 s; {timeline}"
         ));
     }
     violations.extend(

@@ -3,7 +3,6 @@ use sqlx::{AssertSqlSafe, PgConnection};
 use crate::init::config;
 use crate::job::Command;
 use crate::storage::JOB_CHANNEL;
-use crate::worker::{Closing, INTERRUPTED, TAKEOVER_DELAY, close};
 use crate::{JobId, JobState, Result, Schema};
 
 /// What [`stop`] did with the job.
@@ -12,13 +11,14 @@ pub enum StopOutcome {
     /// The job is stopped: it was waiting and no worker will take it until [`restart`], or it
     /// was already stopped.
     Stopped,
-    /// A worker holds the job, or its last run crashed less than 6 seconds ago; the stop is
-    /// recorded and applies when the worker sees it.
+    /// A worker is running the job, or ran it until it died less than about 8 seconds ago; the
+    /// stop is recorded and applies when the worker sees it.
     ///
     /// A running job sees the request within about a second, stops at its next
     /// [`checkpoint`](crate::checkpoint) and is aborted after
-    /// [`WorkerConfig::stop_timeout`](crate::WorkerConfig::stop_timeout). A job that returns `Ok`
-    /// first is recorded as succeeded. Call `stop` again to learn the result.
+    /// [`WorkerConfig::stop_timeout`](crate::WorkerConfig::stop_timeout). A job whose worker died
+    /// is stopped by another worker without running again. A job that returns `Ok` first is
+    /// recorded as succeeded. Call `stop` again to learn the result.
     Requested,
     /// The job had already succeeded, failed, been discarded or been cancelled.
     Finished,
@@ -43,12 +43,13 @@ pub enum RestartOutcome {
 pub enum CancelOutcome {
     /// The waiting or stopped job is marked deleted, will never run and frees its `job_key`.
     Cancelled,
-    /// A worker holds the job, or its last run crashed less than 6 seconds ago; the cancel is
-    /// recorded and applies when the worker sees it.
+    /// A worker is running the job, or ran it until it died less than about 8 seconds ago; the
+    /// cancel is recorded and applies when the worker sees it.
     ///
     /// A running job stops at its next [`checkpoint`](crate::checkpoint) or is aborted after
     /// [`WorkerConfig::stop_timeout`](crate::WorkerConfig::stop_timeout), and is then marked
-    /// deleted. A job that returns `Ok` first is recorded as succeeded. Call `cancel` again to
+    /// deleted. A job whose worker died is marked deleted by another worker without running
+    /// again. A job that returns `Ok` first is recorded as succeeded. Call `cancel` again to
     /// learn the result.
     Requested,
     /// The job had already succeeded, failed, been discarded or been cancelled.
@@ -143,7 +144,8 @@ pub async fn cancel(id: JobId) -> Result<CancelOutcome> {
 /// Puts a stopped job back in its queue; it continues from its saved progress.
 ///
 /// Its attempt count is what it was before the stop, and a job scheduled for later keeps its
-/// run time.
+/// run time. A job stopped right after a worker aborted it at shutdown still waits the few
+/// seconds the aborted run needs to stop.
 ///
 /// # Errors
 ///
@@ -168,6 +170,7 @@ pub async fn restart(id: JobId) -> Result<RestartOutcome> {
              UPDATE {job}
              SET state = CASE WHEN run_at > statement_timestamp() THEN 'scheduled'
                      ELSE 'enqueued' END,
+                 run_at = greatest(run_at, statement_timestamp()),
                  updated_at = statement_timestamp()
              WHERE id = $1 AND state = 'stopped'
              RETURNING id, state, attempts, queue
@@ -237,21 +240,42 @@ async fn apply(
     .await?;
     let pending = Command::parse(&pending).unwrap_or(command);
 
-    let idle: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT attempts FROM {job} AS job
-         WHERE id = $1 AND ({idle} OR (job.state = 'stopped' AND $2))
-         FOR UPDATE SKIP LOCKED",
+    let settled: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "WITH idle AS (
+             SELECT id FROM {job}
+             WHERE id = $1
+                 AND (state IN ('scheduled', 'enqueued') OR (state = 'stopped' AND $2 = 'cancel'))
+             FOR NO KEY UPDATE SKIP LOCKED
+         ),
+         settled AS (
+             UPDATE {job}
+             SET state = CASE WHEN $2 = 'cancel' THEN 'deleted' ELSE 'stopped' END,
+                 updated_at = statement_timestamp()
+             WHERE id IN (SELECT id FROM idle)
+             RETURNING id, state, attempts
+         ),
+         logged AS (
+             INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
+             SELECT id, state, attempts, $3, statement_timestamp() FROM settled
+         ),
+         cleared AS (
+             UPDATE {job_control}
+             SET command = NULL, lease = lease + 1,
+                 progress = CASE WHEN $2 = 'cancel' THEN NULL ELSE progress END,
+                 updated_at = statement_timestamp()
+             WHERE job_id IN (SELECT id FROM settled)
+         )
+         SELECT state FROM settled",
         job = schema.table("job"),
-        idle = schema.idle_job("job", "$3", "$4"),
+        job_history = schema.table("job_history"),
+        job_control = schema.table("job_control"),
     )))
     .bind(id.0)
-    .bind(pending == Command::Cancel)
-    .bind(INTERRUPTED)
-    .bind(TAKEOVER_DELAY)
+    .bind(pending.as_str())
+    .bind(pending.message())
     .fetch_optional(&mut *connection)
     .await?;
-    if let Some(attempts) = idle {
-        close(connection, schema, &Closing::idle(id.0, attempts, pending)).await?;
+    if settled.is_some() {
         return Ok(if pending == command {
             Answer::Applied
         } else {
@@ -264,6 +288,7 @@ async fn apply(
             notify(connection, schema, &queue).await?;
             return Ok(Answer::Requested);
         }
+        Some((state, _)) if state == "running" => return Ok(Answer::Requested),
         Some((state, _)) if state == "stopped" => match command {
             Command::Stop => Answer::Stopped,
             Command::Cancel => return Ok(Answer::Requested),

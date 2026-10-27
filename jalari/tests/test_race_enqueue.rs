@@ -352,7 +352,7 @@ async fn payload_rows(database: &Database, task: &str) -> Vec<PayloadRow> {
 
 async fn pending_of(database: &Database, task: &str) -> i64 {
     sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT count(*) FROM {} WHERE task = $1 AND state IN ('scheduled', 'enqueued')",
+        "SELECT count(*) FROM {} WHERE task = $1 AND state IN ('scheduled', 'enqueued', 'running')",
         database.table("job")
     )))
     .bind(task)
@@ -443,7 +443,7 @@ async fn sample_duplicates(
     while active.load(Ordering::SeqCst) {
         let rows: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT job_key, count(*) FROM {job_table}
-             WHERE job_key IS NOT NULL AND state IN ('scheduled', 'enqueued')
+             WHERE job_key IS NOT NULL AND state IN ('scheduled', 'enqueued', 'running')
              GROUP BY job_key HAVING count(*) > 1"
         )))
         .fetch_all(&observer)
@@ -1004,7 +1004,7 @@ async fn check_window(database: &Database, observer: &PgPool, seed: u64) -> Vec<
         let replaced = jalari::enqueue_with(&Window { token: second }, options()).await;
         let replaced_at = replaced_at.elapsed();
         let rival = start_worker("window", 1, Duration::from_millis(50)).await;
-        let rival_claimed = settle(Duration::from_secs(5), || async {
+        let rival_claimed = settle(Duration::from_secs(2), || async {
             sleeping_backends(database, observer).await > 0
         })
         .await;
@@ -1038,29 +1038,28 @@ async fn check_window(database: &Database, observer: &PgPool, seed: u64) -> Vec<
              {frozen_for:?}, settled {settled}, runs \
              (token, attempt, ok) {ran:?}, history {history:?}, row {row:?}"
         );
-        if replaced != Ok(EnqueueOutcome::Replaced(id)) {
+        if replaced != Ok(EnqueueOutcome::Running(id)) {
             violations.push(format!(
                 "window seed {seed} round {round}: replace after the claim committed returned \
-                 {replaced:?}, expected Replaced({id}); row {row:?}"
+                 {replaced:?}, expected Running({id}) because the committed claim makes the job \
+                 running; row {row:?}"
             ));
-            continue;
         }
-        if runs.iter().any(|run| run.token == first) {
+        if runs.iter().any(|run| run.token == second) {
             violations.push(format!(
-                "window seed {seed} round {round}: job {id} ran the replaced token {first} after \
-                 Replace returned Replaced({id}) with token {second}; runs (token, attempt, ok) \
-                 {ran:?}, row {row:?}"
+                "window seed {seed} round {round}: job {id} ran token {second}, whose Replace \
+                 did not return Replaced; runs (token, attempt, ok) {ran:?}, row {row:?}"
             ));
         }
         if runs
             .iter()
-            .filter(|run| run.token == second && run.ok)
+            .filter(|run| run.token == first && run.ok)
             .count()
             != 1
         {
             violations.push(format!(
-                "window seed {seed} round {round}: job {id} never ran token {second}, the payload \
-                 Replace returned Replaced({id}) for; runs (token, attempt, ok) {ran:?}, row {row:?}"
+                "window seed {seed} round {round}: job {id} did not run its claimed token \
+                 {first} exactly once; runs (token, attempt, ok) {ran:?}, row {row:?}"
             ));
         }
     }
@@ -1092,11 +1091,11 @@ fn interruptions(history: &[(String, i32, Option<String>)]) -> usize {
         .count()
 }
 
-async fn owner_sessions(database: &Database, observer: &PgPool, id: JobId) -> i64 {
+async fn owner_lifelines(database: &Database, observer: &PgPool, id: JobId) -> i64 {
     sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT count(*) FROM {job} AS job
-         JOIN pg_locks AS locks ON locks.locktype = 'transactionid'
-             AND locks.transactionid = job.xmax AND locks.mode = 'ExclusiveLock'
+         JOIN pg_stat_activity AS activity
+             ON activity.application_name = 'jalari lifeline ' || job.locked_by::text
          WHERE job.id = $1",
         job = database.table("job")
     )))
@@ -1122,9 +1121,9 @@ async fn freeze_and_kill(
     }
     let thaw = worker.freeze().await;
     let terminated: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT count(*) FILTER (WHERE pg_terminate_backend(locks.pid)) FROM {job} AS job
-         JOIN pg_locks AS locks ON locks.locktype = 'transactionid'
-             AND locks.transactionid = job.xmax AND locks.mode = 'ExclusiveLock'
+        "SELECT count(*) FILTER (WHERE pg_terminate_backend(activity.pid)) FROM {job} AS job
+         JOIN pg_stat_activity AS activity
+             ON activity.application_name = 'jalari lifeline ' || job.locked_by::text
          WHERE job.id = $1",
         job = database.table("job")
     )))
@@ -1133,13 +1132,14 @@ async fn freeze_and_kill(
     .await
     .unwrap();
     let gone = settle(Duration::from_secs(5), || async {
-        owner_sessions(database, observer, id).await == 0
+        owner_lifelines(database, observer, id).await == 0
     })
     .await;
     if terminated != 1 || !gone {
         thaw.send(()).ok();
         return Err(format!(
-            "could not end the session running job {id}: terminated {terminated}, gone {gone}"
+            "could not end the lifeline of the worker running job {id}: terminated \
+             {terminated}, gone {gone}"
         ));
     }
     Ok(thaw)
@@ -1215,36 +1215,41 @@ async fn check_replace_interrupted(
                 continue;
             }
         };
+        let killed = Instant::now();
+        let rival = start_worker("gap_idle", 1, Duration::from_millis(50)).await;
         let new = token();
-        let wait = if exhausted {
-            TAKEOVER_DELAY
-        } else {
-            Duration::from_secs(8)
-        };
+        let wait = Duration::from_secs(2);
         let replace_started = Instant::now();
-        let replaced = if exhausted {
-            jalari::enqueue_with(
-                &GapOnce {
-                    token: new,
-                    hold_ms: 20,
-                },
-                options(),
-            )
-            .await
-        } else {
-            jalari::enqueue_with(
-                &Gap {
-                    token: new,
-                    hold_ms: 20,
-                    fail: false,
-                },
-                options().delay(wait),
-            )
-            .await
-        }
-        .map_err(|e| e.kind);
-        let rival = start_worker("gap", 2, Duration::from_millis(50)).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let replaced = loop {
+            let outcome = if exhausted {
+                jalari::enqueue_with(
+                    &GapOnce {
+                        token: new,
+                        hold_ms: 20,
+                    },
+                    options(),
+                )
+                .await
+            } else {
+                jalari::enqueue_with(
+                    &Gap {
+                        token: new,
+                        hold_ms: 20,
+                        fail: false,
+                    },
+                    options().delay(wait),
+                )
+                .await
+            }
+            .map_err(|e| e.kind);
+            if outcome != Ok(EnqueueOutcome::Running(id))
+                || replace_started.elapsed() > Duration::from_secs(15)
+            {
+                break outcome;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let replace_returned = Instant::now();
         thaw.send(()).unwrap();
         let settled = settle(Duration::from_secs(20), || async {
             pending_of(database, "race_gap").await == 0
@@ -1258,20 +1263,31 @@ async fn check_replace_interrupted(
         let sibling_runs = gap_runs(sibling);
         let history = job_history(database, id).await;
         let interrupted_until = old_runs.first().and_then(|run| run.finished);
-        let after = |run: &Run| run.started.saturating_duration_since(replace_started);
+        let after_kill = |run: &Run| run.started.saturating_duration_since(killed);
         eprintln!(
-            "replace_interrupted round {round}: exhausted {exhausted}, replace {replaced:?}, \
-             settled {settled}, old runs {}, new run started {:?} after the replace, sibling \
-             started {:?} after the replace, history {history:?}",
+            "replace_interrupted round {round}: exhausted {exhausted}, replace {replaced:?} \
+             {:?} after the kill, settled {settled}, old runs {}, new run started {:?} after the \
+             kill, sibling started {:?} after the kill, history {history:?}",
+            replace_returned.saturating_duration_since(killed),
             old_runs.len(),
-            new_runs.iter().map(after).collect::<Vec<_>>(),
-            sibling_runs.iter().map(after).collect::<Vec<_>>(),
+            new_runs.iter().map(after_kill).collect::<Vec<_>>(),
+            sibling_runs.iter().map(after_kill).collect::<Vec<_>>(),
         );
         let label = format!("replace_interrupted seed {seed} round {round} (job {id})");
-        if replaced != Ok(EnqueueOutcome::Replaced(id)) {
+        let expected = if exhausted {
+            matches!(replaced, Ok(EnqueueOutcome::Inserted(other)) if other != id)
+        } else {
+            replaced == Ok(EnqueueOutcome::Replaced(id))
+        };
+        if !expected {
             violations.push(format!(
-                "{label}: Replace of a job whose worker session had ended returned {replaced:?}, \
-                 expected Replaced({id})"
+                "{label}: Replace once the dead worker's attempt was recorded returned \
+                 {replaced:?}, expected {}",
+                if exhausted {
+                    "a new job, since the failed job frees its job_key".to_owned()
+                } else {
+                    format!("Replaced({id})")
+                }
             ));
         }
         if interruptions(&history) != 1 {
@@ -1289,12 +1305,12 @@ async fn check_replace_interrupted(
         }
         match new_runs.as_slice() {
             [run] if run.ok => {
-                if after(run) + CLOCK_SLACK < wait {
+                if !exhausted
+                    && run.started.saturating_duration_since(replace_returned) + CLOCK_SLACK < wait
+                {
                     violations.push(format!(
-                        "{label}: the new payload (token {new}) started {:?} after the Replace, \
-                         expected at least {wait:?} because the attempt it replaced was \
-                         interrupted",
-                        after(run)
+                        "{label}: the new payload (token {new}) started before the {wait:?} \
+                         delay its Replace asked for"
                     ));
                 }
                 if interrupted_until.is_none_or(|until| run.started < until) {
@@ -1312,25 +1328,17 @@ async fn check_replace_interrupted(
         }
         match sibling_runs.as_slice() {
             [run] if run.ok => {
-                if after(run) + CLOCK_SLACK < TAKEOVER_DELAY {
+                if after_kill(run) + CLOCK_SLACK < TAKEOVER_DELAY {
                     violations.push(format!(
                         "{label}: same-queue_key sibling (token {sibling}) started {:?} after the \
-                         Replace, expected the queue_key fence to hold it for {TAKEOVER_DELAY:?}",
-                        after(run)
+                         kill, before the dead worker's attempt could be recorded",
+                        after_kill(run)
                     ));
                 }
                 if interrupted_until.is_none_or(|until| run.started < until) {
                     violations.push(format!(
                         "{label}: same-queue_key sibling (token {sibling}) started while the \
                          interrupted run of token {old} still held the queue_key"
-                    ));
-                }
-                if after(run) >= wait.max(TAKEOVER_DELAY + Duration::from_secs(1)) {
-                    violations.push(format!(
-                        "{label}: same-queue_key sibling (token {sibling}) started {:?} after the \
-                         Replace, expected the fence to end {TAKEOVER_DELAY:?} after the \
-                         interruption rather than at the replaced job's run time",
-                        after(run)
                     ));
                 }
             }
@@ -1398,8 +1406,8 @@ async fn check_replace_marking(database: &Database, observer: &PgPool, seed: u64
     match freeze_and_kill(database, observer, &frozen_worker, id, old).await {
         Err(e) => violations.push(format!("replace_marking seed {seed}: {e}")),
         Ok(thaw) => {
-            let rival = start_worker("gap", 1, Duration::from_millis(50)).await;
-            let marking = settle(Duration::from_secs(10), || async {
+            let rival = start_worker("gap_idle", 1, Duration::from_millis(50)).await;
+            let marking = settle(Duration::from_secs(15), || async {
                 blocked_markers(database, observer).await > 0
             })
             .await;
@@ -1482,12 +1490,12 @@ async fn check_replace_marking(database: &Database, observer: &PgPool, seed: u64
     let label = format!("replace_marking seed {seed} (job {id})");
     if !marking {
         violations.push(format!(
-            "{label}: no claimer was seen holding the dead row while marking it"
+            "{label}: no reaper was seen holding the dead row while marking it"
         ));
     }
     if replaced != Ok(EnqueueOutcome::Replaced(id)) {
         violations.push(format!(
-            "{label}: Replace while a claimer held the dead row for a few milliseconds to mark it \
+            "{label}: Replace while a reaper held the dead row for a few milliseconds to mark it \
              interrupted returned {replaced:?} in {replace_took:?}, expected Replaced({id})"
         ));
     }
@@ -1500,11 +1508,11 @@ async fn check_replace_marking(database: &Database, observer: &PgPool, seed: u64
     }
     match new_runs.as_slice() {
         [run] if run.ok => {
-            let after = run.started.saturating_duration_since(replace_started);
-            if after + Duration::from_millis(500) < TAKEOVER_DELAY {
+            let interrupted_until = old_runs.first().and_then(|run| run.finished);
+            if interrupted_until.is_none_or(|until| run.started < until) {
                 violations.push(format!(
-                    "{label}: the new payload (token {new}) started {after:?} after the Replace, \
-                     expected the takeover delay of the interruption to hold"
+                    "{label}: the new payload (token {new}) started while the interrupted run of \
+                     token {old} was still running"
                 ));
             }
         }

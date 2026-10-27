@@ -93,27 +93,6 @@ impl Schema {
         format!("jalari:{purpose}:{}", self.name)
     }
 
-    pub(crate) fn unfinished_attempt(&self, job: &str) -> String {
-        format!(
-            "({job}.attempts > 0 AND NOT EXISTS (
-                 SELECT 1 FROM {history} AS history
-                 WHERE history.job_id = {job}.id AND history.attempt = {job}.attempts
-                     AND history.created_at >= {job}.updated_at
-             ))",
-            history = self.table("job_history"),
-        )
-    }
-
-    pub(crate) fn idle_job(&self, job: &str, interrupted: &str, takeover_delay: &str) -> String {
-        format!(
-            "({job}.state IN ('scheduled', 'enqueued') AND NOT {unfinished}
-                 AND ({job}.last_error IS DISTINCT FROM {interrupted}
-                     OR {job}.run_at <= statement_timestamp()
-                     OR {job}.updated_at + {takeover_delay} <= statement_timestamp()))",
-            unfinished = self.unfinished_attempt(job),
-        )
-    }
-
     pub(crate) fn notify_channel(&self, kind: &str) -> String {
         let channel = format!("{}.{}{kind}", self.name, self.prefix);
         if channel.len() <= MAX_IDENTIFIER_LENGTH {

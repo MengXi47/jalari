@@ -256,14 +256,14 @@ impl Fixture {
 
     async fn terminate_running_job(&self) {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let terminated: Vec<bool> = sqlx::query_scalar(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-             WHERE datname = current_database()
-                 AND state = 'idle in transaction'
-                 AND state_change < now() - interval '200 milliseconds'
-                 AND application_name = $1",
-        )
-        .bind(&self.schema_name)
+        let terminated: Vec<bool> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT pg_terminate_backend(activity.pid)
+             FROM pg_stat_activity AS activity
+             JOIN {job} AS job
+                 ON activity.application_name = 'jalari lifeline ' || job.locked_by::text
+             WHERE job.state = 'running'",
+            job = self.table("job"),
+        )))
         .fetch_all(&self.pool)
         .await
         .unwrap();

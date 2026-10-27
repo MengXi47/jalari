@@ -7,13 +7,14 @@ mod housekeeping;
 mod lifeline;
 mod listener;
 mod middleware;
+mod ownership;
 mod reaper;
 mod retry;
 mod runner;
+mod runs;
 mod scheduler;
 
-pub(crate) use close::{Closing, close};
-pub(crate) use execute::{INTERRUPTED, TAKEOVER_DELAY, mark_interrupted};
+pub(crate) use ownership::INTERRUPTED;
 
 pub use builder::WorkerBuilder;
 pub use config::WorkerConfig;

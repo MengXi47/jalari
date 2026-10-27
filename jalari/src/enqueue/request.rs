@@ -7,7 +7,7 @@ use sqlx::{AssertSqlSafe, PgConnection};
 use crate::init::config;
 use crate::job::{JOB_KEY_STATES, context, fingerprint, registry};
 use crate::storage::{JOB_CHANNEL, interval};
-use crate::worker::{INTERRUPTED, mark_interrupted};
+use crate::worker::INTERRUPTED;
 use crate::{
     EnqueueOptions, EnqueueOutcome, Error, ErrorKind, Job, JobId, OnConflict, Result, Schema,
 };
@@ -15,7 +15,6 @@ use crate::{
 const DEFAULT_QUEUE: &str = "default";
 const MAX_CONFLICT_RETRIES: usize = 3;
 const LOCK_POLL: Duration = Duration::from_millis(25);
-const RUNNING_PATIENCE: Duration = Duration::from_millis(100);
 const REPLACE_PATIENCE: Duration = Duration::from_secs(1);
 
 enum Replacement {
@@ -29,9 +28,8 @@ enum Replacement {
 struct ReplaceRow {
     id: i64,
     kept: bool,
-    started: bool,
+    running: bool,
     replaced: bool,
-    interrupted: bool,
 }
 
 pub(crate) struct EnqueueRequest {
@@ -237,18 +235,15 @@ impl EnqueueRequest {
     ) -> Result<Replacement> {
         let sql = format!(
             "WITH target AS (
-                 SELECT job.id, job.state = 'stopped' OR {commanded} AS kept,
-                     {unfinished} AS started
+                 SELECT job.id, job.state, job.state = 'stopped' OR EXISTS (
+                         SELECT 1 FROM {job_control} AS control
+                         WHERE control.job_id = job.id AND control.command IS NOT NULL
+                     ) AS kept,
+                     CASE WHEN job.last_error = $11 AND job.run_at > statement_timestamp()
+                         THEN job.run_at END AS takeover_at
                  FROM {job} AS job
                  WHERE job.job_key = $9 AND job.state IN {JOB_KEY_STATES}
-             ),
-             locked AS (
-                 SELECT id,
-                     CASE WHEN last_error = $11 AND run_at > statement_timestamp() THEN run_at END
-                         AS takeover_at
-                 FROM {job} AS job
-                 WHERE job_key = $9 AND state IN ('scheduled', 'enqueued') AND NOT {commanded}
-                 FOR UPDATE SKIP LOCKED
+                 FOR NO KEY UPDATE SKIP LOCKED
              ),
              replaced AS (
                  UPDATE {job} AS job
@@ -256,15 +251,16 @@ impl EnqueueRequest {
                      state = CASE WHEN input.run_at > now() THEN 'scheduled' ELSE 'enqueued' END,
                      queue_key = $4, attempts = 0, max_attempts = $5, run_at = input.run_at,
                      timeout_ms = $6,
-                     last_error = CASE WHEN locked.takeover_at IS NOT NULL THEN $11 END,
+                     last_error = CASE WHEN target.takeover_at IS NOT NULL THEN $11 END,
                      context = $10, fingerprint = $12, updated_at = statement_timestamp()
-                 FROM locked, LATERAL (
+                 FROM target, LATERAL (
                      SELECT greatest(
                          COALESCE($7::timestamptz, now() + COALESCE($8::interval, interval '0')),
-                         locked.takeover_at
+                         target.takeover_at
                      ) AS run_at
                  ) AS input
-                 WHERE job.id = locked.id AND NOT {unfinished}
+                 WHERE job.id = target.id AND target.state IN ('scheduled', 'enqueued')
+                     AND NOT target.kept
                  RETURNING job.id
              ),
              reset AS (
@@ -272,19 +268,11 @@ impl EnqueueRequest {
                  SET progress = NULL, lease = lease + 1, updated_at = statement_timestamp()
                  WHERE job_id IN (SELECT id FROM replaced)
              )
-             SELECT target.id, target.kept, target.started,
-                 EXISTS (SELECT 1 FROM replaced) AS replaced,
-                 EXISTS (SELECT 1 FROM locked) AND NOT EXISTS (SELECT 1 FROM replaced)
-                     AS interrupted
+             SELECT target.id, target.kept, target.state = 'running' AS running,
+                 EXISTS (SELECT 1 FROM replaced) AS replaced
              FROM target",
             job = schema.table("job"),
             job_control = schema.table("job_control"),
-            unfinished = schema.unfinished_attempt("job"),
-            commanded = format!(
-                "EXISTS (SELECT 1 FROM {job_control} AS control
-                     WHERE control.job_id = job.id AND control.command IS NOT NULL)",
-                job_control = schema.table("job_control"),
-            ),
         );
         let polling_since = Instant::now();
         loop {
@@ -304,29 +292,20 @@ impl EnqueueRequest {
                 .fetch_optional(&mut *connection)
                 .await?;
             match row {
-                None => return Ok(Replacement::Missing),
                 Some(row) if row.kept => return Ok(Replacement::Kept(JobId(row.id))),
                 Some(row) if row.replaced => return Ok(Replacement::Replaced(JobId(row.id))),
-                Some(row) if row.interrupted => {
-                    if !mark_interrupted(connection, schema, &[row.id], false).await?
-                        && polling_since.elapsed() >= REPLACE_PATIENCE
-                    {
-                        return Err(Error::new(
-                            ErrorKind::JobKeyContention,
-                            format!("job_key {job_key:?} stayed locked while enqueuing"),
-                        ));
-                    }
+                Some(row) if row.running => return Ok(Replacement::Running(JobId(row.id))),
+                Some(_) => return Ok(Replacement::Missing),
+                None if pending_id(connection, schema, job_key).await?.is_none() => {
+                    return Ok(Replacement::Missing);
                 }
-                Some(row) if row.started && polling_since.elapsed() >= RUNNING_PATIENCE => {
-                    return Ok(Replacement::Running(JobId(row.id)));
-                }
-                Some(_) if polling_since.elapsed() >= REPLACE_PATIENCE => {
+                None if polling_since.elapsed() >= REPLACE_PATIENCE => {
                     return Err(Error::new(
                         ErrorKind::JobKeyContention,
                         format!("job_key {job_key:?} stayed locked while enqueuing"),
                     ));
                 }
-                Some(_) => tokio::time::sleep(LOCK_POLL).await,
+                None => tokio::time::sleep(LOCK_POLL).await,
             }
         }
     }
