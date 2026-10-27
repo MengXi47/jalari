@@ -279,8 +279,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             options,
         ));
     }
-    jalari::enqueue_many(&syncs).await?;
-    println!("6 acme syncs with queue_key_limit(2) and 3 globex syncs without a limit, 6 slots");
+    let mut transaction = pool.begin().await?;
+    jalari::enqueue_many_in(&mut transaction, &syncs).await?;
+    transaction.commit().await?;
+    println!("committed 6 acme syncs with queue_key_limit(2) and 3 globex syncs without a limit");
+    println!("in one transaction with enqueue_many_in; the sync queue has 6 slots");
     wait_until_done("sync", since).await?;
     for (tenant, running) in RUNNING.lock().expect("not poisoned").iter() {
         println!("{tenant} ran at most {} at once", running.most);
