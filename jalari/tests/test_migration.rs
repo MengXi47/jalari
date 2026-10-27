@@ -167,7 +167,6 @@ async fn test_version_8_adds_the_lock_columns_and_constraints() {
         "job.command:text:YES:",
     ];
 
-    assert_eq!(SCHEMA_VERSION, 8);
     jalari::migrate_to(&pool, &schema, 7).await.unwrap();
     let before = snapshot(&pool, &name).await;
     assert!(
@@ -175,7 +174,7 @@ async fn test_version_8_adds_the_lock_columns_and_constraints() {
             .iter()
             .all(|column| !before.iter().any(|row| row == column))
     );
-    jalari::migrate(&pool, &schema).await.unwrap();
+    jalari::migrate_to(&pool, &schema, 8).await.unwrap();
     let after = snapshot(&pool, &name).await;
     for column in columns {
         assert!(after.iter().any(|row| row == column), "{column}");
@@ -555,11 +554,277 @@ async fn test_prefixed_schema_places_tables_in_existing_schema() {
             "jalari_job",
             "jalari_job_control",
             "jalari_job_history",
+            "jalari_queue_pause",
             "jalari_recurring",
             "jalari_schema_version",
             "jalari_worker",
         ]
     );
+
+    drop_schema(&pool, &name).await;
+}
+
+fn sqlstate(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .map(|code| code.into_owned())
+}
+
+async fn execute(pool: &PgPool, sql: String) -> Result<(), sqlx::Error> {
+    sqlx::query(AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .map(drop)
+}
+
+async fn insert_job(pool: &PgPool, name: &str, state: &str, priority: i16) -> i64 {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "INSERT INTO \"{name}\".job (task, payload, state, priority, max_attempts)
+         VALUES ('shape', '\\x00', $1, $2, 3)
+         RETURNING id"
+    )))
+    .bind(state)
+    .bind(priority)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_version_9_adds_the_option_columns_and_the_pause_table() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    let columns = [
+        "job.parent_id:bigint:YES:",
+        "job.root_id:bigint:YES:",
+        "job.queue_key_limit:smallint:YES:",
+        "job.expires_at:timestamp with time zone:YES:",
+        "recurring.priority:smallint:NO:0",
+        "queue_pause.queue:text:NO:",
+        "queue_pause.paused_at:timestamp with time zone:NO:now()",
+    ];
+
+    assert_eq!(SCHEMA_VERSION, 9);
+    jalari::migrate_to(&pool, &schema, 8).await.unwrap();
+    let before = snapshot(&pool, &name).await;
+    assert!(
+        columns
+            .iter()
+            .all(|column| !before.iter().any(|row| row == column))
+    );
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let after = snapshot(&pool, &name).await;
+    for column in columns {
+        assert!(after.iter().any(|row| row == column), "{column}");
+    }
+    for index in ["job_parent_id_idx", "job_root_id_idx", "job_expires_at_idx"] {
+        assert!(
+            after
+                .iter()
+                .any(|row| row.starts_with(&format!("{index}:CREATE"))),
+            "{index}"
+        );
+    }
+    for constraint in [
+        "job_priority_check",
+        "job_lineage_check",
+        "job_queue_key_limit_check",
+        "job_queue_key_slot_check",
+    ] {
+        let definition = after
+            .iter()
+            .find(|row| row.starts_with(&format!("job.{constraint}:")))
+            .unwrap_or_else(|| panic!("{constraint} is missing"));
+        assert!(definition.ends_with("NOT VALID"), "{definition}");
+    }
+    assert!(
+        after
+            .iter()
+            .any(|row| row.starts_with("recurring.recurring_priority_check:"))
+    );
+
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
+async fn test_version_9_clamps_priorities_into_the_four_levels() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    jalari::migrate_to(&pool, &schema, 8).await.unwrap();
+    let waiting = insert_job(&pool, &name, "enqueued", 7).await;
+    let failed = insert_job(&pool, &name, "failed", -3).await;
+    let kept = insert_job(&pool, &name, "scheduled", 1).await;
+
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let priorities: Vec<(i64, i16)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT id, priority FROM \"{name}\".job ORDER BY id"
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(priorities, [(waiting, 2), (failed, -1), (kept, 1)]);
+
+    for statement in [
+        format!("UPDATE \"{name}\".job SET priority = 3 WHERE id = {waiting}"),
+        format!("UPDATE \"{name}\".job SET priority = -2 WHERE id = {waiting}"),
+        format!(
+            "INSERT INTO \"{name}\".recurring (name, cron, task, payload, max_attempts,
+                 next_run_at, priority)
+             VALUES ('nightly', '0 0 3 * * *', 'shape', '\\x00', 1, now(), 3)"
+        ),
+    ] {
+        let error = execute(&pool, statement.clone()).await.unwrap_err();
+        assert_eq!(sqlstate(&error).as_deref(), Some("23514"), "{statement}");
+    }
+    execute(
+        &pool,
+        format!("UPDATE \"{name}\".job SET priority = -1 WHERE id = {waiting}"),
+    )
+    .await
+    .unwrap();
+
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
+async fn test_upgrade_of_a_populated_version_8_matches_a_fresh_schema() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let upgraded_name = unique_schema_name();
+    let fresh_name = unique_schema_name();
+    let upgraded = Schema::named(&upgraded_name).unwrap();
+    let fresh = Schema::named(&fresh_name).unwrap();
+
+    jalari::migrate_to(&pool, &upgraded, 8).await.unwrap();
+    for (state, priority) in [
+        ("enqueued", 5),
+        ("scheduled", 0),
+        ("failed", -4),
+        ("stopped", 1),
+        ("succeeded", 0),
+    ] {
+        insert_job(&pool, &upgraded_name, state, priority).await;
+    }
+    execute(
+        &pool,
+        format!(
+            "INSERT INTO \"{upgraded_name}\".job (task, payload, state, max_attempts, queue_key,
+                 locked_by, locked_at, lock_token, queue_key_slot)
+             VALUES ('shape', '\\x00', 'running', 3, 'k', gen_random_uuid(), now(), 1, 0)"
+        ),
+    )
+    .await
+    .unwrap();
+    execute(
+        &pool,
+        format!(
+            "INSERT INTO \"{upgraded_name}\".recurring (name, cron, task, payload, max_attempts,
+                 next_run_at)
+             VALUES ('nightly', '0 0 3 * * *', 'shape', '\\x00', 1, now())"
+        ),
+    )
+    .await
+    .unwrap();
+    jalari::migrate(&pool, &upgraded).await.unwrap();
+    jalari::migrate(&pool, &fresh).await.unwrap();
+
+    assert_eq!(
+        snapshot(&pool, &upgraded_name).await,
+        snapshot(&pool, &fresh_name).await
+    );
+    let out_of_range: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"{upgraded_name}\".job WHERE priority NOT BETWEEN -1 AND 2"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(out_of_range, 0);
+    let recurring_priority: i16 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT priority FROM \"{upgraded_name}\".recurring"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recurring_priority, 0);
+
+    drop_schema(&pool, &upgraded_name).await;
+    drop_schema(&pool, &fresh_name).await;
+}
+
+#[tokio::test]
+async fn test_lineage_shape_is_enforced() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let id = insert_job(&pool, &name, "enqueued", 0).await;
+
+    for assignment in ["parent_id = 1", "root_id = 1"] {
+        let statement = format!("UPDATE \"{name}\".job SET {assignment} WHERE id = {id}");
+        let error = execute(&pool, statement).await.unwrap_err();
+        assert_eq!(sqlstate(&error).as_deref(), Some("23514"), "{assignment}");
+    }
+    execute(
+        &pool,
+        format!("UPDATE \"{name}\".job SET parent_id = 1, root_id = 1 WHERE id = {id}"),
+    )
+    .await
+    .unwrap();
+
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
+async fn test_slot_shape_is_enforced() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let unkeyed = insert_job(&pool, &name, "enqueued", 0).await;
+    let keyed = insert_job(&pool, &name, "enqueued", 0).await;
+    execute(
+        &pool,
+        format!("UPDATE \"{name}\".job SET queue_key = 'k' WHERE id = {keyed}"),
+    )
+    .await
+    .unwrap();
+    let running = |slot: i16, limit: Option<i16>| {
+        format!(
+            "UPDATE \"{name}\".job SET state = 'running', locked_by = gen_random_uuid(),
+                 locked_at = now(), lock_token = 1, queue_key_slot = {slot},
+                 queue_key_limit = {}
+             WHERE id = {keyed}",
+            limit.map_or("NULL".to_owned(), |limit| limit.to_string())
+        )
+    };
+
+    for statement in [
+        format!("UPDATE \"{name}\".job SET queue_key_limit = 2 WHERE id = {unkeyed}"),
+        format!("UPDATE \"{name}\".job SET queue_key_limit = 1 WHERE id = {keyed}"),
+        running(1, None),
+        running(2, Some(2)),
+        running(-1, Some(2)),
+    ] {
+        let error = execute(&pool, statement.clone()).await.unwrap_err();
+        assert_eq!(sqlstate(&error).as_deref(), Some("23514"), "{statement}");
+    }
+    for statement in [running(0, None), running(1, Some(2))] {
+        execute(&pool, statement.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
 
     drop_schema(&pool, &name).await;
 }

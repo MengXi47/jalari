@@ -9,7 +9,7 @@ pub const SCHEMA_VERSION: i32 = TEMPLATES[TEMPLATES.len() - 1].0;
 
 const LOCK_MODEL_VERSION: i32 = 8;
 
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 8] = [
     "job",
     "job_history",
     "job_control",
@@ -17,6 +17,7 @@ const TABLES: [&str; 7] = [
     "worker",
     "config",
     "schema_version",
+    "queue_pause",
 ];
 
 /// One version of the table structure as plain SQL.
@@ -194,6 +195,7 @@ fn render(template: &str, version: i32, schema: &Schema) -> String {
 mod tests {
     use super::*;
     use crate::JobState;
+    use crate::job::JOB_KEY_STATES;
 
     fn schemas() -> [Schema; 3] {
         [
@@ -276,6 +278,15 @@ mod tests {
             format!("('{}')", finished.join("', '")),
             JobState::finished_sql()
         );
+    }
+
+    #[test]
+    fn test_job_key_states_match_the_active_key_index() {
+        let indexed = states_after(
+            latest_defining("job_job_key_active_idx"),
+            "job_job_key_active_idx",
+        );
+        assert_eq!(format!("('{}')", indexed.join("', '")), JOB_KEY_STATES);
     }
 
     #[test]

@@ -431,7 +431,7 @@ async fn produce(
             production.rolled_back.push(id);
             continue;
         } else if roll < profile.rollback_percent + profile.priority_percent {
-            let priority = i16::try_from(rng.below(7)).unwrap() - 3;
+            let priority = i16::try_from(rng.below(4)).unwrap() - 1;
             submit_in(
                 &pool,
                 &job_table,
@@ -958,7 +958,7 @@ async fn check_mix(database: &Database) -> Vec<String> {
     for i in 0..20 {
         let queue = if i % 2 == 0 { "alpha" } else { "beta" };
         let queue_key = (i % 3 == 0).then(|| keys[i % keys.len()].as_str());
-        unknown.push(insert_unknown(database, queue, queue_key, 50).await);
+        unknown.push(insert_unknown(database, queue, queue_key, 2).await);
     }
     let workers = vec![
         RunningWorker::spawn(
@@ -1227,7 +1227,7 @@ async fn check_front_block(database: &Database) -> Vec<String> {
         for (queue_key, _) in holds {
             for _ in 0..front_per_key {
                 planned
-                    .push(enqueue_on(database, "gamma", Kind::Instant, Some(queue_key), 10).await);
+                    .push(enqueue_on(database, "gamma", Kind::Instant, Some(queue_key), 2).await);
             }
         }
         let unrelated = enqueue_on(database, "gamma", Kind::Instant, None, 0).await;
@@ -1313,7 +1313,7 @@ async fn check_locked_rows(database: &Database) -> Vec<String> {
     }
     let front_ids: Vec<i64> = front.iter().map(|job| job.id).collect();
     sqlx::query(AssertSqlSafe(format!(
-        "UPDATE {} SET priority = 10 WHERE id = ANY($1)",
+        "UPDATE {} SET priority = 2 WHERE id = ANY($1)",
         database.table("job")
     )))
     .bind(&front_ids)
