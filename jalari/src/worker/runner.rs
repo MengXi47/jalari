@@ -27,7 +27,12 @@ pub(super) const ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// Start as many workers as you like, in one process or many; they coordinate only through
 /// PostgreSQL. A job is claimed by exactly one worker at a time, and when a worker dies another
 /// worker runs its jobs again from their saved progress within seconds. A worker that loses its
-/// database connection aborts the jobs it was running before anyone else can start them.
+/// database connection aborts the jobs it was running before anyone else can start them; one
+/// frozen for 10 seconds or more is taken over while frozen and aborts its jobs as soon as it
+/// wakes up, because it stops trusting its lifeline 11 seconds after the last acknowledged
+/// heartbeat, before PostgreSQL can have ended that session and released it. Aborting is cooperative: a job stops at its next `.await`, and code that never
+/// yields, such as a blocking loop or a thread the job started, keeps running. The guide's
+/// "Crashes and lost connections" gives the timings.
 ///
 /// # Examples
 ///

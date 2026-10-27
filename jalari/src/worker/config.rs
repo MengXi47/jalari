@@ -8,8 +8,9 @@ const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timings of a single worker, set with [`WorkerBuilder::config`](crate::WorkerBuilder::config).
 ///
 /// Cluster-wide settings such as retention live in [`ClusterConfig`](crate::ClusterConfig). How
-/// fast a dead or frozen worker's jobs are taken over is fixed by jalari, not configured here; see
-/// the guide's "Crashes and lost connections".
+/// fast a dead or frozen worker's jobs are taken over is fixed by jalari, not configured here, and
+/// so is how long a worker keeps trying to record a finished job's outcome while the database
+/// does not answer: 30 seconds. See the guide's "Crashes and lost connections".
 ///
 /// # Examples
 ///
