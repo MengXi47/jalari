@@ -95,11 +95,12 @@ Every job moves through the same states:
 
 - **Add capacity by starting processes.** Workers coordinate only through the database and
   need no configuration to find each other.
-- **No job runs twice at once.** Other workers skip rows that are locked. A worker that loses
-  its database connection aborts its jobs within 3 seconds, and other workers wait 6 seconds
-  before running an interrupted job again.
-- **Crashes recover on their own.** When a worker dies, its jobs are released and another
-  worker runs them again within seconds.
+- **No job runs twice at once.** A running job is a `running` row that names its worker.
+  A worker that loses its database connection aborts its jobs within 3 seconds, and other
+  workers wait until it has.
+- **Crashes recover on their own.** When a worker dies, another worker runs its jobs again
+  from their saved progress 6 to 8 seconds later. A running job holds no connection or
+  transaction, so the pool stays small and VACUUM is never held back.
 - **Each scheduled run is enqueued once**, however many workers run the scheduler. If one
   stops, the others keep schedules firing.
 - **Run workers where you like** — inside your web server, or as separate binaries that serve

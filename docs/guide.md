@@ -112,6 +112,22 @@ enqueued by the old release then wait for workers of the old release. Let the qu
 before you stop the last old worker, or release the jobs with
 [`clear_fingerprint`](#jobs-that-wait-for-another-build) after the upgrade.
 
+Version 8 switches to the lock model of 0.7: a running job is a `running` row that names its
+worker, not a row locked by an open transaction. It adds five nullable columns to the job
+table (`locked_by`, `locked_at`, `lock_token`, `queue_key_slot` and `command`), the `running`
+and `discarded` states, an index of running jobs per worker and a unique index that keeps a
+`queue_key` to one running job, and it moves pending stop and cancel requests from
+`job_control` onto the job row. Every 0.6 process must stop before the upgrade, enqueuers
+included: a 0.6 worker does not know the running state, and a 0.6 enqueue with a `job_key`
+fails with `JobKeyContention` against a running job. The upgrade checks this where it can: it
+fails with `LockTimeout` and a message naming 0.6 while a 0.6 worker still runs a job, and
+changes nothing. It records the attempts that 0.6 workers left unfinished as interrupted and
+settles the requests they left pending, as a 0.6 worker would have. The new checks are added
+`NOT VALID`, since existing rows satisfy them by construction, so the upgrade does not scan
+the tables to validate them; run `ALTER TABLE ... VALIDATE CONSTRAINT` later if you want them
+marked valid. Building the indexes reads the job table and blocks writes to it until the
+upgrade commits.
+
 ## Defining jobs
 
 A job is a serializable struct with an `impl Job` inside `#[jalari::job]`. Its fields are the
@@ -254,13 +270,10 @@ Every enqueue returns a `jalari::EnqueueOutcome`:
 | `Replaced(id)` | The waiting job with the same `job_key` was overwritten |
 | `Running(id)` | The job with the same `job_key` is running and could not be replaced |
 
-`Replace` overwrites a job that is waiting, waiting for a retry, or claimed by a worker that
-has not started it yet; that claim is dropped. For a running job it waits about 100 ms before
-returning `Running`, so a worker that is only inspecting the job is not mistaken for one that
-runs it. If the job's last attempt was interrupted (see
-[Crashes and lost connections](#crashes-and-lost-connections)), the replace records the
-interruption, and the new payload waits the same 6 seconds as any interrupted job, together
-with the jobs sharing its `queue_key`. A dropped claim counts as an interrupted attempt. A job
+`Replace` overwrites a job that is waiting or waiting for a retry. A running job returns
+`Running` at once, including a job whose worker died less than about 8 seconds ago (see
+[Crashes and lost connections](#crashes-and-lost-connections)); once another worker records
+the interrupted attempt, the job is waiting again and the next `Replace` overwrites it. A job
 that is stopped, or has a pending stop or cancel, is never replaced and returns `Kept` (see
 [What a stop keeps and releases](#what-a-stop-keeps-and-releases)).
 
@@ -430,15 +443,17 @@ worker.run(shutdown).await;
 ```
 
 A worker runs every `#[jalari::job]` linked into its binary and only takes jobs from the
-queues it lists. Each running job holds one pooled connection, so the pool needs at least
-the sum of all concurrencies plus two; `build()` checks this.
+queues it lists. A running job holds no connection: workers use the pool only for the short
+statements that claim and finish jobs, so the concurrency does not depend on the pool size.
+The pool needs at least two connections, one for the notification listener and one for those
+statements; `build()` checks this. Each worker also opens one session of its own, its
+[lifeline](#crashes-and-lost-connections).
 
 | `jalari::WorkerConfig` field | Meaning | Default |
 |---|---|---|
 | `poll_interval` | Fallback check when no notification arrives | 5 s |
 | `shutdown_timeout` | How long shutdown waits for running jobs before aborting them | 30 s |
-| `max_claim_tries` | Jobs skipped per pass while their `queue_key` is busy | 10 |
-| `heartbeat_interval` | How often the worker reports that it is alive | 30 s |
+| `max_claim_tries` | Retries of a claim that lost a race for the same `queue_key` | 10 |
 | `stop_timeout` | How long a stopped or cancelled job may take to reach a checkpoint before it is aborted | 30 s |
 
 ### Retries
@@ -448,16 +463,18 @@ jitter. Implement `jalari::RetryPolicy` for a different strategy. A job is marke
 `MAX_ATTEMPTS` or returns a permanent error.
 
 An attempt is counted when it starts, so an attempt cut short by a crash counts too, unless it
-ends in a [stop or cancel](#stopping-restarting-and-cancelling). When a
-crashed worker's job is picked up again with no attempts left, it is marked failed with
-`the worker stopped during the last attempt` instead of running once more. This keeps a job
-that brings down its process from crashing workers forever.
+ends in a [stop or cancel](#stopping-restarting-and-cancelling). When another worker takes
+over a crashed worker's job with no attempts left, it marks the job failed with
+`the worker stopped during the last attempt` instead of running it once more. This keeps a
+job that brings down its process from crashing workers forever.
 
 ### Shutdown
 
 Cancelling the token stops the worker from claiming new jobs and waits for running ones.
-Jobs still running after `shutdown_timeout` are aborted and count as an attempt; another
-worker runs them again. A job that reaches a [checkpoint](#checkpoints) during the shutdown
+Jobs still running after `shutdown_timeout` are aborted and count as an attempt; the worker
+saves their progress and hands them back, and another worker runs them again 7 seconds later,
+so whatever the aborted run spawned has time to stop. A job that reaches a
+[checkpoint](#checkpoints) during the shutdown
 gets an error from it; when it returns that error, the job goes back to its queue without
 counting the attempt and keeps its saved progress.
 
@@ -480,32 +497,44 @@ in the job's own task, not in tasks it spawns.
 
 ### Crashes and lost connections
 
-When a worker process dies, PostgreSQL releases its jobs. The next worker that finds one
-records the interrupted attempt in the job history and runs the job again 6 seconds later. A
-`Replace` that finds the job does the same before it writes the new payload, so the new
-payload also waits 6 seconds.
+Each worker holds a lifeline: one session outside the pool, named
+`jalari lifeline <worker id>` in `pg_stat_activity`, that keeps an advisory lock on the worker's
+id and records a heartbeat every second. PostgreSQL itself ends a lifeline that stays silent for
+11 seconds, through `idle_session_timeout` and `tcp_user_timeout` set on that session only, and
+the lock goes with the session. Every worker checks every second, and once when it starts
+before it claims anything, for running jobs whose worker's lock is gone and whose last
+heartbeat is at least 7 seconds old, and takes them over.
 
-While a job runs, its worker checks the connection holding the job's lock every second. If
-that connection is lost (the database restarts, the network fails, or the session is ended by
-an administrator or by `idle_in_transaction_session_timeout`), the worker aborts the job
-within 3 seconds. Other workers wait 6 seconds before running an interrupted job again, so the
-old run has stopped before the new one starts. The wait also covers other jobs with the same
-`queue_key`, since the interrupted run may still hold on to that key. The guarantee holds as long as a worker process
-is not frozen for several seconds, for example by a virtual machine pause.
+| What happened | Old run stops | Job runs again |
+|---|---|---|
+| The worker process dies | at once | 6 to 8 s later |
+| The lifeline is ended while the process lives (database restart, `pg_terminate_backend`) | within about 1 s | 6 to 8 s later |
+| The worker freezes for less than 10 s | never; it continues | never |
+| The worker freezes for 10 s or more | when it wakes up | 10 to 12 s after the freeze began |
+| The network goes silent | within 3 s | 10 to 13 s after the failure |
 
-The same check keeps a long job's transaction busy, so `idle_in_transaction_session_timeout`
-never ends it while the job is still running. jalari sets that timeout to 10 seconds on the
-job's own transaction, overriding the pool's setting: if a worker freezes or the network fails
-without closing the connection, PostgreSQL ends the session after 10 seconds without a check,
-and another worker takes the job over about 16 seconds after the failure instead of waiting
-for TCP keepalives.
+A job taken over continues from the progress its [checkpoints](#checkpoints) last saved, and
+the interrupted attempt is recorded in the job history with
+`the worker stopped during the last attempt`. When that attempt was the job's last, the job
+fails instead. Jobs sharing the interrupted job's `queue_key` wait until it is taken over. A
+pending stop or cancel is settled at the takeover and the job does not run again.
+
+A worker whose heartbeat fails or times out aborts every job it runs, closes its lifeline and
+registers again under a new id. The 7 second wait covers the time such a worker needs to
+notice, so the old run has stopped before the new one starts. A worker frozen for 10 seconds or
+more, for example by a virtual machine pause, may still run code for a moment after it wakes
+and before it notices; the job's writes to the job tables are rejected, but its own side
+effects are not.
+
+If no worker runs at all, a dead worker's jobs stay `running` until a worker starts, and
+`jalari::admin::stranded()` lists them. Do not end lifeline sessions from scripts that clean up
+idle connections: every job of that worker is aborted and taken over.
 
 ## Stopping, restarting and cancelling
 
-A stop frees everything a job holds: its task, its pooled connection, the row lock and the
-`queue_key` its worker holds, and the worker's slot, plus whatever the job's own code holds as it
-returns. The job stays in the database as `stopped` until you restart or cancel it, also
-across worker restarts.
+A stop frees everything a job holds: its task, the `queue_key`, and the worker's slot, plus
+whatever the job's own code holds as it returns. The job stays in the database as `stopped`
+until you restart or cancel it, also across worker restarts.
 
 ```rust
 match jalari::stop(id).await? {
@@ -556,7 +585,7 @@ outside a job. A job that finishes discards its progress, and so does a `Replace
 | `cancel` | `Cancelled` at once | `Requested` | `Cancelled` | `Finished` |
 | `restart` | `NotStopped` | `NotStopped` | `Restarted` | `NotStopped` |
 
-An id with no job returns `NotFound`. A job whose worker crashed less than 6 seconds ago
+An id with no job returns `NotFound`. A job whose worker died less than about 8 seconds ago
 counts as running.
 
 A running job sees a request within about a second. How it ends:
@@ -567,7 +596,7 @@ A running job sees a request within about a second. How it ends:
 | Reaches no checkpoint within `stop_timeout` | aborted at its current `.await`, then `stopped` with the last saved progress |
 | Returns any other error, panics or times out | `stopped` (or `deleted`), not retried |
 | Returns `Ok` first | `succeeded`; a later `stop` returns `Finished` |
-| Its worker crashes | `stopped` (or `deleted`) by the next worker, after the usual 6 second delay; it never runs again |
+| Its worker crashes | `stopped` (or `deleted`) by another worker 6 to 8 seconds later; it never runs again |
 
 `stop` and `cancel` are safe to repeat and report the current state, so call them again until
 they stop returning `Requested`. A cancel wins over a stop that is still pending.
@@ -589,12 +618,10 @@ they stop returning `Requested`. A cancel wins over a stop that is still pending
 - The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
   work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
   outlive the stop, as with `TIMEOUT` and shutdown aborts.
-- `stop` on a crashed job in a queue no worker serves returns `Requested` until a worker
-  takes the queue, or until a later `stop` after the 6 second delay settles it.
 - A crash loses at most about 6 seconds of progress: one second before a copy is kept, and
   five before it is written.
-- During a rolling upgrade, workers of 0.3 fail `init` against the new tables, as with every
-  migration.
+- A job a worker aborted at shutdown keeps waiting the 7 seconds after the abort when it is
+  stopped and restarted or retried in between.
 
 ## Context and middleware
 
@@ -750,23 +777,35 @@ let pool = PgPoolOptions::new()
 ```
 
 The pool given to `jalari::init` may set session options such as `statement_timeout`, for
-example as `-c` startup options. jalari never changes a connection's session settings. It only
-uses `SET LOCAL`, which ends with its own transaction, so every connection returns to the pool
-with the values it had.
+example as `-c` startup options. jalari never changes a pooled connection's session settings,
+so every connection returns to the pool with the values it had.
 
-- A running job keeps one transaction open for its whole run. jalari sets
-  `idle_in_transaction_session_timeout` to 10 seconds in that transaction and turns off
-  `transaction_timeout` on PostgreSQL 17 and later, so neither setting on the pool limits how
-  long a job may run.
-- Every other jalari statement runs under the pool's settings, `statement_timeout` included.
-  None of them waits for long on its own. Jobs that share a `queue_key` are skipped while the
-  key is taken, not waited for.
+- A running job holds no connection and no transaction, so no pool setting limits how long a
+  job may run. Every jalari statement runs under the pool's settings, `statement_timeout`
+  included, and none of them waits for long on its own. Jobs that share a `queue_key` are
+  skipped while the key is taken, not waited for.
+- The lifeline is a pooled connection the worker detaches for good, so it inherits the pool's
+  connect options and `after_connect`. On that session alone the worker sets
+  `idle_session_timeout` and `tcp_user_timeout` to 11 seconds, `statement_timeout` to 2 seconds
+  and, on PostgreSQL 17 and later, `transaction_timeout` to 0.
 - An enqueue with a `job_key` waits while another open transaction is inserting or replacing
   a job with the same key, for example your own transaction that called `jalari::enqueue_in`.
   It fails with `jalari::ErrorKind::QueryCanceled` if the wait outlasts `statement_timeout`.
 - `jalari::migrate` waits for a concurrent migration, and an upgrade waits for running jobs as
   described in [Creating the tables](#creating-the-tables). Give it a pool without a short
   `statement_timeout`, or apply the SQL from `jalari sql` with your own migration tool.
+
+Because no jalari session keeps a transaction open while a job runs, a long job does not hold
+back the xmin horizon: VACUUM keeps removing dead rows in every table of the database, the
+job tables included. Before 0.7 every running job held a transaction for its whole run, which
+pinned the horizon for as long as the longest job.
+
+Workers need real PostgreSQL sessions: the lifeline's advisory lock and the notification
+listener live as long as their session. Point the pool at PostgreSQL directly or at a pooler
+in session mode. Behind a transaction pooler a dead worker's lock could survive on a server
+connection the pooler reuses, and its jobs would never be taken over; `build()` checks that a
+session keeps its advisory lock across statements and fails with `NoSessionConnection`
+otherwise, but it cannot catch every pooler configuration.
 
 A job's writes to your own tables commit separately from jalari marking it done. If the worker
 dies in between, the job runs again, so make those writes idempotent, for example with a table
@@ -828,9 +867,9 @@ jalari::cluster::update(|cluster| {
 | `housekeeping_enabled` | Delete finished jobs after their retention | off |
 | `housekeeping_interval` | How often the cleanup runs across the cluster | 10 min |
 | `succeeded_retention` | How long succeeded jobs are kept | 1 day |
-| `deleted_retention` | How long deleted jobs are kept | 7 days |
-| `failed_retention` | How long failed jobs are kept; `None` keeps them. A job with a `queue_key` whose last attempt was interrupted stays at least 6 s | `None` |
-| `worker_timeout` | Missed-heartbeat time before a worker leaves the list | 5 min |
+| `deleted_retention` | How long deleted and discarded jobs are kept | 7 days |
+| `failed_retention` | How long failed jobs are kept; `None` keeps them | `None` |
+| `worker_timeout` | Missed-heartbeat time before a worker leaves the list; departed workers are deleted after it or 12 s, whichever is longer. Takeover does not depend on it | 5 min |
 
 Workers apply changes immediately. One worker per interval performs the cleanup, deleting in
 small batches. Waiting jobs are never deleted, however old.
@@ -859,8 +898,10 @@ for queue in jalari::admin::throughput(Duration::from_secs(3600)).await? {
 ```
 
 If no listed worker has `scheduler` set, recurring schedules are not firing. `stats` counts
-the jobs in every queue by state; `throughput` sums up the job history of the last window,
-so it only sees as far back as the retention housekeeping keeps.
+the jobs in every queue by state, `running` included; `throughput` sums up the job history of
+the last window, so it only sees as far back as the retention housekeeping keeps. A running
+job's `JobInfo` names the worker in `worker_id`, when its attempt started in `running_since`,
+and a stop or cancel it has not acted on yet in `pending`.
 
 ### Jobs that wait for another build
 
@@ -878,7 +919,9 @@ let released = jalari::admin::clear_fingerprint(&filter).await?;
 [code fingerprint](#code-fingerprints). A job is listed when no worker with a recent heartbeat
 both processes its queue and runs its task at a matching fingerprint. A job whose task no
 running binary knows is listed too. Jobs that only wait for a busy worker are not listed. A worker of
-a release before migration 7 counts as able to run every task of its queues. Each worker logs
+a release before migration 7 counts as able to run every task of its queues. Running jobs are
+listed when their worker's heartbeat is older than the cluster's `worker_timeout`, which only
+happens when no live worker is left to take them over. Each worker logs
 a warning for the groups in its own queues when it starts and every five minutes after: `no
 live worker runs these jobs, enqueued by another build of the task` when the worker knows the
 task, and `no live worker knows this task` when no running binary links it. Both carry the
@@ -944,9 +987,9 @@ does the same for every failed job matching the filter, in batches of 100 that e
 their own. Both give each job the [code fingerprint](#code-fingerprints) of the caller's build
 when the caller links the job's task, and keep the stored one otherwise. `run_now` makes a
 scheduled job, or a retry waiting for its backoff, due now; a
-running job, or one interrupted less than 6 seconds ago, is reported as `Running` and left
-alone. To delete a job, [`cancel`](#stopping-restarting-and-cancelling) it: a waiting or stopped
-job is marked deleted at once, a running one once it stops.
+running job, or one a worker aborted at shutdown less than 7 seconds ago, is reported as
+`Running` and left alone. To delete a job, [`cancel`](#stopping-restarting-and-cancelling)
+it: a waiting or stopped job is marked deleted at once, a running one once it stops.
 
 ## Errors
 
