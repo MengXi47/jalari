@@ -175,17 +175,12 @@ pub async fn restart(id: JobId) -> Result<RestartOutcome> {
              WHERE id = $1 AND state = 'stopped'
              RETURNING id, state, attempts, queue
          ),
-         cleared AS (
-             UPDATE {job_control} SET command = NULL, updated_at = statement_timestamp()
-             WHERE job_id IN (SELECT id FROM restarted) AND command = 'stop'
-         ),
          logged AS (
              INSERT INTO {job_history} (job_id, state, attempt, created_at)
              SELECT id, state, attempts, statement_timestamp() FROM restarted
          )
          SELECT queue FROM restarted",
         job = schema.table("job"),
-        job_control = schema.table("job_control"),
         job_history = schema.table("job_history"),
     )))
     .bind(id.0)
@@ -208,104 +203,57 @@ pub async fn restart(id: JobId) -> Result<RestartOutcome> {
 async fn send(id: JobId, command: Command) -> Result<Answer> {
     let config = config()?;
     let schema = &config.schema;
-    let mut transaction = config.pool.pool().begin().await?;
-    let answer = match job_state(&mut transaction, schema, id).await? {
-        None => Answer::NotFound,
-        Some((state, _)) if is_finished(&state) => Answer::Finished,
-        Some((state, _)) if state == "stopped" && command == Command::Stop => Answer::Stopped,
-        Some(_) => apply(&mut transaction, schema, id, command).await?,
-    };
-    transaction.commit().await?;
-    Ok(answer)
-}
-
-async fn apply(
-    connection: &mut PgConnection,
-    schema: &Schema,
-    id: JobId,
-    command: Command,
-) -> Result<Answer> {
-    let pending: String = sqlx::query_scalar(AssertSqlSafe(format!(
-        "INSERT INTO {job_control} AS control (job_id, command) VALUES ($1, $2)
-         ON CONFLICT (job_id) DO UPDATE
-         SET command = CASE WHEN control.command = 'cancel' THEN 'cancel'
-                 ELSE EXCLUDED.command END,
-             updated_at = statement_timestamp()
-         RETURNING command",
-        job_control = schema.table("job_control"),
-    )))
-    .bind(id.0)
-    .bind(command.as_str())
-    .fetch_one(&mut *connection)
-    .await?;
-    let pending = Command::parse(&pending).unwrap_or(command);
-
-    let settled: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-        "WITH idle AS (
-             SELECT id FROM {job}
-             WHERE id = $1
-                 AND (state IN ('scheduled', 'enqueued') OR (state = 'stopped' AND $2 = 'cancel'))
-             FOR NO KEY UPDATE SKIP LOCKED
-         ),
-         settled AS (
-             UPDATE {job}
-             SET state = CASE WHEN $2 = 'cancel' THEN 'deleted' ELSE 'stopped' END,
-                 updated_at = statement_timestamp()
-             WHERE id IN (SELECT id FROM idle)
-             RETURNING id, state, attempts
+    let pool = config.pool.pool();
+    let sql = format!(
+        "WITH changed AS (
+             UPDATE {job} AS job
+             SET command = CASE WHEN job.state = 'running'
+                     THEN CASE WHEN job.command = 'cancel' THEN 'cancel' ELSE $2 END END,
+                 state = CASE WHEN job.state = 'running' THEN 'running'
+                     WHEN $2 = 'cancel' THEN 'deleted' ELSE 'stopped' END,
+                 updated_at = CASE WHEN job.state = 'running' THEN job.updated_at
+                     ELSE statement_timestamp() END
+             WHERE job.id = $1
+                 AND (job.state IN ('scheduled', 'enqueued', 'running')
+                     OR (job.state = 'stopped' AND $2 = 'cancel'))
+             RETURNING job.id, job.state, job.attempts
          ),
          logged AS (
              INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
-             SELECT id, state, attempts, $3, statement_timestamp() FROM settled
+             SELECT id, state, attempts, $3, statement_timestamp() FROM changed
+             WHERE state <> 'running'
          ),
          cleared AS (
              UPDATE {job_control}
-             SET command = NULL, lease = lease + 1,
+             SET lease = lease + 1,
                  progress = CASE WHEN $2 = 'cancel' THEN NULL ELSE progress END,
                  updated_at = statement_timestamp()
-             WHERE job_id IN (SELECT id FROM settled)
+             WHERE job_id IN (SELECT id FROM changed WHERE state <> 'running')
          )
-         SELECT state FROM settled",
+         SELECT (SELECT state FROM changed) AS changed,
+             (SELECT state FROM {job} WHERE id = $1) AS current",
         job = schema.table("job"),
         job_history = schema.table("job_history"),
         job_control = schema.table("job_control"),
-    )))
-    .bind(id.0)
-    .bind(pending.as_str())
-    .bind(pending.message())
-    .fetch_optional(&mut *connection)
-    .await?;
-    if settled.is_some() {
-        return Ok(if pending == command {
-            Answer::Applied
-        } else {
-            Answer::Finished
-        });
+    );
+    loop {
+        let (changed, current): (Option<String>, Option<String>) =
+            sqlx::query_as(AssertSqlSafe(sql.as_str()))
+                .bind(id.0)
+                .bind(command.as_str())
+                .bind(command.message())
+                .fetch_one(&pool)
+                .await?;
+        let answer = match (changed.as_deref(), current.as_deref()) {
+            (Some("running"), _) => Answer::Requested,
+            (Some(_), _) => Answer::Applied,
+            (None, None) => Answer::NotFound,
+            (None, Some("stopped")) => Answer::Stopped,
+            (None, Some(state)) if is_finished(state) => Answer::Finished,
+            (None, Some(_)) => continue,
+        };
+        return Ok(answer);
     }
-
-    let answer = match job_state(connection, schema, id).await? {
-        Some((state, queue)) if state == "scheduled" || state == "enqueued" => {
-            notify(connection, schema, &queue).await?;
-            return Ok(Answer::Requested);
-        }
-        Some((state, _)) if state == "running" => return Ok(Answer::Requested),
-        Some((state, _)) if state == "stopped" => match command {
-            Command::Stop => Answer::Stopped,
-            Command::Cancel => return Ok(Answer::Requested),
-        },
-        Some(_) => Answer::Finished,
-        None => Answer::NotFound,
-    };
-    sqlx::query(AssertSqlSafe(format!(
-        "UPDATE {job_control} SET command = NULL, updated_at = statement_timestamp()
-         WHERE job_id = $1 AND command = $2",
-        job_control = schema.table("job_control"),
-    )))
-    .bind(id.0)
-    .bind(command.as_str())
-    .execute(connection)
-    .await?;
-    Ok(answer)
 }
 
 async fn job_state(

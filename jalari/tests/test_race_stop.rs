@@ -1425,12 +1425,10 @@ async fn watch_commands(
         let pending: Vec<(i64, String, Option<String>, i32, f64, String)> =
             match sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT job.id, job.state, job.last_error, job.attempts,
-                     EXTRACT(EPOCH FROM job.run_at - now())::float8, control.command
-                 FROM {job} AS job JOIN {control} AS control ON control.job_id = job.id
-                 WHERE job.state IN ('scheduled', 'enqueued') AND control.command IS NOT NULL
-                     AND job.queue = ANY($1)",
+                     EXTRACT(EPOCH FROM job.run_at - now())::float8, job.command
+                 FROM {job} AS job
+                 WHERE job.command IS NOT NULL AND job.queue = ANY($1)",
                 job = database.table("job"),
-                control = database.table("job_control"),
             )))
             .bind(&queues)
             .fetch_all(&database.pool)
@@ -1576,12 +1574,11 @@ async fn check_storm(database: &Database, seed: u64) -> Vec<String> {
         }
         if Instant::now() >= settle_deadline {
             let rows: Vec<StuckRow> = sqlx::query_as(AssertSqlSafe(format!(
-                "SELECT job.id, job.state, job.attempts, job.last_error, control.command
-                     FROM {job} AS job LEFT JOIN {control} AS control ON control.job_id = job.id
+                "SELECT job.id, job.state, job.attempts, job.last_error, job.command
+                     FROM {job} AS job
                      WHERE job.id = ANY($1)
                          AND job.state IN ('scheduled', 'enqueued', 'running', 'stopped')",
                 job = database.table("job"),
-                control = database.table("job_control"),
             )))
             .bind(&ids)
             .fetch_all(&database.pool)
@@ -1835,10 +1832,10 @@ async fn audit(label: &str, database: &Database, ids: &[i64], strict: bool) -> V
         }
     }
     let leftovers: Vec<LeftoverRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT job.id, job.state, control.command, control.progress IS NOT NULL, job.last_error
+        "SELECT job.id, job.state, job.command, control.progress IS NOT NULL, job.last_error
          FROM {job} AS job JOIN {control} AS control ON control.job_id = job.id
          WHERE job.id = ANY($1)
-             AND (control.progress IS NOT NULL OR control.command IS NOT NULL)
+             AND (control.progress IS NOT NULL OR job.command IS NOT NULL)
              AND job.state IN ('succeeded', 'failed', 'deleted')",
         job = database.table("job"),
         control = database.table("job_control"),

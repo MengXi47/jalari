@@ -296,6 +296,109 @@ async fn test_version_8_records_attempts_a_0_6_worker_left_unfinished() {
     drop_schema(&pool, &name).await;
 }
 
+async fn insert_legacy_command(pool: &PgPool, name: &str, id: i64, command: &str) {
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO \"{name}\".job_control (job_id, command, progress)
+         VALUES ($1, $2, '{{\"step\": 3}}')"
+    )))
+    .bind(id)
+    .bind(command)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn settled_shape(
+    pool: &PgPool,
+    name: &str,
+    id: i64,
+) -> (String, i32, Vec<(String, i32, String)>) {
+    let (state, attempts): (String, i32) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT state, attempts FROM \"{name}\".job WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let history: Vec<(String, i32, String)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT state, attempt, error FROM \"{name}\".job_history WHERE job_id = $1 ORDER BY id"
+    )))
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (state, attempts, history)
+}
+
+#[tokio::test]
+async fn test_version_8_settles_requests_a_0_6_worker_left_pending() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    jalari::migrate_to(&pool, &schema, 7).await.unwrap();
+    let stopped_mid_attempt = insert_legacy_job(&pool, &name, 2, 3).await;
+    insert_legacy_command(&pool, &name, stopped_mid_attempt, "stop").await;
+    let exhausted_and_cancelled = insert_legacy_job(&pool, &name, 3, 3).await;
+    insert_legacy_command(&pool, &name, exhausted_and_cancelled, "cancel").await;
+    let cancelled_while_stopped = insert_legacy_job(&pool, &name, 0, 3).await;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE \"{name}\".job SET state = 'stopped' WHERE id = $1"
+    )))
+    .bind(cancelled_while_stopped)
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_legacy_command(&pool, &name, cancelled_while_stopped, "cancel").await;
+
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let stop = "the job was asked to stop".to_owned();
+    let cancel = "the job was asked to cancel".to_owned();
+    assert_eq!(
+        settled_shape(&pool, &name, stopped_mid_attempt).await,
+        (
+            "stopped".to_owned(),
+            1,
+            vec![("stopped".to_owned(), 1, stop)]
+        )
+    );
+    assert_eq!(
+        settled_shape(&pool, &name, exhausted_and_cancelled).await,
+        (
+            "deleted".to_owned(),
+            2,
+            vec![("deleted".to_owned(), 2, cancel.clone())]
+        )
+    );
+    assert_eq!(
+        settled_shape(&pool, &name, cancelled_while_stopped).await,
+        (
+            "deleted".to_owned(),
+            0,
+            vec![("deleted".to_owned(), 0, cancel)]
+        )
+    );
+    let progress: Vec<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT progress::text FROM \"{name}\".job_control ORDER BY job_id"
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(progress, [Some("{\"step\": 3}".to_owned()), None, None]);
+    let command_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = 'job_control' AND column_name = 'command')",
+    )
+    .bind(&name)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!command_column);
+
+    drop_schema(&pool, &name).await;
+}
+
 #[tokio::test]
 async fn test_version_8_refuses_to_run_while_a_0_6_job_runs() {
     let Some(pool) = test_pool().await else {

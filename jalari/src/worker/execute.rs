@@ -67,9 +67,6 @@ impl Shared {
                 incarnation.dead().child_token(),
             ));
             let registration = pending.register(claimed.hold.clone(), Arc::clone(&control));
-            if let Some(command) = claimed.command {
-                control.request(command);
-            }
             if control.lost().is_cancelled() {
                 return;
             }

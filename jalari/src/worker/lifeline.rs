@@ -248,13 +248,11 @@ impl Lifeline {
                  WHERE id = $1::uuid
                  RETURNING id
              )
-             SELECT job.id, job.lock_token, control.command
+             SELECT job.id, job.lock_token, job.command
              FROM beat
-             LEFT JOIN {job} AS job ON job.locked_by = beat.id AND job.state = 'running'
-             LEFT JOIN {job_control} AS control ON control.job_id = job.id",
+             LEFT JOIN {job} AS job ON job.locked_by = beat.id AND job.state = 'running'",
             worker = schema.table("worker"),
             job = schema.table("job"),
-            job_control = schema.table("job_control"),
         )))
         .bind(&*self.incarnation.worker_id)
         .fetch_all(&mut self.connection)

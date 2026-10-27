@@ -353,8 +353,8 @@ impl Reader {
 
     async fn command(&self, database: &Database, id: i64) -> Option<String> {
         sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(format!(
-            "SELECT command FROM {} WHERE job_id = $1",
-            database.table("job_control")
+            "SELECT command FROM {} WHERE id = $1",
+            database.table("job")
         )))
         .bind(id)
         .fetch_optional(&self.pool)

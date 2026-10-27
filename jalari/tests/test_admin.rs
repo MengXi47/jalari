@@ -413,7 +413,7 @@ async fn check_detail_follows_a_job(fixture: &Fixture) {
     assert_eq!(detail.job.state, JobState::Running);
     assert!(detail.job.worker_id.is_some());
     assert!(detail.job.running_since.is_some());
-    assert_eq!(detail.control.unwrap().pending, Some(Command::Stop));
+    assert_eq!(detail.job.pending, Some(Command::Stop));
     assert_eq!(admin::run_now(held).await.unwrap(), RunNowOutcome::Running);
     GATE_OPEN.store(true, Ordering::SeqCst);
     fixture.wait_for_state(held, "succeeded").await;

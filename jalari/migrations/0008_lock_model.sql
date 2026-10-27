@@ -17,30 +17,53 @@ ALTER TABLE {job} ADD COLUMN IF NOT EXISTS queue_key_slot SMALLINT;
 
 ALTER TABLE {job} ADD COLUMN IF NOT EXISTS command TEXT;
 
-WITH unfinished AS (
-    SELECT job.id,
-        EXISTS (
-            SELECT 1 FROM {job_control} AS control
-            WHERE control.job_id = job.id AND control.command IS NOT NULL
-        ) AS commanded
+ALTER TABLE {job_control} ADD COLUMN IF NOT EXISTS command TEXT;
+
+WITH pending AS (
+    SELECT job.id, control.command,
+        job.state IN ('scheduled', 'enqueued') AND job.attempts > 0 AND NOT EXISTS (
+            SELECT 1 FROM {job_history} AS history
+            WHERE history.job_id = job.id AND history.attempt = job.attempts
+                AND history.created_at >= job.updated_at
+        ) AS unfinished
     FROM {job} AS job
+    JOIN {job_control} AS control ON control.job_id = job.id
+    WHERE control.command IS NOT NULL
+        AND (job.state IN ('scheduled', 'enqueued')
+            OR (job.state = 'stopped' AND control.command = 'cancel'))
+),
+settled AS (
+    UPDATE {job} AS job
+    SET state = CASE WHEN pending.command = 'cancel' THEN 'deleted' ELSE 'stopped' END,
+        attempts = CASE WHEN pending.unfinished THEN job.attempts - 1 ELSE job.attempts END,
+        updated_at = now()
+    FROM pending
+    WHERE job.id = pending.id
+    RETURNING job.id, job.state, job.attempts
+),
+cleared AS (
+    UPDATE {job_control} SET lease = lease + 1, progress = NULL, updated_at = now()
+    WHERE job_id IN (SELECT id FROM settled WHERE state = 'deleted')
+)
+INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
+SELECT id, state, attempts,
+    CASE WHEN state = 'deleted' THEN 'the job was asked to cancel'
+        ELSE 'the job was asked to stop' END,
+    now()
+FROM settled;
+
+WITH interrupted AS (
+    UPDATE {job} AS job
+    SET state = CASE WHEN job.attempts >= job.max_attempts THEN 'failed' ELSE 'scheduled' END,
+        last_error = 'the worker stopped during the last attempt',
+        run_at = now(),
+        updated_at = now()
     WHERE job.state IN ('scheduled', 'enqueued') AND job.attempts > 0
         AND NOT EXISTS (
             SELECT 1 FROM {job_history} AS history
             WHERE history.job_id = job.id AND history.attempt = job.attempts
                 AND history.created_at >= job.updated_at
         )
-),
-interrupted AS (
-    UPDATE {job} AS job
-    SET state = CASE WHEN job.attempts >= job.max_attempts AND NOT unfinished.commanded
-            THEN 'failed' ELSE 'scheduled' END,
-        attempts = CASE WHEN unfinished.commanded THEN job.attempts - 1 ELSE job.attempts END,
-        last_error = 'the worker stopped during the last attempt',
-        run_at = now(),
-        updated_at = now()
-    FROM unfinished
-    WHERE job.id = unfinished.id
     RETURNING job.id, job.state, job.attempts
 ),
 cleared AS (
@@ -50,6 +73,8 @@ cleared AS (
 INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
 SELECT id, state, attempts, 'the worker stopped during the last attempt', now()
 FROM interrupted;
+
+ALTER TABLE {job_control} DROP COLUMN IF EXISTS command;
 
 ALTER TABLE {job} DROP CONSTRAINT IF EXISTS job_state_check;
 

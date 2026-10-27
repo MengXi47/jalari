@@ -30,7 +30,6 @@ struct ClaimedRow {
     context: Option<Value>,
     lease: i64,
     progress: Option<Value>,
-    command: Option<String>,
 }
 
 pub(super) struct Claimed {
@@ -43,7 +42,6 @@ pub(super) struct Claimed {
     pub(super) context: Option<Value>,
     pub(super) lease: i64,
     pub(super) progress: Option<Value>,
-    pub(super) command: Option<Command>,
 }
 
 pub(super) enum Closed {
@@ -119,14 +117,14 @@ impl Shared {
                      claimed.max_attempts, claimed.timeout_ms, claimed.context
              ),
              control AS (
-                 SELECT control.job_id, control.lease, control.progress, control.command
+                 SELECT control.job_id, control.lease, control.progress
                  FROM {job_control} AS control
                  WHERE control.job_id IN (SELECT id FROM claimed)
                  FOR SHARE
              )
              SELECT claimed.id, claimed.task, claimed.payload, claimed.attempts,
                  claimed.max_attempts, claimed.timeout_ms, claimed.context,
-                 coalesce(control.lease, 0) AS lease, control.progress, control.command
+                 coalesce(control.lease, 0) AS lease, control.progress
              FROM claimed
              LEFT JOIN control ON control.job_id = claimed.id",
             job = schema.table("job"),
@@ -166,7 +164,6 @@ impl Shared {
                     context: row.context,
                     lease: row.lease,
                     progress: row.progress,
-                    command: row.command.as_deref().and_then(Command::parse),
                 };
                 (claimed, pending)
             }));
@@ -191,11 +188,10 @@ pub(super) async fn close(
              SET state = $4, attempts = $5,
                  last_error = CASE WHEN $6 THEN $7 ELSE last_error END,
                  run_at = coalesce(statement_timestamp() + $8, run_at),
-                 updated_at = statement_timestamp(),
+                 updated_at = statement_timestamp(), command = NULL,
                  locked_by = NULL, locked_at = NULL, lock_token = NULL, queue_key_slot = NULL
              WHERE id = $1 AND locked_by = $2::uuid AND lock_token = $3
-                 AND (SELECT control.command FROM {job_control} AS control
-                     WHERE control.job_id = $1) IS NOT DISTINCT FROM $9
+                 AND command IS NOT DISTINCT FROM $9
              RETURNING id
          ),
          logged AS (
@@ -206,15 +202,12 @@ pub(super) async fn close(
              INSERT INTO {job_control} AS control (job_id, lease, progress)
              SELECT id, 1, $13 FROM closed WHERE $14
              ON CONFLICT (job_id) DO UPDATE
-             SET lease = control.lease + 1,
-                 command = CASE WHEN control.command IS NOT DISTINCT FROM $9 THEN NULL
-                     ELSE control.command END,
-                 progress = EXCLUDED.progress, updated_at = statement_timestamp()
+             SET lease = control.lease + 1, progress = EXCLUDED.progress,
+                 updated_at = statement_timestamp()
          ),
          bumped AS (
              UPDATE {job_control}
              SET lease = lease + 1,
-                 command = CASE WHEN command IS NOT DISTINCT FROM $9 THEN NULL ELSE command END,
                  progress = CASE WHEN $12 THEN NULL ELSE progress END,
                  updated_at = statement_timestamp()
              WHERE job_id IN (SELECT id FROM closed) AND NOT $14
@@ -244,10 +237,8 @@ pub(super) async fn close(
         return Ok(Closed::Written);
     }
     let command: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT (SELECT control.command FROM {job_control} AS control WHERE control.job_id = $1)
-         FROM {job} WHERE id = $1 AND locked_by = $2::uuid AND lock_token = $3",
+        "SELECT command FROM {job} WHERE id = $1 AND locked_by = $2::uuid AND lock_token = $3",
         job = schema.table("job"),
-        job_control = schema.table("job_control"),
     )))
     .bind(hold.job_id)
     .bind(&*hold.worker_id)
@@ -301,7 +292,7 @@ pub(super) async fn interrupt(
                  WHERE pg_try_advisory_xact_lock(hashtextextended($4 || suspects.id::text, 0))
              ),
              doomed AS (
-                 SELECT job.id FROM {job} AS job
+                 SELECT job.id, job.command FROM {job} AS job
                  WHERE job.state = 'running' AND job.locked_by IN (SELECT id FROM dead)
                  ORDER BY job.id
                  LIMIT $6
@@ -310,7 +301,7 @@ pub(super) async fn interrupt(
         ),
         Target::Orphans(_) | Target::Shutdown(_) => format!(
             "doomed AS (
-                 SELECT job.id FROM {job} AS job
+                 SELECT job.id, job.command FROM {job} AS job
                  JOIN unnest($3::bigint[], $4::text[], $5::bigint[]) AS hold (job_id, worker_id, token)
                      ON job.id = hold.job_id AND job.locked_by = hold.worker_id::uuid
                          AND job.lock_token = hold.token
@@ -322,26 +313,23 @@ pub(super) async fn interrupt(
     };
     let sql = format!(
         "WITH {doomed},
-         commanded AS (
-             SELECT doomed.id, control.command FROM doomed
-             LEFT JOIN {job_control} AS control ON control.job_id = doomed.id
-         ),
          marked AS (
              UPDATE {job} AS job
-             SET state = CASE WHEN commanded.command = 'cancel' THEN 'deleted'
-                     WHEN commanded.command = 'stop' THEN 'stopped'
+             SET state = CASE WHEN doomed.command = 'cancel' THEN 'deleted'
+                     WHEN doomed.command = 'stop' THEN 'stopped'
                      WHEN job.attempts >= job.max_attempts THEN 'failed'
                      ELSE 'scheduled' END,
-                 attempts = CASE WHEN commanded.command IS NULL THEN job.attempts
+                 attempts = CASE WHEN doomed.command IS NULL THEN job.attempts
                      ELSE job.attempts - 1 END,
                  last_error = $1,
                  run_at = statement_timestamp() + $2,
+                 command = NULL,
                  locked_by = NULL, locked_at = NULL, lock_token = NULL, queue_key_slot = NULL,
                  updated_at = statement_timestamp()
-             FROM commanded
-             WHERE job.id = commanded.id
+             FROM doomed
+             WHERE job.id = doomed.id
              RETURNING job.id, job.task, job.queue, job.state, job.attempts,
-                 commanded.command IS NOT NULL AS commanded
+                 doomed.command IS NOT NULL AS commanded
          ),
          logged AS (
              INSERT INTO {job_history} (job_id, state, attempt, error, created_at)
@@ -351,7 +339,7 @@ pub(super) async fn interrupt(
              INSERT INTO {job_control} AS control (job_id, lease)
              SELECT id, 1 FROM marked ORDER BY id
              ON CONFLICT (job_id) DO UPDATE
-             SET lease = control.lease + 1, command = NULL,
+             SET lease = control.lease + 1,
                  progress = CASE WHEN control.job_id IN (
                          SELECT id FROM marked WHERE state IN ('failed', 'deleted'))
                      THEN NULL ELSE control.progress END,

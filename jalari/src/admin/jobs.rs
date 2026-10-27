@@ -14,7 +14,7 @@ const MAX_PAGE: u32 = 1000;
 
 pub(crate) const JOB_COLUMNS: &str = "id, queue, task, state, codec, payload, job_key, queue_key, \
      priority, attempts, max_attempts, run_at, timeout_ms, last_error, context, fingerprint, \
-     locked_by::text AS worker_id, locked_at AS running_since, created_at, updated_at";
+     locked_by::text AS worker_id, locked_at AS running_since, command, created_at, updated_at";
 
 pub(crate) const FILTER_SQL: &str = "($1::text[] IS NULL OR state = ANY($1))
     AND ($2::text IS NULL OR queue = $2)
@@ -182,6 +182,9 @@ pub struct JobInfo {
     pub worker_id: Option<String>,
     /// When the current attempt started; `None` unless the job is running.
     pub running_since: Option<DateTime<Utc>>,
+    /// A [`stop`](crate::stop) or [`cancel`](crate::cancel) the running job has not acted on
+    /// yet.
+    pub pending: Option<Command>,
     /// When the job was enqueued.
     pub created_at: DateTime<Utc>,
     /// When the state last changed.
@@ -231,6 +234,7 @@ pub(crate) struct JobRow {
     fingerprint: Option<String>,
     worker_id: Option<String>,
     running_since: Option<DateTime<Utc>>,
+    command: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -258,6 +262,7 @@ impl JobRow {
             fingerprint: self.fingerprint,
             worker_id: self.worker_id,
             running_since: self.running_since,
+            pending: self.command.as_deref().and_then(Command::parse),
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -289,12 +294,10 @@ struct HistoryRow {
     created_at: DateTime<Utc>,
 }
 
-/// What [`stop`](crate::stop), [`cancel`](crate::cancel) and checkpoints recorded for a job.
+/// Progress that [`checkpoint`](crate::checkpoint)s saved for a job.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlInfo {
-    /// Request a worker has not acted on yet.
-    pub pending: Option<Command>,
     /// Progress saved at the job's last checkpoint, kept while it waits or is stopped.
     pub progress: Option<Value>,
     /// Incremented each time the job's lease changes hands.
@@ -305,7 +308,6 @@ pub struct ControlInfo {
 
 #[derive(sqlx::FromRow)]
 struct ControlRow {
-    command: Option<String>,
     progress: Option<Value>,
     lease: i64,
     updated_at: DateTime<Utc>,
@@ -319,7 +321,7 @@ pub struct JobDetail {
     pub job: JobInfo,
     /// Every state change, oldest first.
     pub history: Vec<HistoryEntry>,
-    /// Pending request and saved progress; `None` when nothing was ever recorded.
+    /// Saved progress; `None` when nothing was ever recorded.
     pub control: Option<ControlInfo>,
 }
 
@@ -519,7 +521,7 @@ pub async fn job(id: JobId) -> Result<Option<JobDetail>> {
     .fetch_all(&mut *connection)
     .await?;
     let control: Option<ControlRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT command, progress, lease, updated_at FROM {job_control} WHERE job_id = $1",
+        "SELECT progress, lease, updated_at FROM {job_control} WHERE job_id = $1",
         job_control = schema.table("job_control"),
     )))
     .bind(id.0)
@@ -543,7 +545,6 @@ pub async fn job(id: JobId) -> Result<Option<JobDetail>> {
         job,
         history,
         control: control.map(|row| ControlInfo {
-            pending: row.command.as_deref().and_then(Command::parse),
             progress: row.progress,
             lease: row.lease,
             updated_at: row.updated_at,

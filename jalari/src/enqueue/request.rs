@@ -235,10 +235,8 @@ impl EnqueueRequest {
     ) -> Result<Replacement> {
         let sql = format!(
             "WITH target AS (
-                 SELECT job.id, job.state, job.state = 'stopped' OR EXISTS (
-                         SELECT 1 FROM {job_control} AS control
-                         WHERE control.job_id = job.id AND control.command IS NOT NULL
-                     ) AS kept,
+                 SELECT job.id, job.state,
+                     job.state = 'stopped' OR job.command IS NOT NULL AS kept,
                      CASE WHEN job.last_error = $11 AND job.run_at > statement_timestamp()
                          THEN job.run_at END AS takeover_at
                  FROM {job} AS job
