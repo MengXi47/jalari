@@ -165,6 +165,16 @@ pub async fn add_or_update<T: Job>(
 ///   ([`InvalidCronExpression`](crate::ErrorKind::InvalidCronExpression) or
 ///   [`InvalidInterval`](crate::ErrorKind::InvalidInterval))
 /// - [`init`](crate::init) has not completed or the database query fails
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// let weekdays = jalari::Cron::new("0 30 8 * * MON-FRI")?.timezone("Europe/Berlin")?;
+/// jalari::recurring::update_schedule("digest:sales", weekdays).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn update_schedule(name: &str, schedule: impl Into<Schedule>) -> Result<()> {
     let schedule = schedule.into();
     let config = config()?;
@@ -216,6 +226,18 @@ pub async fn update_schedule(name: &str, schedule: impl Into<Schedule>) -> Resul
 /// Returns an error if:
 /// - No schedule is named `name` ([`RecurringNotFound`](crate::ErrorKind::RecurringNotFound))
 /// - [`init`](crate::init) has not completed or the database query fails
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// match jalari::recurring::trigger("digest:sales").await? {
+///     jalari::EnqueueOutcome::Kept(id) => println!("run {id} is still waiting or running"),
+///     outcome => println!("enqueued run {}", outcome.id()),
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub async fn trigger(name: &str) -> Result<EnqueueOutcome> {
     let config = config()?;
     let schema = &config.schema;
@@ -246,6 +268,21 @@ pub async fn trigger(name: &str) -> Result<EnqueueOutcome> {
 /// - The schedule is declared in code
 ///   ([`RecurringManagedByCode`](crate::ErrorKind::RecurringManagedByCode))
 /// - [`init`](crate::init) has not completed or the database query fails
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// match jalari::recurring::pause("nightly_report").await {
+///     Ok(()) => {}
+///     Err(e) if e.kind == jalari::ErrorKind::RecurringManagedByCode => {
+///         println!("declared in code, change it with a deploy");
+///     }
+///     Err(e) => return Err(e),
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub async fn pause(name: &str) -> Result<()> {
     set_enabled(name, false).await
 }
@@ -258,6 +295,16 @@ pub async fn pause(name: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error under the same conditions as [`pause`].
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// jalari::recurring::pause("digest:sales").await?;
+/// jalari::recurring::resume("digest:sales").await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn resume(name: &str) -> Result<()> {
     set_enabled(name, true).await
 }
@@ -269,6 +316,15 @@ pub async fn resume(name: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error under the same conditions as [`pause`].
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// jalari::recurring::remove("digest:sales").await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn remove(name: &str) -> Result<()> {
     let config = config()?;
     let schema = &config.schema;
@@ -296,6 +352,20 @@ pub async fn remove(name: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if [`init`](crate::init) has not completed or the database query fails.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// for schedule in jalari::recurring::list().await? {
+///     println!(
+///         "{} runs {} at {:?} after {} runs",
+///         schedule.name, schedule.task, schedule.next_run_at, schedule.run_count
+///     );
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub async fn list() -> Result<Vec<RecurringInfo>> {
     let config = config()?;
     let rows: Vec<InfoRow> = sqlx::query_as(AssertSqlSafe(format!(

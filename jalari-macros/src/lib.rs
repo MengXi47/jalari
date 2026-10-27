@@ -1,3 +1,5 @@
+//! The `#[jalari::job]` attribute; use it through the `jalari` crate.
+
 mod fingerprint;
 #[cfg(test)]
 mod tests;

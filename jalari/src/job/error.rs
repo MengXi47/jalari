@@ -202,6 +202,10 @@ impl JobError {
 /// how often a job snoozes, so a job that always snoozes never ends. `delay` is measured by the
 /// database clock and capped at 100 years.
 ///
+/// # Errors
+///
+/// Always returns the snooze as a [`JobError`]; return it from the job or middleware unchanged.
+///
 /// # Examples
 ///
 /// ```rust,no_run

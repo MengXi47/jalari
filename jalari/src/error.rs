@@ -8,6 +8,24 @@ use std::fmt;
 /// [`LockTimeout`](Self::LockTimeout) are usually temporary and worth retrying.
 ///
 /// New kinds may be added in minor releases, so a `match` needs a `_` arm.
+///
+/// # Examples
+///
+/// ```rust
+/// fn worth_retrying(error: &jalari::Error) -> bool {
+///     matches!(
+///         error.kind,
+///         jalari::ErrorKind::ConnectionFailed
+///             | jalari::ErrorKind::ConnectionTerminated
+///             | jalari::ErrorKind::PoolTimedOut
+///             | jalari::ErrorKind::SerializationFailure
+///             | jalari::ErrorKind::Deadlock
+///             | jalari::ErrorKind::LockTimeout
+///     )
+/// }
+///
+/// assert!(!worth_retrying(&jalari::ErrorKind::InvalidSchemaName.into()));
+/// ```
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ErrorKind {

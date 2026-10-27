@@ -19,6 +19,26 @@ use crate::{
 const MIN_CONNECTIONS: u32 = 2;
 
 /// Configuration for a [`Worker`], created by [`Worker::builder`].
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+///
+/// # async fn example() -> jalari::Result<()> {
+/// let worker = jalari::Worker::builder()
+///     .queue("reports", 2)
+///     .scheduler(false)
+///     .retry_policy(jalari::ExponentialBackoff {
+///         base: Duration::from_secs(30),
+///         max: Duration::from_secs(3600),
+///         jitter: 0.2,
+///     })
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 #[must_use]
 pub struct WorkerBuilder {
     queues: Vec<QueueConfig>,

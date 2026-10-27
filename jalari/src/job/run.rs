@@ -16,6 +16,35 @@ tokio::task_local! {
 ///
 /// Get it with [`current_job`]. It is also available to every
 /// [`JobMiddleware`](crate::JobMiddleware) through [`JobMeta`](crate::JobMeta).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use jalari::{Job, JobResult};
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Serialize, Deserialize)]
+/// struct ChargeOrder {
+///     order_id: i64,
+/// }
+///
+/// #[jalari::job(name = "charge_order", queue = "payments")]
+/// impl Job for ChargeOrder {
+///     async fn run(self) -> JobResult {
+///         let run = jalari::current_job().expect("inside a job");
+///         let idempotency_key = format!("charge-{}", run.id());
+///         if let Some(error) = run.last_error() {
+///             println!("attempt {} after {error}", run.attempt());
+///         }
+///         println!(
+///             "charging order {} with key {idempotency_key}, enqueued by {:?}",
+///             self.order_id,
+///             run.parent_id()
+///         );
+///         Ok(())
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct JobRun {
     pub(crate) id: JobId,

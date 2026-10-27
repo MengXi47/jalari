@@ -113,6 +113,21 @@ impl Worker {
     /// then is put back in its queue without counting the attempt, keeping its saved progress.
     /// Jobs still running after [`WorkerConfig::shutdown_timeout`] are aborted, which counts as
     /// an attempt, and another worker runs them again after a few seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let worker = jalari::Worker::builder().queue("default", 4).build().await?;
+    /// let shutdown = jalari::CancellationToken::new();
+    /// let running = tokio::spawn(worker.run(shutdown.child_token()));
+    ///
+    /// tokio::signal::ctrl_c().await?;
+    /// shutdown.cancel();
+    /// running.await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn run(self, shutdown: CancellationToken) {
         let wakers = Arc::new(Wakers {
             queues: self

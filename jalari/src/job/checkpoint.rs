@@ -308,6 +308,29 @@ impl<P: Serialize> Checkpoint<P> {
     /// Returns an error if:
     /// - The job was asked to stop or to cancel, or its worker is shutting down
     /// - `progress` cannot be serialized to JSON (a [`JobError::permanent`])
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize, Default)]
+    /// struct Cursor {
+    ///     next_row: u64,
+    /// }
+    ///
+    /// # async fn copy_row(_row: u64) {}
+    /// async fn copy_rows(rows: u64) -> jalari::JobResult {
+    ///     let (saved, checkpoint) = jalari::resume::<Cursor>()?;
+    ///     let mut cursor = saved.unwrap_or_default();
+    ///     while cursor.next_row < rows {
+    ///         copy_row(cursor.next_row).await;
+    ///         cursor.next_row += 1;
+    ///         checkpoint.save(&cursor).await?;
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn save(&self, progress: &P) -> JobResult {
         let Some(control) = &self.control else {
             return Ok(());

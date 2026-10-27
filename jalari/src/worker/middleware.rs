@@ -162,6 +162,23 @@ pub trait JobMiddleware: Send + Sync + 'static {
 /// How an attempt ended, as saved by the worker that ran it.
 ///
 /// New outcomes may be added in minor releases, so a `match` needs a `_` arm.
+///
+/// # Examples
+///
+/// ```rust
+/// use jalari::Finished;
+///
+/// fn summary(outcome: &Finished) -> String {
+///     match outcome {
+///         Finished::Succeeded => "succeeded".to_owned(),
+///         Finished::Retrying { delay, error } => format!("retrying in {delay:?} after {error}"),
+///         Finished::Failed { error } | Finished::Discarded { error } => error.clone(),
+///         _ => format!("{outcome:?}"),
+///     }
+/// }
+///
+/// assert_eq!(summary(&Finished::Succeeded), "succeeded");
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finished {
@@ -198,6 +215,31 @@ pub enum Finished {
 }
 
 /// What a [`JobMiddleware`] knows about the attempt it wraps.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use jalari::sqlx::types::chrono::Utc;
+/// use jalari::{JobMeta, JobMiddleware, JobResult, Next};
+///
+/// struct QueueDelay;
+///
+/// impl JobMiddleware for QueueDelay {
+///     type Provides = ();
+///
+///     async fn call(&self, job: &JobMeta, next: Next<'_>) -> JobResult {
+///         let waited = Utc::now() - job.scheduled_at();
+///         println!(
+///             "{} #{} at {:?} waited {} ms for a worker",
+///             job.name(),
+///             job.id(),
+///             job.priority(),
+///             waited.num_milliseconds()
+///         );
+///         next.run().await
+///     }
+/// }
+/// ```
 #[derive(Debug)]
 pub struct JobMeta {
     run: JobRun,
@@ -354,6 +396,11 @@ impl<'a> Next<'a> {
     }
 
     /// Runs the remaining middleware and then the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the job or of a middleware further in; pass it on unchanged unless
+    /// the middleware means to change the outcome.
     pub async fn run(self) -> JobResult {
         let mut chain = self.chain;
         while let Some((first, rest)) = chain.split_first() {

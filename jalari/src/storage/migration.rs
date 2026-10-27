@@ -91,6 +91,16 @@ pub async fn migrate(pool: &PgPool, schema: &Schema) -> Result<()> {
 /// - `version` is outside `1..=SCHEMA_VERSION`
 ///   ([`UnknownSchemaVersion`](ErrorKind::UnknownSchemaVersion))
 /// - Any condition listed for [`migrate`] occurs
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let pool = jalari::sqlx::PgPool::connect("postgres://localhost/app").await?;
+/// jalari::migrate_to(&pool, &jalari::Schema::default(), 7).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn migrate_to(pool: &PgPool, schema: &Schema, version: i32) -> Result<()> {
     if !(1..=SCHEMA_VERSION).contains(&version) {
         return Err(Error::new(
@@ -144,6 +154,20 @@ pub async fn migrate_to(pool: &PgPool, schema: &Schema, version: i32) -> Result<
 /// # Errors
 ///
 /// Returns an error if the database cannot be reached or the query fails.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let pool = jalari::sqlx::PgPool::connect("postgres://localhost/app").await?;
+/// match jalari::schema_version(&pool, &jalari::Schema::default()).await? {
+///     Some(version) if version == jalari::SCHEMA_VERSION => println!("up to date"),
+///     Some(version) => println!("at version {version}, run jalari migrate"),
+///     None => println!("no tables yet"),
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub async fn schema_version(pool: &PgPool, schema: &Schema) -> Result<Option<i32>> {
     let mut connection = pool.acquire().await?;
     current_version(&mut connection, schema).await

@@ -29,6 +29,30 @@ pub enum OnConflict {
 }
 
 /// Result of an enqueue, carrying the id of the job that will run.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use jalari::{EnqueueOptions, EnqueueOutcome, OnConflict};
+/// # use serde::{Deserialize, Serialize};
+/// # #[derive(Serialize, Deserialize)]
+/// # struct SendDigest { user_id: i64 }
+/// # #[jalari::job(name = "send_digest")]
+/// # impl jalari::Job for SendDigest {
+/// #     async fn run(self) -> jalari::JobResult { Ok(()) }
+/// # }
+///
+/// # async fn example() -> jalari::Result<()> {
+/// let options = EnqueueOptions::new()
+///     .job_key("digest:42")
+///     .on_conflict(OnConflict::Replace);
+/// match jalari::enqueue_with(&SendDigest { user_id: 42 }, options).await? {
+///     EnqueueOutcome::Running(id) => println!("job {id} is running and keeps its payload"),
+///     outcome => println!("job {} sends the new digest", outcome.id()),
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueOutcome {
     /// A new job was inserted.

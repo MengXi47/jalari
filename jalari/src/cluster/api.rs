@@ -10,6 +10,16 @@ use crate::init;
 /// Returns an error if:
 /// - The `config` row was deleted ([`ConfigMissing`](crate::ErrorKind::ConfigMissing))
 /// - [`init`](crate::init) has not completed or the database query fails
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn example() -> jalari::Result<()> {
+/// let cluster = jalari::cluster::get().await?;
+/// println!("succeeded jobs are kept for {:?}", cluster.succeeded_retention);
+/// # Ok(())
+/// # }
+/// ```
 pub async fn get() -> Result<ClusterConfig> {
     let config = init::config()?;
     let mut connection = config.pool.pool().acquire().await?;
