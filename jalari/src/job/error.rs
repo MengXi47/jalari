@@ -30,7 +30,7 @@ pub struct JobError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disposition {
-    Retry,
+    Retry { delay: Option<Duration> },
     Permanent,
     Halt(Halt),
 }
@@ -40,7 +40,7 @@ impl JobError {
     pub fn new(msg: String) -> Self {
         Self {
             msg,
-            disposition: Disposition::Retry,
+            disposition: Disposition::Retry { delay: None },
         }
     }
 
@@ -62,7 +62,49 @@ impl JobError {
     pub(crate) fn halt(&self) -> Option<Halt> {
         match self.disposition {
             Disposition::Halt(halt) => Some(halt),
-            Disposition::Retry | Disposition::Permanent => None,
+            Disposition::Retry { .. } | Disposition::Permanent => None,
+        }
+    }
+
+    /// Retries the job after `delay` instead of the delay the retry policy picks.
+    ///
+    /// The attempt still counts and `last_error` keeps the message. The retry policy still
+    /// decides whether there is a retry at all, so on the last attempt, or on a
+    /// [`permanent`](Self::permanent) error, it has no effect. Use [`snooze`](crate::snooze) to
+    /// wait without using an attempt. `delay` is measured by the database clock and capped at
+    /// 100 years.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    ///
+    /// use jalari::{JobError, JobResult};
+    ///
+    /// fn check(status: u16, retry_after: Option<Duration>) -> JobResult {
+    ///     if status == 429 {
+    ///         let wait = retry_after.unwrap_or(Duration::from_secs(60));
+    ///         return Err(JobError::new("rate limited".to_owned()).retry_after(wait));
+    ///     }
+    ///     Ok(())
+    /// }
+    ///
+    /// let error = check(429, Some(Duration::from_secs(5))).unwrap_err();
+    /// assert_eq!(error.retry_delay(), Some(Duration::from_secs(5)));
+    /// ```
+    #[must_use]
+    pub fn retry_after(mut self, delay: Duration) -> Self {
+        if let Disposition::Retry { .. } = self.disposition {
+            self.disposition = Disposition::Retry { delay: Some(delay) };
+        }
+        self
+    }
+
+    /// The delay set with [`retry_after`](Self::retry_after), if any.
+    pub fn retry_delay(&self) -> Option<Duration> {
+        match self.disposition {
+            Disposition::Retry { delay } => delay,
+            Disposition::Permanent | Disposition::Halt(_) => None,
         }
     }
 
@@ -123,5 +165,54 @@ impl<E: std::error::Error> From<E> for JobError {
 impl fmt::Display for JobError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retry_after_only_applies_to_retryable_errors() {
+        let delay = Duration::from_secs(7);
+        assert_eq!(
+            JobError::new("boom".to_owned())
+                .retry_after(delay)
+                .retry_delay(),
+            Some(delay)
+        );
+        assert_eq!(
+            JobError::from(std::fmt::Error)
+                .retry_after(delay)
+                .retry_delay(),
+            Some(delay)
+        );
+        assert_eq!(JobError::new("boom".to_owned()).retry_delay(), None);
+        assert_eq!(
+            JobError::permanent(std::fmt::Error)
+                .retry_after(delay)
+                .retry_delay(),
+            None
+        );
+        assert_eq!(
+            JobError::halted(Halt::Shutdown)
+                .retry_after(delay)
+                .retry_delay(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_retry_after_keeps_the_kind_of_error() {
+        let delay = Duration::from_secs(7);
+        assert!(
+            JobError::permanent(std::fmt::Error)
+                .retry_after(delay)
+                .is_permanent()
+        );
+        assert_eq!(
+            JobError::halted(Halt::Shutdown).retry_after(delay).halt(),
+            Some(Halt::Shutdown)
+        );
     }
 }

@@ -10,8 +10,10 @@ const MAX_EXPONENT: u32 = 31;
 
 /// Decides whether and when a failed attempt is retried.
 ///
-/// Set one per worker with [`WorkerBuilder::retry_policy`](crate::WorkerBuilder::retry_policy);
-/// the default is [`ExponentialBackoff`].
+/// Set one per worker with [`WorkerBuilder::retry_policy`](crate::WorkerBuilder::retry_policy),
+/// or per job type with [`Job::RETRY_POLICY`](crate::Job::RETRY_POLICY); the default is
+/// [`ExponentialBackoff`]. Attempts that end in a shutdown release, a stop or a cancel never
+/// reach it.
 ///
 /// # Examples
 ///
@@ -37,7 +39,11 @@ pub trait RetryPolicy: Send + Sync + 'static {
     /// Returns how long to wait before the next attempt, or `None` to mark the job failed.
     ///
     /// `attempt` is the number of the attempt that just failed, starting at 1, and
-    /// `max_attempts` is the job's [`MAX_ATTEMPTS`](crate::Job::MAX_ATTEMPTS).
+    /// `max_attempts` is the job's own, from
+    /// [`EnqueueOptions::max_attempts`](crate::EnqueueOptions::max_attempts) or
+    /// [`MAX_ATTEMPTS`](crate::Job::MAX_ATTEMPTS). When the error carries a
+    /// [`retry_delay`](JobError::retry_delay), that delay replaces the returned one. Delays are
+    /// capped at 100 years.
     fn next_retry(&self, attempt: i32, max_attempts: i32, error: &JobError) -> Option<Duration>;
 }
 

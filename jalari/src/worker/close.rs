@@ -6,6 +6,8 @@ use tracing::{debug, info, warn};
 use crate::job::{Command, Halt, JobState};
 use crate::{JobError, JobResult, RetryPolicy};
 
+const LONGEST_DELAY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 pub(super) enum Ending {
     Returned(JobResult),
     Aborted { after: Duration },
@@ -99,7 +101,7 @@ pub(super) fn decide(
     }
     match retry_policy.next_retry(attempt, max_attempts, error) {
         Some(delay) => Outcome::Retry {
-            delay,
+            delay: error.retry_delay().unwrap_or(delay).min(LONGEST_DELAY),
             error: error.msg().to_owned(),
         },
         None => Outcome::Failed {
@@ -300,5 +302,64 @@ mod tests {
             decide(&ending, None, 1, 3, &policy()),
             Outcome::Retry { .. }
         ));
+    }
+
+    #[test]
+    fn test_retry_after_replaces_the_policy_delay() {
+        let ending = Ending::Returned(Err(
+            JobError::new("slow down".to_owned()).retry_after(Duration::from_secs(7))
+        ));
+        assert_eq!(
+            decide(&ending, None, 1, 3, &policy()),
+            Outcome::Retry {
+                delay: Duration::from_secs(7),
+                error: "slow down".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn test_retry_after_is_ignored_on_the_last_attempt() {
+        let ending = Ending::Returned(Err(
+            JobError::new("slow down".to_owned()).retry_after(Duration::from_secs(7))
+        ));
+        assert_eq!(
+            decide(&ending, None, 3, 3, &policy()),
+            Outcome::Failed {
+                error: "slow down".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn test_retry_after_is_ignored_for_a_permanent_error() {
+        let ending = Ending::Returned(Err(
+            JobError::permanent(std::fmt::Error).retry_after(Duration::from_secs(7))
+        ));
+        assert!(matches!(
+            decide(&ending, None, 1, 3, &policy()),
+            Outcome::Failed { .. }
+        ));
+    }
+
+    struct Forever;
+
+    impl RetryPolicy for Forever {
+        fn next_retry(&self, _: i32, _: i32, _: &JobError) -> Option<Duration> {
+            Some(Duration::MAX)
+        }
+    }
+
+    #[test]
+    fn test_delays_are_capped() {
+        let longest = Outcome::Retry {
+            delay: LONGEST_DELAY,
+            error: "boom".to_owned(),
+        };
+        assert_eq!(decide(&error("boom"), None, 1, 3, &Forever), longest);
+        let ending = Ending::Returned(Err(
+            JobError::new("boom".to_owned()).retry_after(Duration::MAX)
+        ));
+        assert_eq!(decide(&ending, None, 1, 3, &policy()), longest);
     }
 }
