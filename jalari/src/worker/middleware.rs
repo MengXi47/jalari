@@ -8,7 +8,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::task::JoinSet;
+use tracing::{Instrument, warn};
 
+use crate::job::context::{self, Captured};
 use crate::job::registry::{ContextKey, JobFuture};
 use crate::{JobError, JobId, JobResult, JobRun, Priority};
 
@@ -112,6 +115,49 @@ pub trait JobMiddleware: Send + Sync + 'static {
 
     /// Wraps one attempt; call `next.run()` to continue, or return an error to reject it.
     fn call(&self, job: &JobMeta, next: Next<'_>) -> impl Future<Output = JobResult> + Send;
+
+    /// Runs after an attempt's result is saved; does nothing by default.
+    ///
+    /// The hook only observes; change the result in [`call`](Self::call) instead. Hooks run
+    /// innermost first, and only on middleware that wrapped the attempt. Each one runs in its own
+    /// task with the job's context attached, so jobs it enqueues inherit that context, while
+    /// [`current_job`](crate::current_job) is `None`. A panic is logged and the next hook still
+    /// runs. The worker waits for the hooks before it claims another job, so a slow hook holds
+    /// the slot.
+    ///
+    /// Only the worker that ran the attempt calls it, and only once that worker saved the
+    /// outcome. A lost run, an attempt aborted at shutdown, a job the reaper settles, and
+    /// commands or expiry acting on a job that is not running do not call it.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use jalari::{Finished, JobMeta, JobMiddleware, JobResult, Next};
+    ///
+    /// struct Alerts;
+    ///
+    /// impl JobMiddleware for Alerts {
+    ///     type Provides = ();
+    ///
+    ///     async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+    ///         next.run().await
+    ///     }
+    ///
+    ///     async fn finished(&self, job: &JobMeta, outcome: &Finished) {
+    ///         match outcome {
+    ///             Finished::Failed { error } => eprintln!("job {} failed: {error}", job.id()),
+    ///             Finished::Retrying { .. } if job.attempt() + 1 == job.max_attempts() => {
+    ///                 eprintln!("job {} has one attempt left", job.id());
+    ///             }
+    ///             _ => {}
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    #[expect(unused_variables, reason = "the default hook ignores the attempt")]
+    fn finished(&self, job: &JobMeta, outcome: &Finished) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// How an attempt ended, as saved by the worker that ran it.
@@ -187,6 +233,12 @@ impl JobMeta {
     /// Attempts allowed before the job is marked failed.
     pub fn max_attempts(&self) -> i32 {
         self.run.max_attempts()
+    }
+
+    /// Whether this attempt is the last one [`max_attempts`](Self::max_attempts) allows; a
+    /// permanent error can end the job earlier.
+    pub fn is_last_attempt(&self) -> bool {
+        self.attempt() >= self.max_attempts()
     }
 
     /// When the job was first enqueued; see [`JobRun::created_at`].
@@ -306,8 +358,7 @@ impl<'a> Next<'a> {
     pub async fn run(self) -> JobResult {
         let mut chain = self.chain;
         while let Some((first, rest)) = chain.split_first() {
-            let provides = first.provides();
-            if provides.is_unit() || provides.id == self.needs {
+            if wraps(first.as_ref(), self.needs) {
                 let job = self.job;
                 let next = Next {
                     chain: rest,
@@ -325,11 +376,47 @@ impl<'a> Next<'a> {
     }
 }
 
+fn wraps(middleware: &dyn ErasedMiddleware, needs: TypeId) -> bool {
+    let provides = middleware.provides();
+    provides.is_unit() || provides.id == needs
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the close calls it from the integration unit")
+)]
+pub(crate) async fn report_finished(
+    chain: &[Arc<dyn ErasedMiddleware>],
+    meta: Arc<JobMeta>,
+    needs: ContextKey,
+    captured: Captured,
+    outcome: Finished,
+) {
+    let outcome = Arc::new(outcome);
+    let mut hooks = JoinSet::new();
+    for middleware in chain.iter().rev() {
+        if !wraps(middleware.as_ref(), needs.id) {
+            continue;
+        }
+        let hook = {
+            let middleware = Arc::clone(middleware);
+            let meta = Arc::clone(&meta);
+            let outcome = Arc::clone(&outcome);
+            async move { middleware.finished(&meta, &outcome).await }
+        };
+        hooks.spawn(context::within(captured.clone(), hook).in_current_span());
+        if let Some(Err(e)) = hooks.join_next().await {
+            warn!(middleware = middleware.name(), error = %e, "middleware finished hook failed");
+        }
+    }
+}
+
 pub(crate) trait ErasedMiddleware: Send + Sync {
     fn name(&self) -> &'static str;
     fn provides(&self) -> ContextKey;
     fn check(&self) -> BoxFuture<'_, Result<(), JobError>>;
     fn call<'a>(&'a self, job: &'a JobMeta, next: Next<'a>) -> BoxFuture<'a, JobResult>;
+    fn finished<'a>(&'a self, job: &'a JobMeta, outcome: &'a Finished) -> BoxFuture<'a, ()>;
 }
 
 impl<M: JobMiddleware> ErasedMiddleware for M {
@@ -347,5 +434,210 @@ impl<M: JobMiddleware> ErasedMiddleware for M {
 
     fn call<'a>(&'a self, job: &'a JobMeta, next: Next<'a>) -> BoxFuture<'a, JobResult> {
         Box::pin(JobMiddleware::call(self, job, next))
+    }
+
+    fn finished<'a>(&'a self, job: &'a JobMeta, outcome: &'a Finished) -> BoxFuture<'a, ()> {
+        Box::pin(JobMiddleware::finished(self, job, outcome))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::marker::PhantomData;
+    use std::sync::Mutex;
+
+    use serde_json::json;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::current_job;
+    use crate::job::{RunControl, run};
+
+    struct Needed;
+
+    struct Other;
+
+    #[derive(Debug, PartialEq)]
+    struct Call {
+        label: &'static str,
+        job: JobId,
+        outcome: Finished,
+        context: Option<Value>,
+        in_job: bool,
+    }
+
+    type Log = Arc<Mutex<Vec<Call>>>;
+
+    struct Recorder<P> {
+        label: &'static str,
+        log: Log,
+        provides: PhantomData<fn() -> P>,
+    }
+
+    impl<P: Send + Sync + 'static> JobMiddleware for Recorder<P> {
+        type Provides = P;
+
+        async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+            next.run().await
+        }
+
+        async fn finished(&self, job: &JobMeta, outcome: &Finished) {
+            let call = Call {
+                label: self.label,
+                job: job.id(),
+                outcome: outcome.clone(),
+                context: context::current().into_value("hook").unwrap(),
+                in_job: current_job().is_some(),
+            };
+            self.log.lock().unwrap().push(call);
+        }
+    }
+
+    fn recorder<P: Send + Sync + 'static>(
+        label: &'static str,
+        log: &Log,
+    ) -> Arc<dyn ErasedMiddleware> {
+        Arc::new(Recorder::<P> {
+            label,
+            log: Arc::clone(log),
+            provides: PhantomData,
+        })
+    }
+
+    struct Panics;
+
+    impl JobMiddleware for Panics {
+        type Provides = ();
+
+        async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+            next.run().await
+        }
+
+        async fn finished(&self, _job: &JobMeta, _outcome: &Finished) {
+            panic!("hook exploded");
+        }
+    }
+
+    struct Hangs(Mutex<Option<oneshot::Sender<()>>>);
+
+    impl JobMiddleware for Hangs {
+        type Provides = ();
+
+        async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+            next.run().await
+        }
+
+        async fn finished(&self, _job: &JobMeta, _outcome: &Finished) {
+            let _held = self.0.lock().unwrap().take();
+            std::future::pending::<()>().await;
+        }
+    }
+
+    fn job_run(attempt: i32, max_attempts: i32) -> JobRun {
+        let control = Arc::new(RunControl::new(
+            7,
+            1,
+            None,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            false,
+        ));
+        JobRun {
+            attempt,
+            max_attempts,
+            ..JobRun::for_test(7, control)
+        }
+    }
+
+    fn retrying() -> Finished {
+        Finished::Retrying {
+            delay: Duration::from_secs(4),
+            error: "boom".to_owned(),
+        }
+    }
+
+    async fn report<T: 'static>(chain: &[Arc<dyn ErasedMiddleware>]) {
+        let context = json!({ "tenant": "acme" });
+        let meta = Arc::new(JobMeta::new(job_run(1, 3), Some(context.clone())));
+        let captured = Captured::from_stored(Some(context));
+        let report = report_finished(chain, meta, ContextKey::of::<T>(), captured, retrying());
+        run::within(job_run(1, 3), report).await;
+    }
+
+    fn labels(log: &Log) -> Vec<&'static str> {
+        log.lock().unwrap().iter().map(|call| call.label).collect()
+    }
+
+    #[test]
+    fn test_is_last_attempt() {
+        for (attempt, max_attempts, last) in [
+            (1, 3, false),
+            (2, 3, false),
+            (3, 3, true),
+            (4, 3, true),
+            (1, 1, true),
+        ] {
+            let meta = JobMeta::new(job_run(attempt, max_attempts), None);
+            assert_eq!(
+                meta.is_last_attempt(),
+                last,
+                "attempt {attempt} of {max_attempts}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_finished_runs_innermost_first_with_the_job_context() {
+        let log = Log::default();
+        report::<()>(&[recorder::<()>("outer", &log), recorder::<()>("inner", &log)]).await;
+        let expected = ["inner", "outer"].map(|label| Call {
+            label,
+            job: JobId(7),
+            outcome: retrying(),
+            context: Some(json!({ "tenant": "acme" })),
+            in_job: false,
+        });
+        assert_eq!(*log.lock().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_finished_skips_middleware_that_did_not_wrap() {
+        let log = Log::default();
+        let chain = [
+            recorder::<()>("every", &log),
+            recorder::<Other>("other", &log),
+            recorder::<Needed>("needed", &log),
+        ];
+        report::<Needed>(&chain).await;
+        assert_eq!(labels(&log), ["needed", "every"]);
+        log.lock().unwrap().clear();
+        report::<()>(&chain).await;
+        assert_eq!(labels(&log), ["every"]);
+    }
+
+    #[tokio::test]
+    async fn test_finished_panic_is_contained() {
+        let log = Log::default();
+        let chain: [Arc<dyn ErasedMiddleware>; 3] = [
+            recorder::<()>("outer", &log),
+            Arc::new(Panics),
+            recorder::<()>("inner", &log),
+        ];
+        report::<()>(&chain).await;
+        assert_eq!(labels(&log), ["inner", "outer"]);
+    }
+
+    #[tokio::test]
+    async fn test_finished_hook_ends_with_its_report() {
+        let (held, released) = oneshot::channel();
+        let chain: [Arc<dyn ErasedMiddleware>; 1] = [Arc::new(Hangs(Mutex::new(Some(held))))];
+        let report = tokio::time::timeout(Duration::from_millis(50), report::<()>(&chain));
+        assert!(report.await.is_err(), "the hook never returns");
+        let released = tokio::time::timeout(Duration::from_secs(5), released).await;
+        assert!(
+            matches!(released, Ok(Err(_))),
+            "dropping the report aborts the running hook"
+        );
     }
 }
