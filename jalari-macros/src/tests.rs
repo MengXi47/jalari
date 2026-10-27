@@ -390,3 +390,58 @@ fn test_fingerprint_covers_attribute_max_attempts_and_timeout() {
     assert_ne!(base, thirty);
     assert_ne!(thirty, sixty);
 }
+
+#[test]
+fn test_fingerprint_ignores_name_aliases_and_priority() {
+    let base = stamped(&expanded("fingerprint = true", SHORT));
+    assert_eq!(
+        base,
+        stamped(&expanded(
+            "fingerprint = true",
+            &SHORT.replace("\"j\"", "\"k\"")
+        ))
+    );
+    assert_eq!(
+        base,
+        stamped(&expanded(
+            "fingerprint = true, aliases = [\"old\"], priority = \"urgent\"",
+            SHORT
+        ))
+    );
+    assert_eq!(
+        stamped(&expanded("fingerprint = true", UNNAMED)),
+        stamped(&expanded(
+            "fingerprint = true, name = \"send_email\"",
+            UNNAMED
+        ))
+    );
+}
+
+#[test]
+fn test_fingerprint_ignores_retry_policy() {
+    let with_policy = SHORT.replace(
+        "const NAME: &'static str = \"j\";",
+        "const NAME: &'static str = \"j\";
+         const RETRY_POLICY: Option<&'static dyn RetryPolicy> = Some(&BACKOFF);",
+    );
+    assert_eq!(
+        stamped(&expanded("fingerprint = true", SHORT)),
+        stamped(&expanded("fingerprint = true", &with_policy))
+    );
+}
+
+#[test]
+fn test_fingerprint_still_covers_max_attempts() {
+    let declared = |attempts: u32| {
+        SHORT.replace(
+            "const NAME: &'static str = \"j\";",
+            &format!("const NAME: &'static str = \"j\"; const MAX_ATTEMPTS: i32 = {attempts};"),
+        )
+    };
+    let base = stamped(&expanded("fingerprint = true", SHORT));
+    assert_ne!(base, stamped(&expanded("fingerprint = true", &declared(3))));
+    assert_ne!(
+        stamped(&expanded("fingerprint = true", &declared(3))),
+        stamped(&expanded("fingerprint = true", &declared(4)))
+    );
+}

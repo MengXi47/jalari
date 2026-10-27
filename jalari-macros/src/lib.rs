@@ -66,6 +66,11 @@ use syn::{
 /// reached code names, and the jalari version. Formatting, comments and unreachable code do not
 /// change it, and neither does the directory the sources are in.
 ///
+/// `NAME`, `ALIASES`, `PRIORITY` and `RETRY_POLICY`, and the `name`, `aliases`, `priority` and
+/// `checkpoints` arguments, are left out, in either form. Renaming a job with its old name in
+/// `aliases`, or changing its priority or retry policy, therefore leaves waiting jobs runnable
+/// by the new build. `MAX_ATTEMPTS` and `TIMEOUT` are covered in either form.
+///
 /// Every enqueue stores the fingerprint with the job, and a worker takes a job only when the
 /// stored fingerprint is empty or equals its own build's. A job enqueued by another build of
 /// its code waits for a worker of that build. Without `fingerprint = true` the job is enqueued

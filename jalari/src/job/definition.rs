@@ -195,8 +195,10 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     ///
     /// New jobs are always enqueued under [`NAME`](Self::NAME). Jobs stored under an alias run
     /// through this type, and [`JobRun::name`](crate::JobRun::name) reports `NAME` for them. A
-    /// runtime schedule stored under an alias is moved to `NAME` the next time it fires. Once
-    /// no job and no schedule uses an alias, it can be removed.
+    /// runtime schedule stored under an alias is moved to `NAME` the next time it fires. The
+    /// code fingerprint leaves out `NAME` and `ALIASES`, so with the old name kept here, jobs
+    /// that waited under it stay runnable by the renamed build. Once no job and no schedule
+    /// uses an alias, it can be removed.
     ///
     /// An alias must not be empty, equal `NAME` or repeat; `#[jalari::job]` rejects such a list
     /// at compile time:
@@ -257,7 +259,9 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// Retry policy for this job type, used instead of the worker's; `None`, the default, uses
     /// [`WorkerBuilder::retry_policy`](crate::WorkerBuilder::retry_policy).
     ///
-    /// Any [`RetryPolicy`] that can be built in a const or named as a `static` works.
+    /// Any [`RetryPolicy`] that can be built in a const or named as a `static` works. The code
+    /// fingerprint leaves the policy out, so jobs already waiting when a new policy is deployed
+    /// are retried by the new one.
     ///
     /// # Examples
     ///

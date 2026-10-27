@@ -564,10 +564,85 @@ fn test_missing_lock_still_fingerprints() {
     assert_ne!(of(&workspace), of(&with_registry(&app, LOCK)));
 }
 
+const NAME_LINE: &str = "    const NAME: &'static str = \"j\";\n";
+
+fn with_constant(text: &str, constant: &str) -> String {
+    text.replace(NAME_LINE, &format!("{NAME_LINE}    {constant}\n"))
+}
+
+fn with_attribute(text: &str, arguments: &str) -> String {
+    text.replace("#[jalari::job]", &format!("#[jalari::job({arguments})]"))
+}
+
 #[test]
-fn test_job_name_changes_fingerprint() {
+fn test_job_name_keeps_fingerprint() {
     let base = source("", "");
-    assert_ne!(lib(&base), lib(&base.replace("\"j\"", "\"k\"")));
+    assert_eq!(lib(&base), lib(&base.replace("\"j\"", "\"k\"")));
+    let unnamed = base.replace(NAME_LINE, "");
+    assert_eq!(lib(&base), lib(&unnamed));
+    assert_eq!(lib(&base), lib(&with_attribute(&unnamed, "name = \"k\"")));
+}
+
+#[test]
+fn test_aliases_priority_and_checkpoints_keep_fingerprint() {
+    let base = source("", "");
+    let constants = with_constant(
+        &with_constant(
+            &base,
+            "const ALIASES: &'static [&'static str] = &[\"old\"];",
+        ),
+        "const PRIORITY: Priority = Priority::High;",
+    );
+    assert_eq!(lib(&base), lib(&constants));
+    let arguments = with_attribute(
+        &base,
+        "aliases = [\"old\"], priority = \"high\", checkpoints = true",
+    );
+    assert_eq!(lib(&base), lib(&arguments));
+    let queued = with_attribute(&base, "queue = \"q\"");
+    assert_eq!(
+        lib(&queued),
+        lib(&with_attribute(&base, "queue = \"q\", priority = \"low\""))
+    );
+}
+
+#[test]
+fn test_retry_policy_keeps_fingerprint() {
+    let policy = |attempts: &str| {
+        with_constant(
+            &source(
+                "",
+                &format!("const BACKOFF: Fixed = Fixed({attempts});\n\nstruct Fixed(u32);"),
+            ),
+            "const RETRY_POLICY: Option<&'static dyn RetryPolicy> = Some(&BACKOFF);",
+        )
+    };
+    assert_eq!(lib(&policy("3")), lib(&policy("4")));
+    assert_eq!(
+        lib(&policy("3")),
+        lib(&source(
+            "",
+            "const BACKOFF: Fixed = Fixed(5);\n\nstruct Fixed(u32);"
+        ))
+    );
+}
+
+#[test]
+fn test_max_attempts_and_timeout_change_fingerprint() {
+    let base = source("", "");
+    let three = with_constant(&base, "const MAX_ATTEMPTS: i32 = 3;");
+    let four = with_constant(&base, "const MAX_ATTEMPTS: i32 = 4;");
+    assert_ne!(lib(&base), lib(&three));
+    assert_ne!(lib(&three), lib(&four));
+    assert_ne!(
+        lib(&with_attribute(&base, "max_attempts = 3")),
+        lib(&with_attribute(&base, "max_attempts = 4"))
+    );
+    assert_ne!(lib(&base), lib(&with_attribute(&base, "timeout = 30")));
+    assert_ne!(
+        lib(&with_attribute(&base, "timeout = 30")),
+        lib(&with_attribute(&base, "timeout = 60"))
+    );
 }
 
 #[test]

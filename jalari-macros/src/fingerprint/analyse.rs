@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use quote::ToTokens;
 
 use super::hash::{Fnv, canonical};
-use super::index::{Index, ItemId};
+use super::index::{Index, ItemId, hashed_job};
 use super::reach::{MemberRule, reach};
 use super::workspace::{Dependency, JobSite, Workspace};
 
@@ -16,6 +16,11 @@ pub(crate) fn fingerprint(
     site: &JobSite<'_>,
     jalari_version: &str,
 ) -> u128 {
+    let item = hashed_job(site.item);
+    let site = &JobSite {
+        item: &item,
+        file: site.file,
+    };
     let (tag, items, pins) = match reach(index, site, MemberRule::Gated) {
         Some(reached) => {
             let mut roots = reached.roots.clone();

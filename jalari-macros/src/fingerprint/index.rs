@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{Literal, Spacing, TokenStream, TokenTree};
 use quote::ToTokens;
+use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, ExprMethodCall, ImplItem, ItemExternCrate, ItemImpl, ItemMacro, ItemUse, Macro,
-    Meta, Path, TraitItem, UseTree,
+    Meta, MetaNameValue, Path, Token, TraitItem, UseTree, parse_quote,
 };
 
 use super::hash::canonical;
@@ -13,6 +14,10 @@ use super::workspace::{Dependency, Workspace};
 
 pub(crate) type ItemId = usize;
 pub(crate) type ImplId = usize;
+
+const UNHASHED_CONSTANTS: [&str; 4] = ["NAME", "ALIASES", "PRIORITY", "RETRY_POLICY"];
+
+const UNHASHED_ARGUMENTS: [&str; 4] = ["name", "aliases", "priority", "checkpoints"];
 
 const KEYWORDS: &[&str] = &[
     "_",
@@ -476,6 +481,13 @@ impl Builder<'_> {
     }
 
     fn implementation(&mut self, place: &Place<'_>, item_impl: &ItemImpl) {
+        let hashed;
+        let item_impl = if is_job_impl(item_impl) {
+            hashed = hashed_job(item_impl);
+            &hashed
+        } else {
+            item_impl
+        };
         let impl_id = self.index.impls.len();
         let mut header = item_impl.clone();
         header.items.clear();
@@ -592,6 +604,44 @@ impl<'ast> Visit<'ast> for Scan {
         }
         visit::visit_item_impl(self, item_impl);
     }
+}
+
+pub(crate) fn hashed_job(item_impl: &ItemImpl) -> ItemImpl {
+    let mut hashed = item_impl.clone();
+    hashed.items.retain(|item| {
+        !matches!(item, ImplItem::Const(constant)
+            if UNHASHED_CONSTANTS.iter().any(|name| constant.ident == name))
+    });
+    for attribute in &mut hashed.attrs {
+        let is_job = attribute
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "job");
+        if !is_job {
+            continue;
+        }
+        let Ok(arguments) =
+            attribute.parse_args_with(Punctuated::<MetaNameValue, Token![,]>::parse_terminated)
+        else {
+            continue;
+        };
+        let kept: Punctuated<MetaNameValue, Token![,]> = arguments
+            .into_iter()
+            .filter(|argument| {
+                !UNHASHED_ARGUMENTS
+                    .iter()
+                    .any(|name| argument.path.is_ident(name))
+            })
+            .collect();
+        let path = attribute.path().clone();
+        attribute.meta = if kept.is_empty() {
+            Meta::Path(path)
+        } else {
+            parse_quote!(#path(#kept))
+        };
+    }
+    hashed
 }
 
 pub(crate) fn is_job_impl(item_impl: &ItemImpl) -> bool {
