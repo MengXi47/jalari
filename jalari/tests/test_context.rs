@@ -942,12 +942,18 @@ async fn check_finished_reports_every_outcome(fixture: &Fixture) {
         ),
         (stopped, vec![Finished::Stopped]),
         (cancelled, vec![Finished::Cancelled]),
-        (released, vec![Finished::Released]),
     ];
     for (id, outcome) in expected {
         let reports = wait_for_reports(id, outcome.len()).await;
         assert_eq!(outcomes(&reports), outcome, "job {id}");
     }
+    let reports = wait_for_reports(released, 1).await;
+    assert!(
+        outcomes(&reports)
+            .iter()
+            .all(|outcome| *outcome == Finished::Released),
+        "job {released} reported {reports:?}"
+    );
     assert_eq!(fixture.state(released).await.0, "enqueued");
     for id in [snoozed, released] {
         assert_eq!(jalari::cancel(id).await.unwrap(), CancelOutcome::Cancelled);

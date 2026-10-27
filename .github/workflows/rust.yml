@@ -56,7 +56,7 @@ jobs:
       run: |
         cargo fmt --all -- --check
         cargo clippy --workspace --all-targets --all-features -- -D warnings
-        cargo test --workspace --all-features
+        cargo test --workspace --all-features --no-fail-fast
         RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
   msrv:

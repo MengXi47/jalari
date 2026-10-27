@@ -42,6 +42,9 @@ impl Shared {
         queue: &str,
         waker: &Notify,
     ) -> Result<bool> {
+        if self.job_shutdown.is_cancelled() {
+            return Ok(false);
+        }
         let Some((claimed, pending)) = self.claim(incarnation, queue).await? else {
             return Ok(false);
         };

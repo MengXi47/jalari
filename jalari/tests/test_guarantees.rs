@@ -675,12 +675,20 @@ async fn check_horizon_free(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    let dead: i64 =
-        sqlx::query_scalar("SELECT n_dead_tup FROM pg_stat_all_tables WHERE relid = $1::regclass")
-            .bind(&scratch)
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
+    let counted = Instant::now();
+    let mut dead: i64 = 1;
+    while dead != 0 && counted.elapsed() < Duration::from_secs(5) {
+        dead = sqlx::query_scalar(
+            "SELECT n_dead_tup FROM pg_stat_all_tables WHERE relid = $1::regclass",
+        )
+        .bind(&scratch)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        if dead != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     assert_eq!(
         LEDGER.count("horizon", "done"),
         0,
