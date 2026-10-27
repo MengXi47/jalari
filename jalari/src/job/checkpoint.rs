@@ -1,6 +1,6 @@
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,9 @@ pub(crate) struct RunControl {
     halted: CancellationToken,
     command: AtomicU8,
     commanded: Notify,
+    started: Instant,
+    reached_millis: AtomicU64,
+    checkpoints: bool,
     slot: Mutex<Slot>,
 }
 
@@ -112,6 +115,7 @@ impl RunControl {
         saved: Option<Value>,
         shutdown: CancellationToken,
         lost: CancellationToken,
+        checkpoints: bool,
     ) -> Self {
         Self {
             job_id,
@@ -122,6 +126,9 @@ impl RunControl {
             lost,
             command: AtomicU8::new(0),
             commanded: Notify::new(),
+            started: Instant::now(),
+            reached_millis: AtomicU64::new(0),
+            checkpoints,
             slot: Mutex::new(Slot::default()),
         }
     }
@@ -173,6 +180,21 @@ impl RunControl {
         } else {
             self.shutdown.is_cancelled().then_some(Halt::Shutdown)
         }
+    }
+
+    fn reach(&self) -> Option<Halt> {
+        let reached = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.reached_millis.store(reached, Ordering::Relaxed);
+        self.halt()
+    }
+
+    pub(crate) fn declares_checkpoints(&self) -> bool {
+        self.checkpoints
+    }
+
+    pub(crate) fn since_checkpoint(&self) -> Duration {
+        let reached = Duration::from_millis(self.reached_millis.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(reached)
     }
 
     fn is_due(&self) -> bool {
@@ -268,7 +290,7 @@ impl<P: Serialize> Checkpoint<P> {
         let Some(control) = &self.control else {
             return Ok(());
         };
-        let halt = control.halt();
+        let halt = control.reach();
         if halt.is_some() || control.is_due() {
             control.keep(serde_json::to_value(progress).map_err(JobError::permanent)?);
         }
@@ -359,7 +381,7 @@ pub fn resume<P: Serialize + DeserializeOwned>()
 /// ```
 pub async fn checkpoint() -> JobResult {
     match current_job() {
-        Some(job) => stop_point(job.control().halt()).await,
+        Some(job) => stop_point(job.control().reach()).await,
         None => Ok(()),
     }
 }
@@ -388,6 +410,7 @@ mod tests {
                 None,
                 shutdown.child_token(),
                 lost.child_token(),
+                false,
             ));
             Self {
                 control,

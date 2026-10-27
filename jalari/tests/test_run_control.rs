@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,9 @@ use common::{Database, LEDGER, RunningWorker, wait_until};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{CancelOutcome, Job, JobId, JobResult, StopOutcome, Worker, WorkerConfig};
 use serde::{Deserialize, Serialize};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 const QUEUE: &str = "run_control";
 const CONTROL_LATENCY: Duration = Duration::from_millis(2500);
@@ -19,6 +23,74 @@ const CANCEL: &str = "the job was asked to cancel";
 const SHUTDOWN: &str = "the worker is shutting down";
 const LOST: &str = "the worker no longer owns the job";
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
+const IMPATIENT: Duration = Duration::from_secs(1);
+const ABORT_LATENCY: Duration = Duration::from_secs(5);
+const DECLARED: &str = "job declared checkpoints but";
+const IGNORED: &str =
+    "job declared checkpoints but kept running after a checkpoint asked it to stop";
+
+static ERRORS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+struct Message(Option<String>);
+
+impl Visit for Message {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+struct CaptureErrors;
+
+impl Subscriber for CaptureErrors {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() == Level::ERROR
+    }
+
+    fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut message = Message(None);
+        event.record(&mut message);
+        if let Some(message) = message.0 {
+            ERRORS.lock().unwrap().push(message);
+        }
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+fn silent_gap(message: &str) -> Option<u64> {
+    message
+        .strip_prefix("job declared checkpoints but went ")?
+        .strip_suffix("s without one")?
+        .parse()
+        .ok()
+}
+
+fn assert_one_silence(errors: &[String], at_least: Duration) {
+    let [message] = errors else {
+        panic!("expected one missed-checkpoint error, got {errors:?}");
+    };
+    let gap = silent_gap(message).unwrap_or_else(|| panic!("not a silence report: {message}"));
+    assert!(gap >= at_least.as_secs(), "{message}");
+}
+
+fn take_declared_errors() -> Vec<String> {
+    std::mem::take(&mut *ERRORS.lock().unwrap())
+        .into_iter()
+        .filter(|message| message.starts_with(DECLARED))
+        .collect()
+}
 
 static HALTS: LazyLock<Mutex<HashMap<(String, &'static str), String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -57,6 +129,57 @@ impl Job for Blocked {
             }
             () = tokio::time::sleep(Duration::from_secs(600)) => Ok(()),
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeclaredSleeper {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control", checkpoints = true)]
+impl Job for DeclaredSleeper {
+    const NAME: &'static str = "run_control_declared_sleeper";
+
+    async fn run(self) -> JobResult {
+        jalari::checkpoint().await?;
+        LEDGER.record(&self.label, "start");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Swallower {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control", checkpoints = true)]
+impl Job for Swallower {
+    const NAME: &'static str = "run_control_swallower";
+
+    async fn run(self) -> JobResult {
+        LEDGER.record(&self.label, "start");
+        loop {
+            let _ = jalari::checkpoint().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct UndeclaredSleeper {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control")]
+impl Job for UndeclaredSleeper {
+    const NAME: &'static str = "run_control_undeclared_sleeper";
+
+    async fn run(self) -> JobResult {
+        LEDGER.record(&self.label, "start");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok(())
     }
 }
 
@@ -105,12 +228,17 @@ async fn spawn_worker(stop_timeout: Duration, shutdown_timeout: Duration) -> Run
 }
 
 async fn start_blocked(label: &str) -> JobId {
-    let id = jalari::enqueue(&Blocked {
-        label: label.to_owned(),
-    })
+    start(
+        &Blocked {
+            label: label.to_owned(),
+        },
+        label,
+    )
     .await
-    .unwrap()
-    .id();
+}
+
+async fn start<T: Job>(job: &T, label: &str) -> JobId {
+    let id = jalari::enqueue(job).await.unwrap().id();
     wait_until(&format!("{label} to start"), START, || async {
         LEDGER.count(label, "start") == 1
     })
@@ -127,6 +255,7 @@ async fn wait_for_state(database: &Database, id: JobId, state: &str, within: Dur
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_run_control() {
+    tracing::subscriber::set_global_default(CaptureErrors).unwrap();
     let Some(database) = Database::start("run_control", 8).await else {
         return;
     };
@@ -134,6 +263,10 @@ async fn test_run_control() {
     check_interrupted_under_cancel(&database).await;
     check_interrupted_under_shutdown(&database).await;
     check_interrupted_on_lost_run(&database).await;
+    check_declared_checkpoints_log_on_abort(&database).await;
+    check_swallowed_halt_logs(&database).await;
+    check_undeclared_job_logs_nothing(&database).await;
+    check_shutdown_abort_logs(&database).await;
     database.finish().await;
 }
 
@@ -227,4 +360,86 @@ async fn check_interrupted_on_lost_run(database: &Database) {
     );
     assert_eq!(jalari::cancel(id).await.unwrap(), CancelOutcome::Cancelled);
     worker.stop().await;
+}
+
+async fn stop_until_aborted(database: &Database, id: JobId) {
+    assert_eq!(jalari::stop(id).await.unwrap(), StopOutcome::Requested);
+    wait_for_state(database, id, "stopped", ABORT_LATENCY).await;
+    assert_eq!(
+        history(database, id)
+            .await
+            .last()
+            .map(|(_, error)| error.clone()),
+        Some(Some(format!(
+            "aborted because it reached no checkpoint within {IMPATIENT:?}"
+        )))
+    );
+}
+
+async fn check_declared_checkpoints_log_on_abort(database: &Database) {
+    let worker = spawn_worker(IMPATIENT, PATIENT).await;
+    take_declared_errors();
+    let label = "declared";
+    let id = start(
+        &DeclaredSleeper {
+            label: label.to_owned(),
+        },
+        label,
+    )
+    .await;
+    stop_until_aborted(database, id).await;
+    assert_one_silence(&take_declared_errors(), IMPATIENT);
+    worker.stop().await;
+}
+
+async fn check_swallowed_halt_logs(database: &Database) {
+    let worker = spawn_worker(IMPATIENT, PATIENT).await;
+    take_declared_errors();
+    let label = "swallowed";
+    let id = start(
+        &Swallower {
+            label: label.to_owned(),
+        },
+        label,
+    )
+    .await;
+    stop_until_aborted(database, id).await;
+    assert_eq!(take_declared_errors(), [IGNORED]);
+    worker.stop().await;
+}
+
+async fn check_undeclared_job_logs_nothing(database: &Database) {
+    let worker = spawn_worker(IMPATIENT, PATIENT).await;
+    take_declared_errors();
+    let label = "undeclared";
+    let id = start(
+        &UndeclaredSleeper {
+            label: label.to_owned(),
+        },
+        label,
+    )
+    .await;
+    stop_until_aborted(database, id).await;
+    assert_eq!(take_declared_errors(), Vec::<String>::new());
+    worker.stop().await;
+}
+
+async fn check_shutdown_abort_logs(database: &Database) {
+    let worker = spawn_worker(PATIENT, IMPATIENT).await;
+    take_declared_errors();
+    let label = "shutdown_abort";
+    let id = start(
+        &DeclaredSleeper {
+            label: label.to_owned(),
+        },
+        label,
+    )
+    .await;
+    worker.stop().await;
+    assert_one_silence(&take_declared_errors(), IMPATIENT);
+    assert_eq!(
+        history(database, id).await,
+        [("scheduled".to_owned(), Some(INTERRUPTED.to_owned()))]
+    );
+    assert_eq!(jalari::cancel(id).await.unwrap(), CancelOutcome::Cancelled);
 }

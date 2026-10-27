@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, info_span, warn};
+use tracing::{Instrument, error, info_span, warn};
 
 use super::close::{Closing, Ending, decide};
 use super::lifeline::Incarnation;
@@ -59,18 +59,19 @@ impl Shared {
         );
         async move {
             let started = Instant::now();
+            let registration = self.jobs.get(claimed.task.as_str()).copied();
             let control = Arc::new(RunControl::new(
                 claimed.hold.job_id,
                 claimed.lease,
                 claimed.progress.clone(),
                 self.job_shutdown.child_token(),
                 incarnation.dead().child_token(),
+                registration.is_some_and(|registration| registration.checkpoints),
             ));
             let registered = pending.register(claimed.hold.clone(), Arc::clone(&control));
             if control.lost().is_cancelled() {
                 return;
             }
-            let registration = self.jobs.get(claimed.task.as_str()).copied();
             let retry_policy = registration
                 .and_then(|registration| registration.retry_policy)
                 .unwrap_or(&*self.retry_policy);
@@ -84,7 +85,11 @@ impl Shared {
                     let run = claimed.run(self, job, queue, Arc::clone(&control));
                     tokio::pin!(run);
                     let mut deadline = None;
-                    loop {
+                    let shutdown_abort = ShutdownAbort {
+                        control: &control,
+                        window: Some(self.settings.shutdown_timeout),
+                    };
+                    let ending = loop {
                         tokio::select! {
                             biased;
                             () = control.lost().cancelled() => {
@@ -92,6 +97,7 @@ impl Shared {
                                 return;
                             }
                             () = sleep_until(deadline), if deadline.is_some() => {
+                                report_missed_checkpoints(&control, self.settings.stop_timeout);
                                 break Ending::Aborted { after: self.settings.stop_timeout };
                             }
                             () = control.commanded(), if deadline.is_none() => {
@@ -99,7 +105,9 @@ impl Shared {
                             }
                             result = &mut run => break Ending::Returned(result),
                         }
-                    }
+                    };
+                    shutdown_abort.finished();
+                    ending
                 }
             };
             registered.closing();
@@ -165,6 +173,68 @@ impl Shared {
         }
         warn!("the job outcome kept changing, giving up");
         registration.abandon();
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Missed {
+    Silent { gap: Duration },
+    IgnoredHalt,
+}
+
+fn missed_checkpoints(
+    declared: bool,
+    since_checkpoint: Duration,
+    window: Duration,
+) -> Option<Missed> {
+    if !declared {
+        return None;
+    }
+    if since_checkpoint < window {
+        Some(Missed::IgnoredHalt)
+    } else {
+        Some(Missed::Silent {
+            gap: since_checkpoint,
+        })
+    }
+}
+
+fn report_missed_checkpoints(control: &RunControl, window: Duration) {
+    match missed_checkpoints(
+        control.declares_checkpoints(),
+        control.since_checkpoint(),
+        window,
+    ) {
+        Some(Missed::Silent { gap }) => error!(
+            "job declared checkpoints but went {}s without one",
+            gap.as_secs()
+        ),
+        Some(Missed::IgnoredHalt) => {
+            error!("job declared checkpoints but kept running after a checkpoint asked it to stop")
+        }
+        None => {}
+    }
+}
+
+struct ShutdownAbort<'a> {
+    control: &'a RunControl,
+    window: Option<Duration>,
+}
+
+impl ShutdownAbort<'_> {
+    fn finished(mut self) {
+        self.window = None;
+    }
+}
+
+impl Drop for ShutdownAbort<'_> {
+    fn drop(&mut self) {
+        if let Some(window) = self.window
+            && self.control.shutdown().is_cancelled()
+            && !self.control.lost().is_cancelled()
+        {
+            report_missed_checkpoints(self.control, window);
+        }
     }
 }
 
@@ -242,5 +312,39 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
         Err(payload) => payload
             .downcast_ref::<&str>()
             .map_or_else(|| "unknown panic payload".to_owned(), |s| (*s).to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn test_undeclared_job_reports_nothing() {
+        for since in [Duration::ZERO, WINDOW, Duration::from_secs(600)] {
+            assert_eq!(missed_checkpoints(false, since, WINDOW), None);
+        }
+    }
+
+    #[test]
+    fn test_long_gap_reports_silence() {
+        for since in [WINDOW, Duration::from_secs(41)] {
+            assert_eq!(
+                missed_checkpoints(true, since, WINDOW),
+                Some(Missed::Silent { gap: since })
+            );
+        }
+    }
+
+    #[test]
+    fn test_recent_checkpoint_reports_an_ignored_halt() {
+        for since in [Duration::ZERO, WINDOW - Duration::from_millis(1)] {
+            assert_eq!(
+                missed_checkpoints(true, since, WINDOW),
+                Some(Missed::IgnoredHalt)
+            );
+        }
     }
 }

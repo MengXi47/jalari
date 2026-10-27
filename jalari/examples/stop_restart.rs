@@ -14,7 +14,7 @@ struct Cursor {
     next_row: u64,
 }
 
-#[jalari::job(queue = "exports")]
+#[jalari::job(queue = "exports", checkpoints = true)]
 impl Job for Export {
     const NAME: &'static str = "export";
 
