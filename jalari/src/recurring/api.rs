@@ -3,22 +3,12 @@ use serde_json::Value;
 use sqlx::AssertSqlSafe;
 
 use super::store::{
-    Plan, SCHEDULE_COLUMNS, StoredSchedule, lock_schedule, managed_by_code, not_found,
-    notify_change, plan,
+    JOB_COLUMNS, Plan, SCHEDULE_COLUMNS, StoredJob, StoredSchedule, lock_schedule, managed_by_code,
+    not_found, notify_change, plan,
 };
 use crate::enqueue::{EnqueueRequest, default_queue, encode_payload, timeout_ms};
 use crate::init::config;
-use crate::{EnqueueOutcome, Job, RecurringInfo, Result, Schedule};
-
-#[derive(sqlx::FromRow)]
-struct TriggerRow {
-    task: String,
-    payload: Vec<u8>,
-    queue: String,
-    max_attempts: i32,
-    timeout_ms: Option<i32>,
-    context: Option<Value>,
-}
+use crate::{EnqueueOutcome, Job, Priority, RecurringInfo, Result, Schedule};
 
 #[derive(sqlx::FromRow)]
 struct InfoRow {
@@ -27,6 +17,7 @@ struct InfoRow {
     stored: StoredSchedule,
     task: String,
     queue: String,
+    priority: i16,
     enabled: bool,
     managed: bool,
     next_run_at: Option<DateTime<Utc>>,
@@ -113,9 +104,10 @@ pub async fn add_or_update<T: Job>(
     let stored = schedule.stored();
     let saved: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
         "INSERT INTO {recurring} AS existing (name, {SCHEDULE_COLUMNS}, task, payload, queue,
-             max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at, context)
+             max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at, context,
+             priority)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, $14, $15, $16,
-             $17)
+             $17, $18)
          ON CONFLICT (name) DO UPDATE SET
              cron = EXCLUDED.cron, timezone = EXCLUDED.timezone,
              interval_count = EXCLUDED.interval_count, interval_unit = EXCLUDED.interval_unit,
@@ -124,7 +116,7 @@ pub async fn add_or_update<T: Job>(
              queue = EXCLUDED.queue, max_attempts = EXCLUDED.max_attempts,
              timeout_ms = EXCLUDED.timeout_ms, next_run_at = EXCLUDED.next_run_at,
              run_count = EXCLUDED.run_count, finished_at = EXCLUDED.finished_at,
-             context = EXCLUDED.context, updated_at = now()
+             context = EXCLUDED.context, priority = EXCLUDED.priority, updated_at = now()
          WHERE NOT existing.managed
          RETURNING name",
         recurring = schema.table("recurring"),
@@ -146,6 +138,7 @@ pub async fn add_or_update<T: Job>(
     .bind(plan.run_count)
     .bind(plan.finished_at)
     .bind(&context)
+    .bind(T::PRIORITY.level())
     .fetch_optional(&mut *transaction)
     .await?;
     if saved.is_none() {
@@ -228,26 +221,17 @@ pub async fn trigger(name: &str) -> Result<EnqueueOutcome> {
     let config = config()?;
     let schema = &config.schema;
     let mut transaction = config.pool.pool().begin().await?;
-    let row: Option<TriggerRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT task, payload, queue, max_attempts, timeout_ms, context FROM {recurring}
-         WHERE name = $1",
+    let row: Option<StoredJob> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT {JOB_COLUMNS} FROM {recurring} WHERE name = $1",
         recurring = schema.table("recurring"),
     )))
     .bind(name)
     .fetch_optional(&mut *transaction)
     .await?;
     let row = row.ok_or_else(|| not_found(name))?;
-    let outcome = EnqueueRequest::recurring(
-        name,
-        row.task,
-        row.payload,
-        row.queue,
-        row.max_attempts,
-        row.timeout_ms,
-        row.context,
-    )
-    .insert(&mut transaction, schema)
-    .await?;
+    let outcome = EnqueueRequest::recurring(name, row)
+        .insert(&mut transaction, schema)
+        .await?;
     transaction.commit().await?;
     Ok(outcome)
 }
@@ -316,7 +300,7 @@ pub async fn remove(name: &str) -> Result<()> {
 pub async fn list() -> Result<Vec<RecurringInfo>> {
     let config = config()?;
     let rows: Vec<InfoRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT name, {SCHEDULE_COLUMNS}, task, queue, enabled, managed, next_run_at,
+        "SELECT name, {SCHEDULE_COLUMNS}, task, queue, priority, enabled, managed, next_run_at,
              last_run_at, run_count, finished_at, context
          FROM {recurring}
          ORDER BY name",
@@ -331,6 +315,7 @@ pub async fn list() -> Result<Vec<RecurringInfo>> {
             schedule: row.stored.parse().ok(),
             task: row.task,
             queue: row.queue,
+            priority: Priority::from_level(row.priority),
             enabled: row.enabled,
             managed: row.managed,
             next_run_at: row.next_run_at,

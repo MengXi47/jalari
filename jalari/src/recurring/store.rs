@@ -1,4 +1,5 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
+use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgConnection};
 
 use super::schedule::IntervalUnit;
@@ -7,6 +8,20 @@ use crate::{Cron, Error, ErrorKind, Interval, Result, Schedule, Schema};
 
 pub(crate) const SCHEDULE_COLUMNS: &str =
     "cron, timezone, interval_count, interval_unit, anchor, until_at, max_runs";
+
+pub(crate) const JOB_COLUMNS: &str =
+    "task, payload, queue, max_attempts, timeout_ms, priority, context";
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct StoredJob {
+    pub(crate) task: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) queue: String,
+    pub(crate) max_attempts: i32,
+    pub(crate) timeout_ms: Option<i32>,
+    pub(crate) priority: i16,
+    pub(crate) context: Option<Value>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub(crate) struct StoredSchedule {

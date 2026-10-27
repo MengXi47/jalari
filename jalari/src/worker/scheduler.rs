@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use sqlx::AssertSqlSafe;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -10,7 +9,9 @@ use tracing::{debug, warn};
 
 use super::runner::{ERROR_BACKOFF, Shared, wait};
 use crate::enqueue::{EnqueueOutcome, EnqueueRequest, timeout_ms};
-use crate::recurring::store::{Plan, SCHEDULE_COLUMNS, StoredSchedule, lock_schedule};
+use crate::recurring::store::{
+    JOB_COLUMNS, Plan, SCHEDULE_COLUMNS, StoredJob, StoredSchedule, lock_schedule,
+};
 use crate::{Error, ErrorKind, Result, Schedule};
 
 const HELD_FIRE_BACKOFF: Duration = Duration::from_millis(100);
@@ -20,12 +21,8 @@ struct DueRecurring {
     name: String,
     #[sqlx(flatten)]
     stored: StoredSchedule,
-    task: String,
-    payload: Vec<u8>,
-    queue: String,
-    max_attempts: i32,
-    timeout_ms: Option<i32>,
-    context: Option<Value>,
+    #[sqlx(flatten)]
+    job: StoredJob,
     run_count: i32,
     scheduled_at: DateTime<Utc>,
     now: DateTime<Utc>,
@@ -89,11 +86,13 @@ impl Shared {
 
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {recurring} (name, cron, timezone, task, payload, queue,
-                     max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at)
-                 VALUES ($1, $2, $3, $1, $4, $5, $6, $7, TRUE, $8, $9, $10)
+                     max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at,
+                     priority)
+                 VALUES ($1, $2, $3, $1, $4, $5, $6, $7, TRUE, $8, $9, $10, $11)
                  ON CONFLICT (name) DO UPDATE SET
                      task = EXCLUDED.task, payload = EXCLUDED.payload, queue = EXCLUDED.queue,
                      max_attempts = EXCLUDED.max_attempts, timeout_ms = EXCLUDED.timeout_ms,
+                     priority = EXCLUDED.priority,
                      cron = EXCLUDED.cron, timezone = EXCLUDED.timezone,
                      interval_count = NULL, interval_unit = NULL, anchor = NULL,
                      until_at = NULL, max_runs = NULL,
@@ -116,6 +115,7 @@ impl Shared {
             .bind(plan.next_run_at)
             .bind(plan.run_count)
             .bind(plan.finished_at)
+            .bind(registration.priority.level())
             .execute(&mut *transaction)
             .await?;
             declared_names.push(registration.name.to_owned());
@@ -141,8 +141,8 @@ impl Shared {
         loop {
             let mut transaction = pool.begin().await?;
             let due: Option<DueRecurring> = sqlx::query_as(AssertSqlSafe(format!(
-                "SELECT name, {SCHEDULE_COLUMNS}, task, payload, queue, max_attempts,
-                     timeout_ms, context, run_count, next_run_at AS scheduled_at, now() AS now
+                "SELECT name, {SCHEDULE_COLUMNS}, {JOB_COLUMNS}, run_count,
+                     next_run_at AS scheduled_at, now() AS now
                  FROM {recurring}
                  WHERE enabled AND next_run_at <= now() AND task = ANY($1)
                  ORDER BY next_run_at
@@ -165,17 +165,9 @@ impl Shared {
                 .and_then(|schedule| schedule.next_after(after).map(|next| (schedule, next)));
             match planned {
                 Ok((schedule, next)) => {
-                    let outcome = EnqueueRequest::recurring(
-                        &due.name,
-                        due.task,
-                        due.payload,
-                        due.queue,
-                        due.max_attempts,
-                        due.timeout_ms,
-                        due.context,
-                    )
-                    .insert(&mut transaction, schema)
-                    .await?;
+                    let outcome = EnqueueRequest::recurring(&due.name, due.job)
+                        .insert(&mut transaction, schema)
+                        .await?;
                     let run_count = match outcome {
                         EnqueueOutcome::Inserted(_) => due.run_count.saturating_add(1),
                         _ => due.run_count,

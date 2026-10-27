@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use jalari::admin::{self, JobFilter};
 use jalari::sqlx::postgres::PgPoolOptions;
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
-    CancellationToken, Cron, EnqueueOutcome, ErrorKind, Job, JobResult, RecurringInfo, Schema,
-    Worker, WorkerConfig, recurring,
+    CancellationToken, Cron, EnqueueOutcome, ErrorKind, Job, JobId, JobResult, Priority,
+    RecurringInfo, Schema, Worker, WorkerConfig, recurring,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,7 @@ struct Tick;
 #[jalari::job(cron = "* * * * * *", queue = "ticks")]
 impl Job for Tick {
     const NAME: &'static str = "r_tick";
+    const PRIORITY: Priority = Priority::High;
 
     async fn run(self) -> JobResult {
         record_execution("tick");
@@ -46,6 +48,7 @@ struct Daily {
 #[jalari::job(cron = "0 0 3 * * *", timezone = "Asia/Taipei", queue = "daily")]
 impl Job for Daily {
     const NAME: &'static str = "r_daily";
+    const PRIORITY: Priority = Priority::Low;
 
     async fn run(self) -> JobResult {
         record_execution(&format!("daily:{}", self.label));
@@ -61,6 +64,7 @@ struct Report {
 #[jalari::job(queue = "runtime")]
 impl Job for Report {
     const NAME: &'static str = "r_report";
+    const PRIORITY: Priority = Priority::Urgent;
 
     async fn run(self) -> JobResult {
         record_execution(&format!("report:{}", self.title));
@@ -117,6 +121,17 @@ async fn info(name: &str) -> Option<RecurringInfo> {
         .unwrap()
         .into_iter()
         .find(|info| info.name == name)
+}
+
+async fn priority_of(id: JobId) -> Priority {
+    admin::job(id).await.unwrap().unwrap().job.priority
+}
+
+fn inserted(outcome: EnqueueOutcome) -> JobId {
+    match outcome {
+        EnqueueOutcome::Inserted(id) => id,
+        other => panic!("expected a new job, got {other:?}"),
+    }
 }
 
 async fn wait_until<F: AsyncFn() -> bool>(description: &str, condition: F) {
@@ -201,11 +216,14 @@ async fn test_recurring() {
     let running = tokio::spawn(worker.run(shutdown.child_token()));
 
     check_declared_jobs_are_synced().await;
+    check_declared_schedule_follows_priority_on_sync().await;
     check_code_declared_cron_fires().await;
     check_code_declared_cron_cannot_change_at_runtime(&fixture).await;
     check_runtime_schedule_is_independent().await;
     check_runtime_schedule_can_change_pause_and_cancel().await;
     check_trigger_runs_now().await;
+    check_runtime_schedule_stores_the_type_priority().await;
+    check_trigger_uses_the_stored_priority_without_the_registration(&fixture).await;
     check_recomputed_schedule_never_repeats_a_fired_run(&fixture).await;
     check_each_run_is_enqueued_once_under_contention(&fixture).await;
 
@@ -268,12 +286,26 @@ async fn check_declared_jobs_are_synced() {
     .await;
 }
 
+async fn check_declared_schedule_follows_priority_on_sync() {
+    assert_eq!(info("r_tick").await.unwrap().priority, Priority::High);
+    assert_eq!(info("r_daily").await.unwrap().priority, Priority::Low);
+    assert_eq!(
+        info("other_binary").await.unwrap().priority,
+        Priority::Normal
+    );
+}
+
 async fn check_code_declared_cron_fires() {
     wait_until("the every-second job to run twice", async || {
         executions("tick") >= 2
     })
     .await;
     assert!(info("r_tick").await.unwrap().last_run_at.is_some());
+    let fired = admin::jobs(&JobFilter::new().task("r_tick"), 10, None)
+        .await
+        .unwrap();
+    assert!(!fired.is_empty());
+    assert!(fired.iter().all(|job| job.priority == Priority::High));
 }
 
 async fn check_code_declared_cron_cannot_change_at_runtime(fixture: &Fixture) {
@@ -531,4 +563,40 @@ async fn check_trigger_runs_now() {
 
     let error = recurring::trigger("missing").await.unwrap_err();
     assert_eq!(error.kind, ErrorKind::RecurringNotFound);
+}
+
+async fn check_runtime_schedule_stores_the_type_priority() {
+    let far_future = Cron::new("0 0 0 1 1 *").unwrap();
+    let report = Report {
+        title: "prioritized".to_owned(),
+    };
+    recurring::add_or_update("report_priority", far_future, &report)
+        .await
+        .unwrap();
+    assert_eq!(
+        info("report_priority").await.unwrap().priority,
+        Priority::Urgent
+    );
+    let id = inserted(recurring::trigger("report_priority").await.unwrap());
+    assert_eq!(priority_of(id).await, Priority::Urgent);
+    recurring::remove("report_priority").await.unwrap();
+}
+
+async fn check_trigger_uses_the_stored_priority_without_the_registration(fixture: &Fixture) {
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {} (name, cron, timezone, task, payload, queue, max_attempts, managed,
+             next_run_at, priority)
+         VALUES ('unlinked_priority', '0 0 0 1 1 *', 'UTC', 'unlinked_task', 'null',
+             'nowhere', 1, FALSE, now() + interval '1 day', 1)",
+        fixture.recurring_table()
+    )))
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        info("unlinked_priority").await.unwrap().priority,
+        Priority::High
+    );
+    let id = inserted(recurring::trigger("unlinked_priority").await.unwrap());
+    assert_eq!(priority_of(id).await, Priority::High);
 }

@@ -6,11 +6,12 @@ use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::init::config;
 use crate::job::{JOB_KEY_STATES, context, fingerprint, registry};
+use crate::recurring::store::StoredJob;
 use crate::storage::{JOB_CHANNEL, interval};
 use crate::worker::INTERRUPTED;
 use crate::{
-    EnqueueOptions, EnqueueOutcome, Error, ErrorKind, Job, JobId, OnConflict, Priority, Result,
-    Schema, current_job,
+    EnqueueOptions, EnqueueOutcome, Error, ErrorKind, Job, JobId, OnConflict, Result, Schema,
+    current_job,
 };
 
 const DEFAULT_QUEUE: &str = "default";
@@ -152,30 +153,22 @@ impl EnqueueRequest {
         })
     }
 
-    pub(crate) fn recurring(
-        name: &str,
-        task: String,
-        payload: Vec<u8>,
-        queue: String,
-        max_attempts: i32,
-        timeout_ms: Option<i32>,
-        context: Option<Value>,
-    ) -> Self {
+    pub(crate) fn recurring(name: &str, job: StoredJob) -> Self {
         Self {
-            fingerprint: fingerprint::of_task(&task),
-            task,
-            payload,
-            max_attempts,
-            timeout_ms,
-            queue,
+            fingerprint: fingerprint::of_task(&job.task),
+            task: job.task,
+            payload: job.payload,
+            max_attempts: job.max_attempts,
+            timeout_ms: job.timeout_ms,
+            queue: job.queue,
             run_at: None,
             delay: None,
             job_key: Some(format!("recurring:{name}")),
             queue_key: None,
             on_conflict: OnConflict::KeepExisting,
-            context,
+            context: job.context,
             inherit_when_submitted: false,
-            priority: Priority::Normal.level(),
+            priority: job.priority,
             parent_id: None,
             root_id: None,
             queue_key_limit: None,

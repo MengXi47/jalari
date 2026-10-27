@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use crate::Schedule;
+use crate::{Priority, Schedule};
 
 /// Snapshot of one recurring schedule, as returned by [`list`](crate::recurring::list).
 #[non_exhaustive]
@@ -19,6 +19,11 @@ pub struct RecurringInfo {
     pub task: String,
     /// Queue each run's job goes to.
     pub queue: String,
+    /// Priority of each run's job, taken from the job type when the schedule was written.
+    ///
+    /// A code-declared schedule follows the job type at every worker start; a runtime schedule
+    /// keeps it until [`add_or_update`](crate::recurring::add_or_update) writes it again.
+    pub priority: Priority,
     /// `false` while paused.
     pub enabled: bool,
     /// `true` when declared with `#[jalari::job(cron = ...)]`; such schedules follow the
