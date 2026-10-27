@@ -11,8 +11,8 @@ pub(crate) const JOB_KEY_STATES: &str = "('scheduled', 'enqueued', 'stopped')";
 /// # Examples
 ///
 /// ```rust
-/// assert_eq!(jalari::JobState::Failed.as_str(), "failed");
-/// assert!(jalari::JobState::Succeeded.is_finished());
+/// assert_eq!(jalari::JobState::Running.as_str(), "running");
+/// assert!(jalari::JobState::Discarded.is_finished());
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,10 +21,14 @@ pub enum JobState {
     Scheduled,
     /// Due now, waiting for a worker or being run by one.
     Enqueued,
+    /// Being run by a worker.
+    Running,
     /// Finished successfully.
     Succeeded,
     /// Gave up after its last attempt or a permanent error.
     Failed,
+    /// Gave up on purpose, without retrying; never runs again.
+    Discarded,
     /// Held by [`stop`](crate::stop) until [`restart`](crate::restart).
     Stopped,
     /// Cancelled, or marked for deletion; housekeeping removes it later.
@@ -32,11 +36,13 @@ pub enum JobState {
 }
 
 impl JobState {
-    const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Scheduled,
         Self::Enqueued,
+        Self::Running,
         Self::Succeeded,
         Self::Failed,
+        Self::Discarded,
         Self::Stopped,
         Self::Deleted,
     ];
@@ -46,16 +52,21 @@ impl JobState {
         match self {
             Self::Scheduled => "scheduled",
             Self::Enqueued => "enqueued",
+            Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Discarded => "discarded",
             Self::Stopped => "stopped",
             Self::Deleted => "deleted",
         }
     }
 
-    /// Whether the job will never run again: succeeded, failed or deleted.
+    /// Whether the job will never run again: succeeded, failed, discarded or deleted.
     pub fn is_finished(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Deleted)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Discarded | Self::Deleted
+        )
     }
 
     pub(crate) fn parse(value: &str) -> crate::Result<Self> {
@@ -69,10 +80,40 @@ impl JobState {
                 )
             })
     }
+
+    pub(crate) fn finished_sql() -> String {
+        let finished: Vec<String> = Self::ALL
+            .into_iter()
+            .filter(|state| state.is_finished())
+            .map(|state| format!("'{state}'"))
+            .collect();
+        format!("({})", finished.join(", "))
+    }
 }
 
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_every_state_parses_back_from_its_column_value() {
+        for state in JobState::ALL {
+            assert_eq!(JobState::parse(state.as_str()).unwrap(), state);
+        }
+        assert!(JobState::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn test_finished_sql_lists_exactly_the_finished_states() {
+        assert_eq!(
+            JobState::finished_sql(),
+            "('succeeded', 'failed', 'discarded', 'deleted')"
+        );
     }
 }

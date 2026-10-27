@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use super::execute::{INTERRUPTED, TAKEOVER_DELAY};
 use super::runner::{ERROR_BACKOFF, Shared, wait};
-use crate::Result;
+use crate::{JobState, Result};
 
 const BATCH_SIZE: i64 = 1000;
 const MIN_DELAY: Duration = Duration::from_secs(1);
@@ -59,18 +59,19 @@ impl Shared {
                 let removed = sqlx::query(AssertSqlSafe(format!(
                     "DELETE FROM {job} WHERE id IN (
                          SELECT job.id FROM {job} AS job CROSS JOIN {config} AS config
-                         WHERE (job.state = 'succeeded'
-                                 AND job.updated_at < now() - config.succeeded_retention)
-                             OR (job.state = 'deleted'
-                                 AND job.updated_at < now() - config.deleted_retention)
-                             OR (job.state = 'failed'
-                                 AND job.updated_at < now() - config.failed_retention
-                                 AND (job.queue_key IS NULL OR job.last_error IS DISTINCT FROM $2
-                                     OR job.updated_at < now() - $3))
+                         WHERE job.state IN {finished}
+                             AND job.updated_at < now() - CASE job.state
+                                 WHEN 'succeeded' THEN config.succeeded_retention
+                                 WHEN 'failed' THEN config.failed_retention
+                                 ELSE config.deleted_retention END
+                             AND (job.state <> 'failed' OR job.queue_key IS NULL
+                                 OR job.last_error IS DISTINCT FROM $2
+                                 OR job.updated_at < now() - $3)
                          LIMIT $1
                          FOR UPDATE OF job SKIP LOCKED
                      )",
                     job = schema.table("job"),
+                    finished = JobState::finished_sql(),
                 )))
                 .bind(BATCH_SIZE)
                 .bind(INTERRUPTED)

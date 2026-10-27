@@ -20,7 +20,7 @@ pub struct ClusterConfig {
     pub housekeeping_interval: Duration,
     /// How long succeeded jobs are kept after finishing; defaults to 1 day.
     pub succeeded_retention: Duration,
-    /// How long deleted jobs are kept after finishing; defaults to 7 days.
+    /// How long deleted and discarded jobs are kept after finishing; defaults to 7 days.
     pub deleted_retention: Duration,
     /// How long failed jobs are kept after finishing; `None`, the default, keeps them forever.
     ///

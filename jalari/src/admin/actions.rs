@@ -22,7 +22,7 @@ const MAX_KEY_RETRIES: usize = 3;
 pub enum RetryOutcome {
     /// The job is waiting again with its attempts reset; a worker runs it as soon as it can.
     Retried,
-    /// The job has not failed: it is waiting, running, stopped, succeeded or deleted.
+    /// The job has not failed: it is waiting, running, stopped, succeeded, discarded or deleted.
     NotFailed,
     /// Another job with the same `job_key` is waiting, running or stopped, so this one stays
     /// failed; the id is that other job's.
@@ -50,7 +50,7 @@ pub enum RunNowOutcome {
     /// call holding the row for an instant, such as [`stop`](crate::stop) or a `Replace`, also
     /// answers this; call again.
     Running,
-    /// The job is stopped, succeeded, failed or deleted; [`restart`](crate::restart) a
+    /// The job is stopped, succeeded, failed, discarded or deleted; [`restart`](crate::restart) a
     /// stopped job and [`retry`] a failed one instead.
     NotWaiting,
     /// No job has this id, or housekeeping already removed it.

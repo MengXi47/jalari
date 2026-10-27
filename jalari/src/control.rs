@@ -4,7 +4,7 @@ use crate::init::config;
 use crate::job::Command;
 use crate::storage::JOB_CHANNEL;
 use crate::worker::{Closing, INTERRUPTED, TAKEOVER_DELAY, close};
-use crate::{JobId, Result, Schema};
+use crate::{JobId, JobState, Result, Schema};
 
 /// What [`stop`] did with the job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub enum StopOutcome {
     /// [`WorkerConfig::stop_timeout`](crate::WorkerConfig::stop_timeout). A job that returns `Ok`
     /// first is recorded as succeeded. Call `stop` again to learn the result.
     Requested,
-    /// The job had already succeeded, failed or been cancelled.
+    /// The job had already succeeded, failed, been discarded or been cancelled.
     Finished,
     /// No job has this id, or housekeeping already removed it.
     NotFound,
@@ -51,7 +51,7 @@ pub enum CancelOutcome {
     /// deleted. A job that returns `Ok` first is recorded as succeeded. Call `cancel` again to
     /// learn the result.
     Requested,
-    /// The job had already succeeded, failed or been cancelled.
+    /// The job had already succeeded, failed, been discarded or been cancelled.
     Finished,
     /// No job has this id, or housekeeping already removed it.
     NotFound,
@@ -299,7 +299,7 @@ async fn job_state(
 }
 
 fn is_finished(state: &str) -> bool {
-    matches!(state, "succeeded" | "failed" | "deleted")
+    JobState::parse(state).is_ok_and(JobState::is_finished)
 }
 
 async fn notify(connection: &mut PgConnection, schema: &Schema, queue: &str) -> Result<()> {
