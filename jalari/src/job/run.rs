@@ -1,11 +1,12 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use tokio::task::futures::TaskLocalFuture;
 use tokio_util::sync::CancellationToken;
 
 use super::checkpoint::RunControl;
-use crate::{JobError, JobId};
+use crate::{JobError, JobId, Priority};
 
 tokio::task_local! {
     static CURRENT_JOB: JobRun;
@@ -17,36 +18,22 @@ tokio::task_local! {
 /// [`JobMiddleware`](crate::JobMiddleware) through [`JobMeta`](crate::JobMeta).
 #[derive(Debug, Clone)]
 pub struct JobRun {
-    id: JobId,
-    name: &'static str,
-    queue: Arc<str>,
-    attempt: i32,
-    max_attempts: i32,
-    cancellation: CancellationToken,
-    control: Arc<RunControl>,
+    pub(crate) id: JobId,
+    pub(crate) name: &'static str,
+    pub(crate) queue: Arc<str>,
+    pub(crate) attempt: i32,
+    pub(crate) max_attempts: i32,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) scheduled_at: DateTime<Utc>,
+    pub(crate) priority: Priority,
+    pub(crate) last_error: Option<Arc<str>>,
+    pub(crate) parent_id: Option<JobId>,
+    pub(crate) root_id: JobId,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) control: Arc<RunControl>,
 }
 
 impl JobRun {
-    pub(crate) fn new(
-        id: JobId,
-        name: &'static str,
-        queue: Arc<str>,
-        attempt: i32,
-        max_attempts: i32,
-        cancellation: CancellationToken,
-        control: Arc<RunControl>,
-    ) -> Self {
-        Self {
-            id,
-            name,
-            queue,
-            attempt,
-            max_attempts,
-            cancellation,
-            control,
-        }
-    }
-
     pub(crate) fn control(&self) -> &Arc<RunControl> {
         &self.control
     }
@@ -74,6 +61,48 @@ impl JobRun {
     /// Attempts allowed before the job is marked failed.
     pub fn max_attempts(&self) -> i32 {
         self.max_attempts
+    }
+
+    /// When the job was first enqueued; an [`OnConflict::Replace`](crate::OnConflict::Replace)
+    /// keeps it.
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
+    /// When this attempt became due: the requested run time, the end of a retry's backoff, or
+    /// the time another worker took the job over after its worker stopped.
+    ///
+    /// The time the attempt waited for a worker is `Utc::now() - scheduled_at()`.
+    pub fn scheduled_at(&self) -> DateTime<Utc> {
+        self.scheduled_at
+    }
+
+    /// [`Priority`] the job was claimed with.
+    pub fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    /// Error of the previous attempt, kept until an attempt succeeds.
+    ///
+    /// For a job another worker took over after its worker stopped, it is the interruption
+    /// message. An [`OnConflict::Replace`](crate::OnConflict::Replace) clears it. The full error
+    /// history is in [`admin::job`](crate::admin::job).
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Id of the job that was running when this one was enqueued, if any.
+    ///
+    /// Only an enqueue from the running job's own task records a parent; jobs enqueued from
+    /// tasks it spawns have none.
+    pub fn parent_id(&self) -> Option<JobId> {
+        self.parent_id
+    }
+
+    /// Id of the first job in this chain: the parent's root, or this job's own id when it has no
+    /// parent.
+    pub fn root_id(&self) -> JobId {
+        self.root_id
     }
 
     /// Cancelled when the worker starts shutting down; see [`shutdown_requested`].

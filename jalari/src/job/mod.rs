@@ -13,6 +13,7 @@ pub use checkpoint::{Checkpoint, Command, checkpoint, resume};
 pub(crate) use checkpoint::{Halt, RunControl};
 pub use context::scope;
 pub use definition::{Job, JobResult};
+pub(crate) use error::SNOOZED;
 pub use error::{JobError, snooze};
 pub use id::JobId;
 pub use priority::Priority;

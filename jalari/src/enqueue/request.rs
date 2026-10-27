@@ -9,7 +9,8 @@ use crate::job::{JOB_KEY_STATES, context, fingerprint, registry};
 use crate::storage::{JOB_CHANNEL, interval};
 use crate::worker::INTERRUPTED;
 use crate::{
-    EnqueueOptions, EnqueueOutcome, Error, ErrorKind, Job, JobId, OnConflict, Result, Schema,
+    EnqueueOptions, EnqueueOutcome, Error, ErrorKind, Job, JobId, OnConflict, Priority, Result,
+    Schema, current_job,
 };
 
 const DEFAULT_QUEUE: &str = "default";
@@ -33,19 +34,25 @@ struct ReplaceRow {
 }
 
 pub(crate) struct EnqueueRequest {
-    task: String,
-    payload: Vec<u8>,
-    max_attempts: i32,
-    timeout_ms: Option<i32>,
-    queue: String,
-    run_at: Option<DateTime<Utc>>,
-    delay: Option<Duration>,
-    job_key: Option<String>,
-    queue_key: Option<String>,
-    on_conflict: OnConflict,
-    context: Option<Value>,
-    fingerprint: Option<&'static str>,
-    inherit_when_submitted: bool,
+    pub(super) task: String,
+    pub(super) payload: Vec<u8>,
+    pub(super) max_attempts: i32,
+    pub(super) timeout_ms: Option<i32>,
+    pub(super) queue: String,
+    pub(super) run_at: Option<DateTime<Utc>>,
+    pub(super) delay: Option<Duration>,
+    pub(super) job_key: Option<String>,
+    pub(super) queue_key: Option<String>,
+    pub(super) on_conflict: OnConflict,
+    pub(super) context: Option<Value>,
+    pub(super) fingerprint: Option<&'static str>,
+    pub(super) inherit_when_submitted: bool,
+    pub(super) priority: i16,
+    pub(super) parent_id: Option<i64>,
+    pub(super) root_id: Option<i64>,
+    pub(super) queue_key_limit: Option<i16>,
+    pub(super) expires_at: Option<DateTime<Utc>>,
+    pub(super) expire_after: Option<Duration>,
 }
 
 pub(crate) fn encode_payload<T: Job>(job: &T) -> Result<Vec<u8>> {
@@ -70,6 +77,38 @@ pub(crate) fn timeout_ms(task: &str, timeout: Option<Duration>) -> Result<Option
         .transpose()
 }
 
+fn max_attempts(task: &str, max_attempts: Option<i32>, default: i32) -> Result<i32> {
+    match max_attempts {
+        Some(max_attempts) if max_attempts < 1 => Err(Error::new(
+            ErrorKind::InvalidOptions,
+            format!("{task}: max_attempts {max_attempts} must be at least 1"),
+        )),
+        Some(max_attempts) => Ok(max_attempts),
+        None => Ok(default),
+    }
+}
+
+fn queue_key_limit(task: &str, limit: Option<u16>, keyed: bool) -> Result<Option<i16>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let invalid = |reason: &str| {
+        Err(Error::new(
+            ErrorKind::InvalidOptions,
+            format!("{task}: queue_key_limit {limit} {reason}"),
+        ))
+    };
+    if !keyed {
+        return invalid("needs a queue_key");
+    }
+    match i16::try_from(limit) {
+        Ok(0) => invalid("must be at least 1"),
+        Ok(1) => Ok(None),
+        Ok(limit) => Ok(Some(limit)),
+        Err(_) => invalid(&format!("must be at most {}", i16::MAX)),
+    }
+}
+
 pub(crate) fn default_queue(task: &str) -> &'static str {
     registry::find(task).map_or(DEFAULT_QUEUE, |registration| registration.queue)
 }
@@ -78,6 +117,13 @@ impl EnqueueRequest {
     pub(crate) fn build<T: Job>(job: &T, options: EnqueueOptions) -> Result<Self> {
         let payload = encode_payload(job)?;
         let timeout_ms = timeout_ms(T::NAME, options.timeout.or(T::TIMEOUT))?;
+        let max_attempts = max_attempts(T::NAME, options.max_attempts, T::MAX_ATTEMPTS)?;
+        let queue_key_limit = queue_key_limit(
+            T::NAME,
+            options.queue_key_limit,
+            options.queue_key.is_some(),
+        )?;
+        let lineage = current_job().map(|run| (run.id().0, run.root_id().0));
         let queue = options
             .queue
             .unwrap_or_else(|| default_queue(T::NAME).to_owned());
@@ -87,7 +133,7 @@ impl EnqueueRequest {
             inherit_when_submitted: inherits && context.is_none(),
             task: T::NAME.to_owned(),
             payload,
-            max_attempts: T::MAX_ATTEMPTS,
+            max_attempts,
             timeout_ms,
             queue,
             run_at: options.run_at,
@@ -97,6 +143,12 @@ impl EnqueueRequest {
             on_conflict: options.on_conflict,
             context,
             fingerprint: fingerprint::of_task(T::NAME),
+            priority: options.priority.unwrap_or(T::PRIORITY).level(),
+            parent_id: lineage.map(|(parent_id, _)| parent_id),
+            root_id: lineage.map(|(_, root_id)| root_id),
+            queue_key_limit,
+            expires_at: options.expires_at,
+            expire_after: options.expire_after.map(interval),
         })
     }
 
@@ -123,6 +175,12 @@ impl EnqueueRequest {
             on_conflict: OnConflict::KeepExisting,
             context,
             inherit_when_submitted: false,
+            priority: Priority::Normal.level(),
+            parent_id: None,
+            root_id: None,
+            queue_key_limit: None,
+            expires_at: None,
+            expire_after: None,
         }
     }
 
@@ -141,7 +199,7 @@ impl EnqueueRequest {
         request.insert(connection, &config.schema).await
     }
 
-    fn inherit_context(mut self) -> Result<Self> {
+    pub(super) fn inherit_context(mut self) -> Result<Self> {
         if self.inherit_when_submitted {
             self.context = context::current().into_value(&self.task)?;
         }
@@ -200,9 +258,11 @@ impl EnqueueRequest {
     ) -> Result<Option<JobId>> {
         let sql = format!(
             "INSERT INTO {job} (queue, task, payload, state, job_key, queue_key, max_attempts, \
-                 run_at, timeout_ms, context, fingerprint)
+                 run_at, timeout_ms, context, fingerprint, priority, parent_id, root_id, \
+                 queue_key_limit, expires_at)
              SELECT $1, $2, $3, CASE WHEN input.run_at > now() THEN 'scheduled' ELSE 'enqueued' END,
-                 $4, $5, $6, input.run_at, $7, $10, $11
+                 $4, $5, $6, input.run_at, $7, $10, $11, $12, $13, $14, $15,
+                 COALESCE($16::timestamptz, statement_timestamp() + $17::interval)
              FROM (SELECT COALESCE($8::timestamptz, now() + COALESCE($9::interval, interval '0'))
                  AS run_at) AS input
              ON CONFLICT (job_key) WHERE job_key IS NOT NULL AND state IN {JOB_KEY_STATES}
@@ -222,6 +282,12 @@ impl EnqueueRequest {
             .bind(self.delay)
             .bind(&self.context)
             .bind(self.fingerprint)
+            .bind(self.priority)
+            .bind(self.parent_id)
+            .bind(self.root_id)
+            .bind(self.queue_key_limit)
+            .bind(self.expires_at)
+            .bind(self.expire_after)
             .fetch_optional(connection)
             .await?;
         Ok(id.map(JobId))
@@ -250,7 +316,10 @@ impl EnqueueRequest {
                      queue_key = $4, attempts = 0, max_attempts = $5, run_at = input.run_at,
                      timeout_ms = $6,
                      last_error = CASE WHEN target.takeover_at IS NOT NULL THEN $11 END,
-                     context = $10, fingerprint = $12, updated_at = statement_timestamp()
+                     context = $10, fingerprint = $12, priority = $13, parent_id = $14,
+                     root_id = $15, queue_key_limit = $16,
+                     expires_at = COALESCE($17::timestamptz, statement_timestamp() + $18::interval),
+                     updated_at = statement_timestamp()
                  FROM target, LATERAL (
                      SELECT greatest(
                          COALESCE($7::timestamptz, now() + COALESCE($8::interval, interval '0')),
@@ -287,6 +356,12 @@ impl EnqueueRequest {
                 .bind(&self.context)
                 .bind(INTERRUPTED)
                 .bind(self.fingerprint)
+                .bind(self.priority)
+                .bind(self.parent_id)
+                .bind(self.root_id)
+                .bind(self.queue_key_limit)
+                .bind(self.expires_at)
+                .bind(self.expire_after)
                 .fetch_optional(&mut *connection)
                 .await?;
             match row {
@@ -340,4 +415,35 @@ async fn pending_id(
         .fetch_optional(connection)
         .await?;
     Ok(id.map(JobId))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_max_attempts_rejects_values_below_one() {
+        for value in [0, -1] {
+            let error = max_attempts("task", Some(value), 10).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidOptions);
+            assert!(error.msg.contains("max_attempts"), "{}", error.msg);
+        }
+        assert_eq!(max_attempts("task", Some(1), 10).unwrap(), 1);
+        assert_eq!(max_attempts("task", None, 10).unwrap(), 10);
+    }
+
+    #[test]
+    fn test_queue_key_limit_stores_one_as_no_limit() {
+        assert_eq!(queue_key_limit("task", None, false).unwrap(), None);
+        assert_eq!(queue_key_limit("task", Some(1), true).unwrap(), None);
+        assert_eq!(queue_key_limit("task", Some(4), true).unwrap(), Some(4));
+        assert_eq!(
+            queue_key_limit("task", Some(32_767), true).unwrap(),
+            Some(i16::MAX)
+        );
+        for (limit, keyed) in [(0, true), (32_768, true), (40_000, true), (2, false)] {
+            let error = queue_key_limit("task", Some(limit), keyed).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidOptions, "{limit} {keyed}");
+        }
+    }
 }

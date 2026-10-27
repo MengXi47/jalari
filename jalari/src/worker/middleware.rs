@@ -5,11 +5,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::job::registry::{ContextKey, JobFuture};
-use crate::{JobError, JobId, JobResult, JobRun};
+use crate::{JobError, JobId, JobResult, JobRun, Priority};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -186,6 +187,36 @@ impl JobMeta {
     /// Attempts allowed before the job is marked failed.
     pub fn max_attempts(&self) -> i32 {
         self.run.max_attempts()
+    }
+
+    /// When the job was first enqueued; see [`JobRun::created_at`].
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.run.created_at()
+    }
+
+    /// When this attempt became due; see [`JobRun::scheduled_at`].
+    pub fn scheduled_at(&self) -> DateTime<Utc> {
+        self.run.scheduled_at()
+    }
+
+    /// [`Priority`] the job was claimed with.
+    pub fn priority(&self) -> Priority {
+        self.run.priority()
+    }
+
+    /// Error of the previous attempt; see [`JobRun::last_error`].
+    pub fn last_error(&self) -> Option<&str> {
+        self.run.last_error()
+    }
+
+    /// Id of the job that was running when this one was enqueued, if any.
+    pub fn parent_id(&self) -> Option<JobId> {
+        self.run.parent_id()
+    }
+
+    /// Id of the first job in this chain; see [`JobRun::root_id`].
+    pub fn root_id(&self) -> JobId {
+        self.run.root_id()
     }
 
     /// The context stored with the job, decoded as `T`; `None` when the job has none.

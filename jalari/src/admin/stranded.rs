@@ -17,7 +17,7 @@ const STALE_FLOOR: Duration = Duration::from_secs(12);
 /// build of the task and jobs whose task no live worker knows at all. It also appears when the
 /// jobs are running on a worker whose heartbeat is older than the cluster's
 /// [`worker_timeout`](crate::ClusterConfig::worker_timeout) and no live worker is left to take
-/// them over.
+/// them over. Jobs past their `expires_at` are not listed, since no worker would start them.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrandedJobs {
@@ -29,6 +29,9 @@ pub struct StrandedJobs {
     pub fingerprint: Option<String>,
     /// How many jobs are in the group.
     pub count: i64,
+    /// Whether the queue is paused with [`pause_queue`](super::pause_queue); its jobs wait for
+    /// [`resume_queue`](super::resume_queue) as well.
+    pub paused: bool,
     /// Earliest `run_at` in the group, or the earliest last heartbeat of a dead worker.
     pub since: DateTime<Utc>,
 }
@@ -39,6 +42,7 @@ struct StrandedRow {
     task: String,
     fingerprint: Option<String>,
     count: i64,
+    paused: bool,
     since: DateTime<Utc>,
 }
 
@@ -81,12 +85,15 @@ pub(crate) async fn stranded_in(
     queues: Option<&[String]>,
 ) -> Result<Vec<StrandedJobs>> {
     let rows: Vec<StrandedRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT job.queue, job.task, job.fingerprint, count(*) AS count, min(job.run_at) AS since
+        "SELECT job.queue, job.task, job.fingerprint, count(*) AS count,
+             EXISTS (SELECT 1 FROM {queue_pause} AS pause WHERE pause.queue = job.queue) AS paused,
+             min(job.run_at) AS since
          FROM (
              SELECT job.queue, job.task, job.fingerprint, job.run_at
              FROM {job} AS job
              WHERE job.state IN ('scheduled', 'enqueued')
                  AND job.run_at <= now()
+                 AND (job.expires_at IS NULL OR job.expires_at > now())
                  AND ($1::text[] IS NULL OR job.queue = ANY($1))
                  AND NOT EXISTS (
                      SELECT 1 FROM {worker} AS worker
@@ -109,6 +116,7 @@ pub(crate) async fn stranded_in(
         job = schema.table("job"),
         worker = schema.table("worker"),
         config = schema.table("config"),
+        queue_pause = schema.table("queue_pause"),
         compatible = compatible("worker.tasks"),
     )))
     .bind(queues)
@@ -122,6 +130,7 @@ pub(crate) async fn stranded_in(
             task: row.task,
             fingerprint: row.fingerprint,
             count: row.count,
+            paused: row.paused,
             since: row.since,
         })
         .collect())

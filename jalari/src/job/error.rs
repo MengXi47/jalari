@@ -4,6 +4,8 @@ use std::time::Duration;
 use super::checkpoint::Halt;
 use crate::JobResult;
 
+pub(crate) const SNOOZED: &str = "the job asked to run again later";
+
 /// Failure of one attempt of [`Job::run`](crate::Job::run).
 ///
 /// Any `std::error::Error` converts into a retryable `JobError`, so `?` works inside `run`. Use

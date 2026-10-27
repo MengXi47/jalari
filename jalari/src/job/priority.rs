@@ -8,7 +8,7 @@
 /// # Examples
 ///
 /// ```rust,no_run
-/// use jalari::{Job, JobResult, Priority};
+/// use jalari::{EnqueueOptions, Job, JobResult, Priority};
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Serialize, Deserialize)]
@@ -25,6 +25,12 @@
 ///         Ok(())
 ///     }
 /// }
+///
+/// # async fn example() -> jalari::Result<()> {
+/// let reset = PasswordReset { user_id: 7 };
+/// jalari::enqueue_with(&reset, EnqueueOptions::new().priority(Priority::Low)).await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Priority {
@@ -48,10 +54,6 @@ impl Priority {
         Priority::Low,
     ];
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by enqueue and admin in the next commit")
-    )]
     pub(crate) const fn level(self) -> i16 {
         match self {
             Self::Low => -1,
@@ -61,10 +63,6 @@ impl Priority {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by admin in the next commit")
-    )]
     pub(crate) const fn from_level(level: i16) -> Self {
         match level {
             ..=-1 => Self::Low,

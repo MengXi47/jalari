@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
+use tracing::{debug, info, warn};
 
 use crate::job::{Command, Halt, JobState};
 use crate::{JobError, JobResult, RetryPolicy};
@@ -163,6 +164,20 @@ impl Closing {
 
     pub(super) fn kept(&self) -> Option<&Value> {
         self.kept.as_ref()
+    }
+
+    pub(super) fn log(&self, job_id: i64) {
+        let duration_ms = self.duration_ms;
+        match &self.outcome {
+            Outcome::Succeeded => debug!(duration_ms, "job succeeded"),
+            Outcome::Retry { delay, error } => {
+                warn!(error = %error, ?delay, "job failed, retrying");
+            }
+            Outcome::Failed { error } => warn!(error = %error, "job failed"),
+            Outcome::Released { note } => info!(job_id, note = %note, "job released"),
+            Outcome::Stopped { note } => info!(job_id, note = %note, "job stopped"),
+            Outcome::Cancelled { note } => info!(job_id, note = %note, "job cancelled"),
+        }
     }
 }
 

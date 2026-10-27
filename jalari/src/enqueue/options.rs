@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::JobId;
 use crate::job::context::Captured;
+use crate::{JobId, Priority};
 
 /// What to do when a job with the same `job_key` is already waiting, running or stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -74,6 +74,11 @@ pub struct EnqueueOptions {
     pub(super) timeout: Option<Duration>,
     pub(super) on_conflict: OnConflict,
     pub(super) context: ContextChoice,
+    pub(super) priority: Option<Priority>,
+    pub(super) max_attempts: Option<i32>,
+    pub(super) queue_key_limit: Option<u16>,
+    pub(super) expires_at: Option<DateTime<Utc>>,
+    pub(super) expire_after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -148,9 +153,62 @@ impl EnqueueOptions {
         self
     }
 
+    /// Lets up to `limit` jobs that share the [`queue_key`](Self::queue_key) run at the same
+    /// time; defaults to 1.
+    ///
+    /// Each job runs only when one of the first `limit` slots of its key is free, so jobs of one
+    /// key with different limits share the slots: a job with the default limit of 1 needs the
+    /// first slot. The enqueue returns [`InvalidOptions`](crate::ErrorKind::InvalidOptions) for
+    /// a limit of 0, a limit above 32767, or a limit without a `queue_key`.
+    pub fn queue_key_limit(mut self, limit: u16) -> Self {
+        self.queue_key_limit = Some(limit);
+        self
+    }
+
     /// Overrides [`Job::TIMEOUT`](crate::Job::TIMEOUT) for this job.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Overrides [`Job::PRIORITY`](crate::Job::PRIORITY) for this job.
+    ///
+    /// With [`OnConflict::Replace`] the replaced job takes this priority; a job kept by
+    /// [`OnConflict::KeepExisting`] keeps its own.
+    pub fn priority(mut self, priority: Priority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Overrides [`Job::MAX_ATTEMPTS`](crate::Job::MAX_ATTEMPTS) for this job.
+    ///
+    /// [`admin::retry`](crate::admin::retry) gives the job this many attempts again, and an
+    /// [`OnConflict::Replace`] writes it over the replaced job's. The enqueue returns
+    /// [`InvalidOptions`](crate::ErrorKind::InvalidOptions) if it is below 1.
+    pub fn max_attempts(mut self, max_attempts: i32) -> Self {
+        self.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Discards the job if it is still waiting at `expires_at`; a running attempt is never cut
+    /// short.
+    ///
+    /// The rule holds for every wait, including retries, snoozes, releases and restarts. The job
+    /// ends [`Discarded`](crate::JobState::Discarded) and frees its `job_key`. Replaces any
+    /// earlier [`expire_after`](Self::expire_after).
+    pub fn expires_at(mut self, expires_at: DateTime<Utc>) -> Self {
+        self.expires_at = Some(expires_at);
+        self.expire_after = None;
+        self
+    }
+
+    /// Discards the job if it is still waiting `after` the enqueue, measured by the database
+    /// clock and including any [`delay`](Self::delay); a running attempt is never cut short.
+    ///
+    /// Otherwise it behaves like [`expires_at`](Self::expires_at), which it replaces.
+    pub fn expire_after(mut self, after: Duration) -> Self {
+        self.expire_after = Some(after);
+        self.expires_at = None;
         self
     }
 

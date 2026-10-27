@@ -143,7 +143,7 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
     let mut after = 0_i64;
     loop {
         let query = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT id FROM {job} WHERE {FILTER_SQL} AND id > $9 ORDER BY id LIMIT $10",
+            "SELECT id FROM {job} WHERE {FILTER_SQL} AND id > $12 ORDER BY id LIMIT $13",
             job = schema.table("job"),
         )));
         let ids: Vec<i64> = bind_filter!(query, filter)

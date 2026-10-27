@@ -1,9 +1,12 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, TimeDelta, Utc};
+use jalari::admin;
 use jalari::sqlx::postgres::{PgListener, PgPoolOptions};
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
-    EnqueueOptions, EnqueueOutcome, ErrorKind, Job, JobId, JobResult, OnConflict, Schema, Worker,
+    EnqueueOptions, EnqueueOutcome, ErrorKind, Job, JobId, JobResult, OnConflict, Priority, Schema,
+    Worker,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +20,19 @@ impl Job for SendEmail {
     const NAME: &'static str = "test_send_email";
     const MAX_ATTEMPTS: i32 = 5;
     const TIMEOUT: Option<Duration> = Some(Duration::from_secs(30));
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Alarm;
+
+#[jalari::job(queue = "alarms")]
+impl Job for Alarm {
+    const NAME: &'static str = "test_alarm";
+    const PRIORITY: Priority = Priority::Urgent;
 
     async fn run(self) -> JobResult {
         Ok(())
@@ -46,6 +62,15 @@ struct JobRow {
     attempts: i32,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct OptionsRow {
+    priority: i16,
+    max_attempts: i32,
+    queue_key_limit: Option<i16>,
+    expires_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
 struct Fixture {
     pool: PgPool,
     schema_name: String,
@@ -55,6 +80,18 @@ impl Fixture {
     async fn row(&self, id: JobId) -> JobRow {
         sqlx::query_as(AssertSqlSafe(format!(
             "SELECT queue, task, state, payload, max_attempts, timeout_ms, attempts
+             FROM \"{}\".job WHERE id = $1",
+            self.schema_name
+        )))
+        .bind(id.0)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn options(&self, id: JobId) -> OptionsRow {
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT priority, max_attempts, queue_key_limit, expires_at, created_at
              FROM \"{}\".job WHERE id = $1",
             self.schema_name
         )))
@@ -127,6 +164,13 @@ async fn test_init_and_enqueue() {
     check_enqueue_in_follows_transaction(&fixture).await;
     check_enqueue_notifies_queue(&fixture).await;
     check_worker_build_checks_connections().await;
+    check_priority_defaults_to_the_job_type(&fixture).await;
+    check_enqueue_option_overrides_priority(&fixture).await;
+    check_replace_takes_the_new_priority_and_keep_existing_keeps_the_old(&fixture).await;
+    check_enqueue_rejects_max_attempts_below_one(&fixture).await;
+    check_replace_writes_the_new_max_attempts(&fixture).await;
+    check_key_limit_validation(&fixture).await;
+    check_expiry_is_stored(&fixture).await;
 
     sqlx::raw_sql(AssertSqlSafe(format!(
         "DROP SCHEMA \"{schema_name}\" CASCADE"
@@ -331,4 +375,175 @@ async fn check_worker_build_checks_connections() {
         .build()
         .await
         .unwrap();
+}
+
+async fn info(id: JobId) -> admin::JobInfo {
+    admin::job(id).await.unwrap().unwrap().job
+}
+
+fn later() -> EnqueueOptions {
+    EnqueueOptions::new().delay(Duration::from_secs(3600))
+}
+
+async fn check_priority_defaults_to_the_job_type(fixture: &Fixture) {
+    let alarm = jalari::enqueue(&Alarm).await.unwrap().id();
+    let plain = jalari::enqueue(&email("priority@example.com"))
+        .await
+        .unwrap()
+        .id();
+    assert_eq!(fixture.options(alarm).await.priority, 2);
+    assert_eq!(fixture.options(plain).await.priority, 0);
+    assert_eq!(info(alarm).await.priority, Priority::Urgent);
+    assert_eq!(info(plain).await.priority, Priority::Normal);
+}
+
+async fn check_enqueue_option_overrides_priority(fixture: &Fixture) {
+    let low = jalari::enqueue_with(&Alarm, EnqueueOptions::new().priority(Priority::Low))
+        .await
+        .unwrap()
+        .id();
+    let high = jalari::enqueue_with(
+        &email("high@example.com"),
+        EnqueueOptions::new().priority(Priority::High),
+    )
+    .await
+    .unwrap()
+    .id();
+    assert_eq!(fixture.options(low).await.priority, -1);
+    assert_eq!(fixture.options(high).await.priority, 1);
+    assert_eq!(info(low).await.priority, Priority::Low);
+}
+
+async fn check_replace_takes_the_new_priority_and_keep_existing_keeps_the_old(fixture: &Fixture) {
+    let keyed = |priority: Priority| later().job_key("priority-key").priority(priority);
+    let EnqueueOutcome::Inserted(id) =
+        jalari::enqueue_with(&email("keyed@example.com"), keyed(Priority::High))
+            .await
+            .unwrap()
+    else {
+        panic!("the first keyed enqueue inserts");
+    };
+    let kept = jalari::enqueue_with(&email("keyed@example.com"), keyed(Priority::Low))
+        .await
+        .unwrap();
+    assert_eq!(kept, EnqueueOutcome::Kept(id));
+    assert_eq!(fixture.options(id).await.priority, 1);
+    let replaced = jalari::enqueue_with(
+        &email("keyed@example.com"),
+        keyed(Priority::Urgent).on_conflict(OnConflict::Replace),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced, EnqueueOutcome::Replaced(id));
+    assert_eq!(fixture.options(id).await.priority, 2);
+}
+
+async fn check_enqueue_rejects_max_attempts_below_one(fixture: &Fixture) {
+    let before = fixture.count().await;
+    for max_attempts in [0, -3] {
+        let error = jalari::enqueue_with(
+            &email("attempts@example.com"),
+            EnqueueOptions::new().max_attempts(max_attempts),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidOptions, "{max_attempts}");
+        assert!(error.msg.contains("max_attempts"), "{}", error.msg);
+    }
+    assert_eq!(fixture.count().await, before);
+    let id = jalari::enqueue_with(
+        &email("attempts@example.com"),
+        EnqueueOptions::new().max_attempts(2),
+    )
+    .await
+    .unwrap()
+    .id();
+    assert_eq!(fixture.options(id).await.max_attempts, 2);
+}
+
+async fn check_replace_writes_the_new_max_attempts(fixture: &Fixture) {
+    let keyed = |max_attempts: i32| later().job_key("attempts-key").max_attempts(max_attempts);
+    let id = jalari::enqueue_with(&email("replace@example.com"), keyed(3))
+        .await
+        .unwrap()
+        .id();
+    assert_eq!(fixture.options(id).await.max_attempts, 3);
+    let replaced = jalari::enqueue_with(
+        &email("replace@example.com"),
+        keyed(7).on_conflict(OnConflict::Replace),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced, EnqueueOutcome::Replaced(id));
+    assert_eq!(fixture.options(id).await.max_attempts, 7);
+}
+
+async fn check_key_limit_validation(fixture: &Fixture) {
+    let before = fixture.count().await;
+    for options in [
+        later().queue_key("limits").queue_key_limit(0),
+        later().queue_key("limits").queue_key_limit(40_000),
+        later().queue_key_limit(2),
+    ] {
+        let error = jalari::enqueue_with(&email("limit@example.com"), options)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidOptions);
+        assert!(error.msg.contains("queue_key_limit"), "{}", error.msg);
+    }
+    assert_eq!(fixture.count().await, before);
+    for (limit, stored) in [(1, None), (4, Some(4))] {
+        let options = later().queue_key("limits").queue_key_limit(limit);
+        let id = jalari::enqueue_with(&email("limit@example.com"), options)
+            .await
+            .unwrap()
+            .id();
+        assert_eq!(fixture.options(id).await.queue_key_limit, stored);
+        assert_eq!(info(id).await.queue_key_limit, limit);
+    }
+    let default = jalari::enqueue_with(&email("limit@example.com"), later().queue_key("limits"))
+        .await
+        .unwrap()
+        .id();
+    assert_eq!(info(default).await.queue_key_limit, 1);
+}
+
+async fn check_expiry_is_stored(fixture: &Fixture) {
+    let at =
+        DateTime::from_timestamp_micros((Utc::now() + TimeDelta::minutes(5)).timestamp_micros())
+            .unwrap();
+    let after = Duration::from_secs(120);
+    let enqueue = |options: EnqueueOptions| async move {
+        jalari::enqueue_with(&email("expiry@example.com"), options)
+            .await
+            .unwrap()
+            .id()
+    };
+
+    let absolute = enqueue(later().expires_at(at)).await;
+    assert_eq!(fixture.options(absolute).await.expires_at, Some(at));
+    assert_eq!(info(absolute).await.expires_at, Some(at));
+
+    let relative = enqueue(later().expire_after(after)).await;
+    let row = fixture.options(relative).await;
+    let lifetime = (row.expires_at.unwrap() - row.created_at).to_std().unwrap();
+    assert!(
+        (after..after + Duration::from_secs(1)).contains(&lifetime),
+        "{lifetime:?}"
+    );
+
+    let replaced_by_absolute = enqueue(later().expire_after(after).expires_at(at)).await;
+    assert_eq!(
+        fixture.options(replaced_by_absolute).await.expires_at,
+        Some(at)
+    );
+    let replaced_by_relative = enqueue(later().expires_at(at).expire_after(after)).await;
+    assert_ne!(
+        fixture.options(replaced_by_relative).await.expires_at,
+        Some(at)
+    );
+    assert_eq!(
+        fixture.options(enqueue(later()).await).await.expires_at,
+        None
+    );
 }

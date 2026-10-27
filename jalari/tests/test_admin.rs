@@ -9,7 +9,7 @@ use jalari::sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
     CancellationToken, Command, EnqueueOptions, ErrorKind, Job, JobError, JobId, JobResult,
-    JobState, OnConflict, Schema, StopOutcome, Worker, WorkerConfig,
+    JobState, OnConflict, Priority, Schema, StopOutcome, Worker, WorkerConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -180,6 +180,10 @@ async fn test_admin() {
     check_run_now(&fixture).await;
     check_retry_of_an_interrupted_job(&fixture).await;
     check_throughput(&fixture).await;
+    check_filter_by_priority().await;
+    check_filter_by_parent_and_root(&fixture).await;
+    check_stranded_marks_paused_queues_and_skips_expired_jobs(&fixture).await;
+    check_throughput_tells_snoozes_and_discards_apart(&fixture).await;
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(10), running)
@@ -677,4 +681,184 @@ async fn check_throughput(fixture: &Fixture) {
     let total: i64 = stats.iter().map(|count| count.count).sum();
     assert_eq!(total, admin::count(&JobFilter::new()).await.unwrap());
     let _ = fixture;
+}
+
+async fn enqueue_on(queue: &str, label: &str, options: EnqueueOptions) -> JobId {
+    jalari::enqueue_with(&ping(label, 0), options.queue(queue))
+        .await
+        .unwrap()
+        .id()
+}
+
+async fn ids(filter: &JobFilter) -> Vec<JobId> {
+    let mut ids: Vec<JobId> = admin::jobs(filter, 100, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+    ids.sort_by_key(|id| id.0);
+    ids
+}
+
+async fn check_filter_by_priority() {
+    let later = || EnqueueOptions::new().delay(Duration::from_secs(3600));
+    let mut by_priority = HashMap::new();
+    for priority in [
+        Priority::Low,
+        Priority::Normal,
+        Priority::High,
+        Priority::Urgent,
+        Priority::Urgent,
+    ] {
+        let id = enqueue_on("by-priority", "priority", later().priority(priority)).await;
+        by_priority
+            .entry(priority)
+            .or_insert_with(Vec::new)
+            .push(id);
+    }
+    let queue = JobFilter::new().queue("by-priority");
+    assert_eq!(admin::count(&queue).await.unwrap(), 5);
+    assert_eq!(
+        ids(&queue.clone().priority(Priority::Urgent)).await,
+        by_priority[&Priority::Urgent]
+    );
+    let mut high_or_urgent = by_priority[&Priority::High].clone();
+    high_or_urgent.extend(&by_priority[&Priority::Urgent]);
+    assert_eq!(
+        ids(&queue
+            .clone()
+            .priority(Priority::High)
+            .priority(Priority::Urgent))
+        .await,
+        high_or_urgent
+    );
+    assert_eq!(
+        admin::count(
+            &queue
+                .clone()
+                .priority(Priority::Low)
+                .state(JobState::Failed)
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    for job in admin::jobs(&queue, 100, None).await.unwrap() {
+        assert!(by_priority[&job.priority].contains(&job.id), "{job:?}");
+    }
+}
+
+async fn check_filter_by_parent_and_root(fixture: &Fixture) {
+    let later = || EnqueueOptions::new().delay(Duration::from_secs(3600));
+    let a = enqueue_on("lineage", "a", later()).await;
+    let b = enqueue_on("lineage", "b", later()).await;
+    let c = enqueue_on("lineage", "c", EnqueueOptions::new()).await;
+    let alone = enqueue_on("lineage", "alone", later()).await;
+    for (child, parent) in [(b, a), (c, b)] {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {} SET parent_id = $2, root_id = $3 WHERE id = $1",
+            fixture.table("job")
+        )))
+        .bind(child.0)
+        .bind(parent.0)
+        .bind(a.0)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(ids(&JobFilter::new().root(a)).await, [a, b, c]);
+    assert_eq!(ids(&JobFilter::new().parent(a)).await, [b]);
+    assert_eq!(ids(&JobFilter::new().parent(b)).await, [c]);
+    assert_eq!(ids(&JobFilter::new().root(alone)).await, [alone]);
+    assert_eq!(
+        ids(&JobFilter::new().root(a).state(JobState::Scheduled)).await,
+        [a, b]
+    );
+    assert_eq!(
+        admin::count(&JobFilter::new().root(a).parent(b))
+            .await
+            .unwrap(),
+        1
+    );
+    let child = admin::job(c).await.unwrap().unwrap().job;
+    assert_eq!((child.parent_id, child.root_id), (Some(b), Some(a)));
+    let top = admin::job(a).await.unwrap().unwrap().job;
+    assert_eq!((top.parent_id, top.root_id), (None, None));
+}
+
+async fn check_stranded_marks_paused_queues_and_skips_expired_jobs(fixture: &Fixture) {
+    for label in ["paused-1", "paused-2"] {
+        enqueue_on("paused-queue", label, EnqueueOptions::new()).await;
+    }
+    enqueue_on(
+        "expired-queue",
+        "expired",
+        EnqueueOptions::new().expires_at(Utc::now() - TimeDelta::seconds(1)),
+    )
+    .await;
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {} (queue) VALUES ('paused-queue')",
+        fixture.table("queue_pause")
+    )))
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    let groups = admin::stranded().await.unwrap();
+    let paused = groups
+        .iter()
+        .find(|group| group.queue == "paused-queue")
+        .unwrap_or_else(|| panic!("{groups:?}"));
+    assert!(paused.paused);
+    assert_eq!(paused.count, 2);
+    let lineage = groups
+        .iter()
+        .find(|group| group.queue == "lineage")
+        .unwrap_or_else(|| panic!("{groups:?}"));
+    assert!(!lineage.paused);
+    assert!(
+        groups.iter().all(|group| group.queue != "expired-queue"),
+        "{groups:?}"
+    );
+}
+
+async fn check_throughput_tells_snoozes_and_discards_apart(fixture: &Fixture) {
+    let id = enqueue_on(
+        "raw-throughput",
+        "raw",
+        EnqueueOptions::new().delay(Duration::from_secs(3600)),
+    )
+    .await;
+    for (state, attempt, error) in [
+        ("scheduled", 1, "the first attempt failed"),
+        ("scheduled", 1, "the job asked to run again later"),
+        ("scheduled", 1, "the job asked to run again later"),
+        ("discarded", 2, "nothing left to do"),
+        ("failed", 2, "gave up"),
+    ] {
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {} (job_id, state, attempt, error, duration_ms)
+             VALUES ($1, $2, $3, $4, 10)",
+            fixture.table("job_history")
+        )))
+        .bind(id.0)
+        .bind(state)
+        .bind(attempt)
+        .bind(error)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    }
+    let throughput = admin::throughput(Duration::from_secs(3600)).await.unwrap();
+    let raw = throughput
+        .iter()
+        .find(|queue| queue.queue == "raw-throughput")
+        .unwrap();
+    assert_eq!(
+        (raw.retried, raw.snoozed, raw.discarded, raw.failed),
+        (1, 2, 1, 1),
+        "{raw:?}"
+    );
 }

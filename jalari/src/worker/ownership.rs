@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -28,6 +29,12 @@ struct ClaimedRow {
     max_attempts: i32,
     timeout_ms: Option<i32>,
     context: Option<Value>,
+    priority: i16,
+    created_at: DateTime<Utc>,
+    scheduled_at: DateTime<Utc>,
+    last_error: Option<String>,
+    parent_id: Option<i64>,
+    root_id: Option<i64>,
     lease: i64,
     progress: Option<Value>,
 }
@@ -40,6 +47,12 @@ pub(super) struct Claimed {
     pub(super) max_attempts: i32,
     pub(super) timeout_ms: Option<i32>,
     pub(super) context: Option<Value>,
+    pub(super) priority: i16,
+    pub(super) created_at: DateTime<Utc>,
+    pub(super) scheduled_at: DateTime<Utc>,
+    pub(super) last_error: Option<String>,
+    pub(super) parent_id: Option<i64>,
+    pub(super) root_id: Option<i64>,
     pub(super) lease: i64,
     pub(super) progress: Option<Value>,
 }
@@ -99,7 +112,7 @@ impl Shared {
                      ) AS alive
              ),
              picked AS (
-                 SELECT job.id FROM {job} AS job
+                 SELECT job.id, job.run_at FROM {job} AS job
                  WHERE (SELECT alive FROM alive)
                      AND job.queue = $1
                      AND job.state IN ('scheduled', 'enqueued')
@@ -122,7 +135,9 @@ impl Shared {
                  FROM picked
                  WHERE claimed.id = picked.id
                  RETURNING claimed.id, claimed.task, claimed.payload, claimed.attempts,
-                     claimed.max_attempts, claimed.timeout_ms, claimed.context
+                     claimed.max_attempts, claimed.timeout_ms, claimed.context, claimed.priority,
+                     claimed.created_at, picked.run_at AS scheduled_at, claimed.last_error,
+                     claimed.parent_id, claimed.root_id
              ),
              control AS (
                  SELECT control.job_id, control.lease, control.progress
@@ -131,8 +146,9 @@ impl Shared {
                  FOR SHARE
              )
              SELECT claimed.id, claimed.task, claimed.payload, claimed.attempts,
-                 claimed.max_attempts, claimed.timeout_ms, claimed.context,
-                 coalesce(control.lease, 0) AS lease, control.progress
+                 claimed.max_attempts, claimed.timeout_ms, claimed.context, claimed.priority,
+                 claimed.created_at, claimed.scheduled_at, claimed.last_error, claimed.parent_id,
+                 claimed.root_id, coalesce(control.lease, 0) AS lease, control.progress
              FROM claimed
              LEFT JOIN control ON control.job_id = claimed.id",
             job = schema.table("job"),
@@ -170,6 +186,12 @@ impl Shared {
                     max_attempts: row.max_attempts,
                     timeout_ms: row.timeout_ms,
                     context: row.context,
+                    priority: row.priority,
+                    created_at: row.created_at,
+                    scheduled_at: row.scheduled_at,
+                    last_error: row.last_error,
+                    parent_id: row.parent_id,
+                    root_id: row.root_id,
                     lease: row.lease,
                     progress: row.progress,
                 };

@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, info_span, warn};
 
-use super::close::{Closing, Ending, Outcome, decide};
+use super::close::{Closing, Ending, decide};
 use super::lifeline::Incarnation;
 use super::middleware::{JobMeta, Next};
 use super::ownership::{Claimed, Closed, close};
@@ -15,7 +15,7 @@ use super::runs::{PendingClaim, Registration};
 use crate::job::context::{self, Captured};
 use crate::job::registry::JobRegistration;
 use crate::job::{RunControl, run};
-use crate::{JobError, JobId, JobResult, JobRun, Result};
+use crate::{JobError, JobId, JobResult, JobRun, Priority, Result, RetryPolicy};
 
 const MAX_CLOSE_TRIES: u32 = 5;
 const CLOSE_RETRY: Duration = Duration::from_secs(1);
@@ -66,17 +66,21 @@ impl Shared {
                 self.job_shutdown.child_token(),
                 incarnation.dead().child_token(),
             ));
-            let registration = pending.register(claimed.hold.clone(), Arc::clone(&control));
+            let registered = pending.register(claimed.hold.clone(), Arc::clone(&control));
             if control.lost().is_cancelled() {
                 return;
             }
-            let ending = match (self.jobs.get(claimed.task.as_str()), control.command()) {
+            let registration = self.jobs.get(claimed.task.as_str()).copied();
+            let retry_policy = registration
+                .and_then(|registration| registration.retry_policy)
+                .unwrap_or(&*self.retry_policy);
+            let ending = match (registration, control.command()) {
                 (_, Some(_)) => Ending::NotStarted,
                 (None, None) => Ending::Returned(Err(JobError::new(format!(
                     "no job is registered as {:?}",
                     claimed.task
                 )))),
-                (Some(&job), None) => {
+                (Some(job), None) => {
                     let run = claimed.run(self, job, queue, Arc::clone(&control));
                     tokio::pin!(run);
                     let mut deadline = None;
@@ -98,9 +102,16 @@ impl Shared {
                     }
                 }
             };
-            registration.closing();
-            self.settle(&claimed, &control, registration, &ending, started.elapsed())
-                .await;
+            registered.closing();
+            self.settle(
+                &claimed,
+                &control,
+                registered,
+                retry_policy,
+                &ending,
+                started.elapsed(),
+            )
+            .await;
         }
         .instrument(span)
         .await;
@@ -111,6 +122,7 @@ impl Shared {
         claimed: &Claimed,
         control: &RunControl,
         registration: Registration<'_>,
+        retry_policy: &dyn RetryPolicy,
         ending: &Ending,
         duration: Duration,
     ) {
@@ -122,14 +134,14 @@ impl Shared {
                 seen,
                 claimed.attempt,
                 claimed.max_attempts,
-                &*self.retry_policy,
+                retry_policy,
             );
             let closing =
                 Closing::after_run(claimed.attempt, outcome, seen, duration, control.latest());
             match close(&pool, &self.config.schema, &claimed.hold, &closing).await {
                 Ok(Closed::Written) => {
                     registration.close();
-                    log_outcome(claimed.hold.job_id, &closing);
+                    closing.log(claimed.hold.job_id);
                     return;
                 }
                 Ok(Closed::Recommanded(command)) => seen = command,
@@ -156,20 +168,6 @@ impl Shared {
     }
 }
 
-fn log_outcome(job_id: i64, closing: &Closing) {
-    let duration_ms = closing.duration_ms();
-    match closing.outcome() {
-        Outcome::Succeeded => debug!(duration_ms, "job succeeded"),
-        Outcome::Retry { delay, error } => {
-            warn!(error = %error, ?delay, "job failed, retrying");
-        }
-        Outcome::Failed { error } => warn!(error = %error, "job failed"),
-        Outcome::Released { note } => info!(job_id, note = %note, "job released"),
-        Outcome::Stopped { note } => info!(job_id, note = %note, "job stopped"),
-        Outcome::Cancelled { note } => info!(job_id, note = %note, "job cancelled"),
-    }
-}
-
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -185,15 +183,21 @@ impl Claimed {
         queue: &str,
         control: Arc<RunControl>,
     ) -> JobResult {
-        let job_run = JobRun::new(
-            JobId(self.hold.job_id),
-            registration.name,
-            Arc::from(queue),
-            self.attempt,
-            self.max_attempts,
-            control.shutdown().clone(),
+        let job_run = JobRun {
+            id: JobId(self.hold.job_id),
+            name: registration.name,
+            queue: Arc::from(queue),
+            attempt: self.attempt,
+            max_attempts: self.max_attempts,
+            created_at: self.created_at,
+            scheduled_at: self.scheduled_at,
+            priority: Priority::from_level(self.priority),
+            last_error: self.last_error.as_deref().map(Arc::from),
+            parent_id: self.parent_id.map(JobId),
+            root_id: JobId(self.root_id.unwrap_or(self.hold.job_id)),
+            cancellation: control.shutdown().clone(),
             control,
-        );
+        };
         let meta = JobMeta::new(job_run.clone(), self.context.clone());
         let captured = Captured::from_stored(self.context.clone());
         let middlewares = Arc::clone(&shared.middlewares);

@@ -6,15 +6,17 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::init::config;
+use crate::job::SNOOZED;
 use crate::storage::interval;
-use crate::{Command, Error, ErrorKind, JobId, JobState, Result};
+use crate::{Command, Error, ErrorKind, JobId, JobState, Priority, Result};
 
 const JSON_CODEC: &str = "json";
 const MAX_PAGE: u32 = 1000;
 
 pub(crate) const JOB_COLUMNS: &str = "id, queue, task, state, codec, payload, job_key, queue_key, \
      priority, attempts, max_attempts, run_at, timeout_ms, last_error, context, fingerprint, \
-     locked_by::text AS worker_id, locked_at AS running_since, command, created_at, updated_at";
+     locked_by::text AS worker_id, locked_at AS running_since, command, created_at, updated_at, \
+     parent_id, root_id, coalesce(queue_key_limit, 1::smallint) AS queue_key_limit, expires_at";
 
 pub(crate) const FILTER_SQL: &str = "($1::text[] IS NULL OR state = ANY($1))
     AND ($2::text IS NULL OR queue = $2)
@@ -23,7 +25,10 @@ pub(crate) const FILTER_SQL: &str = "($1::text[] IS NULL OR state = ANY($1))
     AND ($5::text IS NULL OR starts_with(job_key, $5))
     AND ($6::timestamptz IS NULL OR created_at >= $6)
     AND ($7::timestamptz IS NULL OR created_at < $7)
-    AND ($8::jsonb IS NULL OR context @> $8)";
+    AND ($8::jsonb IS NULL OR context @> $8)
+    AND ($9::smallint[] IS NULL OR priority = ANY($9))
+    AND ($10::bigint IS NULL OR parent_id = $10)
+    AND ($11::bigint IS NULL OR root_id = $11 OR id = $11)";
 
 macro_rules! bind_filter {
     ($query:expr, $filter:expr) => {
@@ -36,6 +41,9 @@ macro_rules! bind_filter {
             .bind($filter.created_after)
             .bind($filter.created_before)
             .bind(&$filter.context)
+            .bind($filter.priority_levels())
+            .bind($filter.parent.map(|id| id.0))
+            .bind($filter.root.map(|id| id.0))
     };
 }
 
@@ -63,6 +71,9 @@ pub struct JobFilter {
     pub(crate) created_after: Option<DateTime<Utc>>,
     pub(crate) created_before: Option<DateTime<Utc>>,
     pub(crate) context: Option<Value>,
+    pub(crate) priorities: Vec<Priority>,
+    pub(crate) parent: Option<JobId>,
+    pub(crate) root: Option<JobId>,
 }
 
 impl JobFilter {
@@ -124,6 +135,35 @@ impl JobFilter {
         self
     }
 
+    /// Adds a priority to match; a job matches when it has any of the added priorities.
+    pub fn priority(mut self, priority: Priority) -> Self {
+        if !self.priorities.contains(&priority) {
+            self.priorities.push(priority);
+        }
+        self
+    }
+
+    /// Matches only jobs enqueued by the running job with this id.
+    pub fn parent(mut self, parent: JobId) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// Matches the job with this id and every job enqueued below it, at any depth.
+    pub fn root(mut self, root: JobId) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    pub(crate) fn priority_levels(&self) -> Option<Vec<i16>> {
+        (!self.priorities.is_empty()).then(|| {
+            self.priorities
+                .iter()
+                .map(|priority| priority.level())
+                .collect()
+        })
+    }
+
     pub(crate) fn state_names(&self) -> Option<Vec<&'static str>> {
         (!self.states.is_empty()).then(|| self.states.iter().map(|state| state.as_str()).collect())
     }
@@ -156,8 +196,11 @@ pub struct JobInfo {
     pub job_key: Option<String>,
     /// Exclusion key, if any.
     pub queue_key: Option<String>,
-    /// Higher runs first.
-    pub priority: i16,
+    /// How many jobs sharing the `queue_key` may run at once; 1 unless set with
+    /// [`EnqueueOptions::queue_key_limit`](crate::EnqueueOptions::queue_key_limit).
+    pub queue_key_limit: u16,
+    /// Which due jobs of the queue run before this one.
+    pub priority: Priority,
     /// Attempts started so far.
     pub attempts: i32,
     /// Attempts allowed.
@@ -189,6 +232,13 @@ pub struct JobInfo {
     pub created_at: DateTime<Utc>,
     /// When the state last changed.
     pub updated_at: DateTime<Utc>,
+    /// Id of the job that was running when this one was enqueued, if any.
+    pub parent_id: Option<JobId>,
+    /// Id of the first job of the chain this job belongs to; `None` for a job enqueued outside
+    /// a job, which is its own root.
+    pub root_id: Option<JobId>,
+    /// When the job is discarded if it is still waiting, if set.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl JobInfo {
@@ -237,6 +287,10 @@ pub(crate) struct JobRow {
     command: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    parent_id: Option<i64>,
+    root_id: Option<i64>,
+    queue_key_limit: i16,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 impl JobRow {
@@ -250,7 +304,8 @@ impl JobRow {
             payload: self.payload,
             job_key: self.job_key,
             queue_key: self.queue_key,
-            priority: self.priority,
+            queue_key_limit: u16::try_from(self.queue_key_limit).unwrap_or(1),
+            priority: Priority::from_level(self.priority),
             attempts: self.attempts,
             max_attempts: self.max_attempts,
             run_at: self.run_at,
@@ -265,6 +320,9 @@ impl JobRow {
             pending: self.command.as_deref().and_then(Command::parse),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            parent_id: self.parent_id.map(JobId),
+            root_id: self.root_id.map(JobId),
+            expires_at: self.expires_at,
         })
     }
 }
@@ -350,6 +408,11 @@ pub struct Throughput {
     /// Attempts that ran, failed and were scheduled again; interrupted attempts are not
     /// counted, since they never finished.
     pub retried: i64,
+    /// Attempts that ran and asked to run again later; they are not in `retried`.
+    pub snoozed: i64,
+    /// Jobs that ended discarded, by `JobError::discard` or by expiry; they are not in
+    /// `failed`.
+    pub discarded: i64,
     /// Attempts that ran and were stopped.
     pub stopped: i64,
     /// Jobs that were cancelled.
@@ -366,6 +429,8 @@ struct ThroughputRow {
     succeeded: i64,
     failed: i64,
     retried: i64,
+    snoozed: i64,
+    discarded: i64,
     stopped: i64,
     cancelled: i64,
     average_ms: Option<f64>,
@@ -469,9 +534,9 @@ pub async fn jobs(filter: &JobFilter, limit: u32, before: Option<JobId>) -> Resu
     let config = config()?;
     let query = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT {JOB_COLUMNS} FROM {job}
-         WHERE {FILTER_SQL} AND ($9::bigint IS NULL OR id < $9)
+         WHERE {FILTER_SQL} AND ($12::bigint IS NULL OR id < $12)
          ORDER BY id DESC
-         LIMIT $10",
+         LIMIT $13",
         job = config.schema.table("job"),
     )));
     let rows: Vec<JobRow> = bind_filter!(query, filter)
@@ -578,7 +643,11 @@ pub async fn throughput(window: Duration) -> Result<Vec<Throughput>> {
              count(*) FILTER (WHERE history.state = 'succeeded') AS succeeded,
              count(*) FILTER (WHERE history.state = 'failed') AS failed,
              count(*) FILTER (WHERE history.state = 'scheduled'
-                 AND history.duration_ms IS NOT NULL) AS retried,
+                 AND history.duration_ms IS NOT NULL
+                 AND history.error IS DISTINCT FROM $2) AS retried,
+             count(*) FILTER (WHERE history.state = 'scheduled'
+                 AND history.duration_ms IS NOT NULL AND history.error = $2) AS snoozed,
+             count(*) FILTER (WHERE history.state = 'discarded') AS discarded,
              count(*) FILTER (WHERE history.state = 'stopped'
                  AND history.duration_ms IS NOT NULL) AS stopped,
              count(*) FILTER (WHERE history.state = 'deleted') AS cancelled,
@@ -593,6 +662,7 @@ pub async fn throughput(window: Duration) -> Result<Vec<Throughput>> {
         job_history = config.schema.table("job_history"),
     )))
     .bind(interval(window))
+    .bind(SNOOZED)
     .fetch_all(&config.pool.pool())
     .await?;
     Ok(rows
@@ -602,6 +672,8 @@ pub async fn throughput(window: Duration) -> Result<Vec<Throughput>> {
             succeeded: row.succeeded,
             failed: row.failed,
             retried: row.retried,
+            snoozed: row.snoozed,
+            discarded: row.discarded,
             stopped: row.stopped,
             cancelled: row.cancelled,
             average_duration: row
