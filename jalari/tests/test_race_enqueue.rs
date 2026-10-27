@@ -220,6 +220,21 @@ impl Job for Wake {
 }
 
 #[derive(Serialize, Deserialize)]
+struct Batched {
+    key: u32,
+    from: u8,
+}
+
+#[jalari::job(queue = "batched")]
+impl Job for Batched {
+    const NAME: &'static str = "race_batched";
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct Parent {
     token: i64,
     children: Vec<i64>,
@@ -2031,6 +2046,117 @@ async fn check_children(database: &Database, seed: u64) -> Vec<String> {
     violations
 }
 
+async fn many_overlap_round(
+    database: &Database,
+    label: &str,
+    round: usize,
+    keys: u32,
+) -> Vec<String> {
+    let batch = |from: u8, ascending: bool| {
+        let mut items: Vec<_> = (0..keys)
+            .map(|key| {
+                let options = EnqueueOptions::new().job_key(&format!("{label}:{round}:{key:05}"));
+                (Batched { key, from }, options)
+            })
+            .collect();
+        if !ascending {
+            items.reverse();
+        }
+        items
+    };
+    let ascending = batch(0, true);
+    let descending = batch(1, false);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let send = |items: Vec<(Batched, EnqueueOptions)>| {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            jalari::enqueue_many(&items).await
+        })
+    };
+    let first = send(ascending);
+    let second = send(descending);
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+
+    let mut violations = Vec::new();
+    let (first, second) = match (first, second) {
+        (Ok(first), Ok(second)) => (first, second),
+        (first, second) => {
+            for error in [first.err(), second.err()].into_iter().flatten() {
+                violations.push(format!(
+                    "{label} round {round}: enqueue_many of {keys} overlapping keys failed: \
+                     {error}"
+                ));
+            }
+            return violations;
+        }
+    };
+    let rows: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT job_key, id FROM {} WHERE job_key LIKE $1",
+        database.table("job")
+    )))
+    .bind(format!("{label}:{round}:%"))
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    if rows.len() != usize::try_from(keys).unwrap() {
+        violations.push(format!(
+            "{label} round {round}: {} rows for {keys} keys sent by two batches",
+            rows.len()
+        ));
+    }
+    let stored: HashMap<String, i64> = rows.into_iter().collect();
+    let mut second = second;
+    second.reverse();
+    for (key, (first, second)) in first.iter().zip(&second).enumerate() {
+        let job_key = format!("{label}:{round}:{key:05}");
+        let stored = stored.get(&job_key).copied();
+        if stored != Some(first.id().0) || stored != Some(second.id().0) {
+            violations.push(format!(
+                "{label} round {round}: key {job_key} is stored as {stored:?}, the ascending \
+                 batch answered {first:?} and the descending one {second:?}"
+            ));
+        }
+        let inserted = [first, second]
+            .iter()
+            .filter(|outcome| matches!(outcome, EnqueueOutcome::Inserted(_)))
+            .count();
+        if inserted != 1 {
+            violations.push(format!(
+                "{label} round {round}: key {job_key} answered Inserted {inserted} times, \
+                 expected once ({first:?}, {second:?})"
+            ));
+        }
+    }
+    violations
+}
+
+async fn check_many_overlapping_keys_do_not_deadlock(
+    database: &Database,
+    seed: u64,
+) -> Vec<String> {
+    let deadlocks = database.deadlocks().await;
+    let mut violations = Vec::new();
+    for round in 0..20 {
+        violations.extend(many_overlap_round(database, "many", round, 200).await);
+    }
+    for round in 0..2 {
+        violations.extend(many_overlap_round(database, "many_chunked", round, 12_000).await);
+    }
+    let deadlocks = database.deadlocks().await - deadlocks;
+    if deadlocks != 0 {
+        violations.push(format!(
+            "many_overlap seed {seed}: {deadlocks} deadlocks while two batches sent the same keys \
+             in opposite orders"
+        ));
+    }
+    eprintln!(
+        "many_overlap: 20 rounds of 200 keys and 2 rounds of 12,000 keys in opposite orders, \
+         {deadlocks} deadlocks"
+    );
+    violations
+}
+
 fn selected(only: Option<&str>, name: &str) -> bool {
     only.is_none_or(|only| only == name)
 }
@@ -2174,6 +2300,15 @@ async fn test_race_enqueue() {
             "batch_wakeup",
             started,
             check_batch_wakeup(&database, &app, seed).await,
+        );
+    }
+    if selected(only, "many_overlap") {
+        let seed = common::seed("many_overlap");
+        let started = Instant::now();
+        report(
+            "many_overlap",
+            started,
+            check_many_overlapping_keys_do_not_deadlock(&database, seed).await,
         );
     }
     if selected(only, "children") {
