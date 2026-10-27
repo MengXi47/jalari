@@ -65,6 +65,26 @@ fn test_expansion_stamps_a_fingerprint_only_when_turned_on() {
 }
 
 #[test]
+fn test_expansion_asserts_job_constants() {
+    let expansion = expanded("", SHORT);
+    let checks = expansion
+        .split("const _ : () =")
+        .nth(1)
+        .expect("a const block that checks the constants");
+    for expected in [
+        "< J as :: jalari :: Job > :: MAX_ATTEMPTS >= 1",
+        "\"J: Job::MAX_ATTEMPTS must be at least 1\"",
+        "! < J as :: jalari :: Job > :: NAME . is_empty ()",
+        "\"J: Job::NAME must not be empty\"",
+        "< J as :: jalari :: Job > :: TIMEOUT",
+        "timeout . is_zero ()",
+        "timeout . as_millis () <= :: core :: primitive :: i32 :: MAX",
+    ] {
+        assert!(checks.contains(expected), "the checks contain {expected}");
+    }
+}
+
+#[test]
 fn test_fingerprint_covers_the_impl_as_written() {
     assert_ne!(
         stamped(&expanded("fingerprint = true", SHORT)),

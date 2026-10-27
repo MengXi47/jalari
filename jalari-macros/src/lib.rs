@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use proc_macro::{Span, TokenStream};
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::{
     Expr, ExprLit, ImplItem, ItemImpl, Lit, LitBool, LitStr, MetaNameValue, Token,
     parse_macro_input, parse_quote,
@@ -32,6 +33,13 @@ use syn::{
 ///
 /// When the impl leaves out `type Context`, it is set to `()`. When `run` takes only `self`,
 /// the context parameter is added for it, so jobs that need no context stay short.
+///
+/// # Checks
+///
+/// The job's constants are checked at compile time, computed values included: `NAME` must not
+/// be empty, `MAX_ATTEMPTS` must be at least 1, and `TIMEOUT`, when set, must be longer than
+/// zero and at most `i32::MAX` milliseconds. A violation is a compile error that names the job
+/// and points at the constant.
 ///
 /// # Code fingerprint
 ///
@@ -162,13 +170,65 @@ fn expand(
         None => quote!(::core::option::Option::None),
     };
 
+    let checks = constant_checks(&item_impl);
+
     Ok(quote! {
         #item_impl
 
         ::jalari::__private::inventory::submit! {
             ::jalari::__private::JobRegistration::new::<#job_type>(#queue, #cron, #fingerprint)
         }
+
+        #checks
     })
+}
+
+fn constant_checks(item_impl: &ItemImpl) -> TokenStream2 {
+    let job_type = &item_impl.self_ty;
+    let label = quote!(#job_type).to_string();
+    let span_of = |name: &str| {
+        item_impl
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ImplItem::Const(constant) if constant.ident == name => Some(constant.span()),
+                _ => None,
+            })
+            .unwrap_or_else(|| job_type.span())
+    };
+    let job = quote!(<#job_type as ::jalari::Job>);
+
+    let message = format!("{label}: Job::MAX_ATTEMPTS must be at least 1");
+    let max_attempts = quote_spanned! {span_of("MAX_ATTEMPTS")=>
+        ::core::assert!(#job::MAX_ATTEMPTS >= 1, #message);
+    };
+    let message = format!("{label}: Job::NAME must not be empty");
+    let name = quote_spanned! {span_of("NAME")=>
+        ::core::assert!(!#job::NAME.is_empty(), #message);
+    };
+    let message =
+        format!("{label}: Job::TIMEOUT must be longer than zero and at most i32::MAX milliseconds");
+    let timeout = quote_spanned! {span_of("TIMEOUT")=>
+        ::core::assert!(
+            match #job::TIMEOUT {
+                ::core::option::Option::Some(timeout) => {
+                    !timeout.is_zero()
+                        && timeout.as_millis()
+                            <= ::core::primitive::i32::MAX as ::core::primitive::u128
+                }
+                ::core::option::Option::None => true,
+            },
+            #message
+        );
+    };
+
+    quote! {
+        const _: () = {
+            #max_attempts
+            #name
+            #timeout
+        };
+    }
 }
 
 fn fill_in_context(item_impl: &mut ItemImpl) {

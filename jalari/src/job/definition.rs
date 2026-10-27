@@ -65,18 +65,90 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// Must be unique within a binary. Jobs already enqueued under an old name keep waiting
     /// until a worker that knows that name picks them up. Jobs enqueued by another build of
     /// the same name wait the same way, for a worker of that build.
+    ///
+    /// Must not be empty; `#[jalari::job]` rejects an empty name at compile time:
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct Ping;
+    /// #[jalari::job]
+    /// impl Job for Ping {
+    ///     const NAME: &'static str = "";
+    ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
     const NAME: &'static str;
 
     /// Number of attempts before the job is marked failed, including the first; defaults to 10.
     ///
     /// An attempt counts as soon as it starts, so attempts cut short by a crashed worker count
     /// too, and a job that keeps crashing its worker stops once the limit is reached.
+    ///
+    /// Must be at least 1; `#[jalari::job]` rejects a smaller value at compile time:
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct Ping;
+    /// #[jalari::job]
+    /// impl Job for Ping {
+    ///     const NAME: &'static str = "ping";
+    ///     const MAX_ATTEMPTS: i32 = 0;
+    ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
     const MAX_ATTEMPTS: i32 = DEFAULT_MAX_ATTEMPTS;
 
     /// Longest time one attempt may run before it is cancelled and counted as failed.
     ///
     /// `None`, the default, means no limit.
     /// [`EnqueueOptions::timeout`](crate::EnqueueOptions::timeout) overrides it per job.
+    ///
+    /// A limit must be longer than zero and at most `i32::MAX` milliseconds, about 24.8 days;
+    /// `#[jalari::job]` rejects any other value at compile time:
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use std::time::Duration;
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct Ping;
+    /// #[jalari::job]
+    /// impl Job for Ping {
+    ///     const NAME: &'static str = "ping";
+    ///     const TIMEOUT: Option<Duration> = Some(Duration::ZERO);
+    ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use std::time::Duration;
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct Ping;
+    /// #[jalari::job]
+    /// impl Job for Ping {
+    ///     const NAME: &'static str = "ping";
+    ///     const TIMEOUT: Option<Duration> = Some(Duration::from_secs(3_000_000));
+    ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
     const TIMEOUT: Option<Duration> = None;
 
     /// Value the job receives in [`run`](Self::run), provided by the worker's
