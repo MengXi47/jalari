@@ -851,6 +851,9 @@ async fn test_race_process() {
     if selected("partitions") {
         failures.extend(timed("partitions", check_partitions(&database, seed)).await);
     }
+    if selected("long_freeze") {
+        failures.extend(timed("long_freeze", check_long_freeze(&database, seed)).await);
+    }
 
     database.finish().await;
     assert!(
@@ -1213,6 +1216,11 @@ async fn check_freezes(database: &Database, seed: u64) -> Vec<String> {
     failures
 }
 
+async fn check_long_freeze(database: &Database, seed: u64) -> Vec<String> {
+    let mut rng = Rng::new(seed).fork(5);
+    freeze_wave(database, seed, 9, &[12], &mut rng).await
+}
+
 async fn freeze_wave(
     database: &Database,
     seed: u64,
@@ -1377,8 +1385,40 @@ async fn freeze_wave(
                 ));
             }
         } else {
+            match (lifeline_ends[trial], takeover) {
+                (Some(ended), Some(takeover)) => {
+                    if !(8.0..=12.5).contains(&(ended - base)) {
+                        failures.push(format!(
+                            "{trial_label}: PostgreSQL should end the silent lifeline about 11 s \
+                             after its last heartbeat, but it ended {:+.2} s after the freeze",
+                            ended - base
+                        ));
+                    }
+                    if takeover.started < ended - SESSION_POLL_SLACK
+                        || takeover.started - base > 14.5
+                    {
+                        failures.push(format!(
+                            "{trial_label}: the frozen job should be taken over right after its \
+                             lifeline ends, 10 to 13 s after the freeze, but the lifeline ended \
+                             {:+.2} s and {}",
+                            ended - base,
+                            takeover.describe(base)
+                        ));
+                    }
+                }
+                (ended, None) => failures.push(format!(
+                    "{trial_label}: a {seconds} s freeze outlasts the 10 s freeze tolerance, yet \
+                     the job was never taken over; the lifeline ended {}",
+                    relative(ended)
+                )),
+                (None, Some(takeover)) => failures.push(format!(
+                    "{trial_label}: the frozen job was taken over while its lifeline never \
+                     ended: {}",
+                    takeover.describe(base)
+                )),
+            }
             for overlap in audit.overlaps.iter().chain(&audit.alive_overlaps) {
-                eprintln!("  documented limitation (docs/guide.md:327): {overlap}");
+                eprintln!("  documented limitation of freezes over 10 s: {overlap}");
             }
         }
     }
