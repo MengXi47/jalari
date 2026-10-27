@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
+use sqlx::AssertSqlSafe;
 
 use crate::Result;
+use crate::init::{Config, config};
+use crate::storage::QUEUE_CHANNEL;
 
 /// A paused queue, as returned by [`paused_queues`].
 #[non_exhaustive]
@@ -34,9 +37,21 @@ pub struct PausedQueue {
 /// # Ok(())
 /// # }
 /// ```
-#[expect(unused_variables, reason = "filled in by W5")]
 pub async fn pause_queue(queue: &str) -> Result<bool> {
-    todo!("W5")
+    let config = config()?;
+    changed(
+        config,
+        format!(
+            "WITH changed AS (
+                INSERT INTO {queue_pause} (queue, paused_at) VALUES ($1, statement_timestamp())
+                ON CONFLICT (queue) DO NOTHING RETURNING queue
+            )
+            SELECT EXISTS (SELECT 1 FROM changed), pg_notify($2, $1)",
+            queue_pause = config.schema.table("queue_pause"),
+        ),
+        queue,
+    )
+    .await
 }
 
 /// Lets workers start jobs of `queue` again and returns whether it was paused.
@@ -55,9 +70,18 @@ pub async fn pause_queue(queue: &str) -> Result<bool> {
 /// # Ok(())
 /// # }
 /// ```
-#[expect(unused_variables, reason = "filled in by W5")]
 pub async fn resume_queue(queue: &str) -> Result<bool> {
-    todo!("W5")
+    let config = config()?;
+    changed(
+        config,
+        format!(
+            "WITH changed AS (DELETE FROM {queue_pause} WHERE queue = $1 RETURNING queue)
+            SELECT EXISTS (SELECT 1 FROM changed), pg_notify($2, $1)",
+            queue_pause = config.schema.table("queue_pause"),
+        ),
+        queue,
+    )
+    .await
 }
 
 /// Lists the paused queues, sorted by name.
@@ -77,5 +101,24 @@ pub async fn resume_queue(queue: &str) -> Result<bool> {
 /// # }
 /// ```
 pub async fn paused_queues() -> Result<Vec<PausedQueue>> {
-    todo!("W5")
+    let config = config()?;
+    let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT queue, paused_at FROM {queue_pause} ORDER BY queue",
+        queue_pause = config.schema.table("queue_pause"),
+    )))
+    .fetch_all(&config.pool.pool())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(queue, paused_at)| PausedQueue { queue, paused_at })
+        .collect())
+}
+
+async fn changed(config: &Config, statement: String, queue: &str) -> Result<bool> {
+    let changed = sqlx::query_scalar(AssertSqlSafe(statement))
+        .bind(queue)
+        .bind(config.schema.notify_channel(QUEUE_CHANNEL))
+        .fetch_one(&config.pool.pool())
+        .await?;
+    Ok(changed)
 }

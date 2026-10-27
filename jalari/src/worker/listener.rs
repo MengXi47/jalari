@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::runner::{Shared, Wakers};
-use crate::storage::{CONFIG_CHANNEL, JOB_CHANNEL, RECURRING_CHANNEL};
+use crate::storage::{CONFIG_CHANNEL, JOB_CHANNEL, QUEUE_CHANNEL, RECURRING_CHANNEL};
 
 const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
@@ -16,10 +16,12 @@ pub(super) async fn listen(shared: Arc<Shared>, wakers: Arc<Wakers>, shutdown: C
     let job_channel = shared.config.schema.notify_channel(JOB_CHANNEL);
     let recurring_channel = shared.config.schema.notify_channel(RECURRING_CHANNEL);
     let config_channel = shared.config.schema.notify_channel(CONFIG_CHANNEL);
+    let queue_channel = shared.config.schema.notify_channel(QUEUE_CHANNEL);
     let channels = [
         job_channel.as_str(),
         recurring_channel.as_str(),
         config_channel.as_str(),
+        queue_channel.as_str(),
     ];
     let mut delay = MIN_RECONNECT_DELAY;
     while !shutdown.is_cancelled() {
@@ -38,6 +40,9 @@ pub(super) async fn listen(shared: Arc<Shared>, wakers: Arc<Wakers>, shutdown: C
                         }
                         Ok(Some(notification)) if notification.channel() == config_channel => {
                             wake(&wakers.housekeeping);
+                        }
+                        Ok(Some(notification)) if notification.channel() == queue_channel => {
+                            wake(&wakers.pauses);
                         }
                         Ok(Some(notification)) => {
                             if let Some(waker) = wakers.queues.get(notification.payload()) {
@@ -77,9 +82,10 @@ fn wake_all(wakers: &Wakers) {
     }
     wake(&wakers.scheduler);
     wake(&wakers.housekeeping);
+    wake(&wakers.pauses);
 }
 
-fn wake(waker: &Notify) {
+pub(super) fn wake(waker: &Notify) {
     waker.notify_waiters();
     waker.notify_one();
 }

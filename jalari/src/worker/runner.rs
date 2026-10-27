@@ -13,6 +13,7 @@ use super::flusher;
 use super::lifeline::{self, Current, WorkerRegistration};
 use super::middleware::ErasedMiddleware;
 use super::ownership::{Target, interrupt};
+use super::pauses::{Pauses, watch_pauses};
 use super::runs::RunBook;
 use super::{housekeeping, listener, reaper, scheduler};
 use crate::init::Config;
@@ -89,6 +90,7 @@ pub(super) struct Wakers {
     pub(super) queues: HashMap<String, Arc<Notify>>,
     pub(super) scheduler: Arc<Notify>,
     pub(super) housekeeping: Arc<Notify>,
+    pub(super) pauses: Arc<Notify>,
 }
 
 impl Worker {
@@ -119,6 +121,7 @@ impl Worker {
                 .collect(),
             scheduler: Arc::new(Notify::new()),
             housekeeping: Arc::new(Notify::new()),
+            pauses: Arc::new(Notify::new()),
         });
 
         let mut tasks = JoinSet::new();
@@ -166,6 +169,23 @@ impl Worker {
                 }
             }
         }
+        let pauses = Arc::new(Pauses::default());
+        if let Err(e) = pauses
+            .refresh(
+                &self.shared.config.pool.pool(),
+                &self.shared.config.schema,
+                &queue_names,
+            )
+            .await
+        {
+            warn!(error = %e, "failed to read the paused queues");
+        }
+        tasks.spawn(watch_pauses(
+            Arc::clone(&self.shared),
+            Arc::clone(&pauses),
+            Arc::clone(&wakers),
+            shutdown.clone(),
+        ));
         tasks.spawn(reaper::reap(
             Arc::clone(&self.shared),
             queue_names,
@@ -176,6 +196,7 @@ impl Worker {
             for _ in 0..queue.concurrency {
                 tasks.spawn(work_loop(
                     Arc::clone(&self.shared),
+                    Arc::clone(&pauses),
                     queue.name.clone(),
                     Arc::clone(&wakers.queues[&queue.name]),
                     registered.clone(),
@@ -222,6 +243,7 @@ impl Worker {
 
 async fn work_loop(
     shared: Arc<Shared>,
+    pauses: Arc<Pauses>,
     queue: String,
     waker: Arc<Notify>,
     mut current: Current,
@@ -241,6 +263,10 @@ async fn work_loop(
             }
             continue;
         };
+        if pauses.contains(&queue) {
+            wait(&waker, &shutdown, shared.settings.poll_interval).await;
+            continue;
+        }
         match shared.process_next(&incarnation, &queue, &waker).await {
             Ok(true) => {}
             Ok(false) if incarnation.dead().is_cancelled() => {}

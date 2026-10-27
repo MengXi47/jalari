@@ -7,6 +7,7 @@ const DEFAULT_SCHEMA_NAME: &str = "jalari";
 pub(crate) const JOB_CHANNEL: &str = "job";
 pub(crate) const RECURRING_CHANNEL: &str = "recurring";
 pub(crate) const CONFIG_CHANNEL: &str = "config";
+pub(crate) const QUEUE_CHANNEL: &str = "queue";
 
 /// Where jalari's tables live: a dedicated schema, or a table prefix inside an existing one.
 ///
