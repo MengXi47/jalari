@@ -28,6 +28,8 @@ const STEP: Duration = Duration::from_millis(100);
 const POLL: Duration = Duration::from_millis(200);
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
 const SESSION_POLL_SLACK: f64 = 0.2;
+const RESUME_BOUND: f64 = 0.5;
+const SILENCE_AFTER_RESUME: Duration = Duration::from_secs(3);
 
 struct Probe {
     pool: PgPool,
@@ -1234,6 +1236,19 @@ async fn check_false_interruptions(database: &Database, seed: u64) -> Vec<String
     failures
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Closed,
+    Silent,
+    StaleReply,
+}
+
+#[derive(Clone, Copy)]
+struct Freeze {
+    seconds: u64,
+    wake: Wake,
+}
+
 fn freeze_lengths() -> Vec<u64> {
     if let Ok(list) = std::env::var("RACE_FREEZES") {
         return list
@@ -1251,25 +1266,47 @@ fn freeze_lengths() -> Vec<u64> {
 async fn check_freezes(database: &Database, seed: u64) -> Vec<String> {
     let mut rng = Rng::new(seed).fork(3);
     let mut failures = Vec::new();
-    for (wave, lengths) in freeze_lengths().chunks(3).enumerate() {
-        failures.extend(freeze_wave(database, seed, wave, lengths, &mut rng).await);
+    let trials: Vec<Freeze> = freeze_lengths()
+        .into_iter()
+        .map(|seconds| Freeze {
+            seconds,
+            wake: Wake::Closed,
+        })
+        .collect();
+    for (wave, trials) in trials.chunks(3).enumerate() {
+        failures.extend(freeze_wave(database, seed, wave, trials, &mut rng).await);
     }
     failures
 }
 
 async fn check_long_freeze(database: &Database, seed: u64) -> Vec<String> {
     let mut rng = Rng::new(seed).fork(5);
-    freeze_wave(database, seed, 9, &[12], &mut rng).await
+    let trials =
+        [Wake::Closed, Wake::Silent, Wake::StaleReply].map(|wake| Freeze { seconds: 12, wake });
+    freeze_wave(database, seed, 9, &trials, &mut rng).await
 }
 
 async fn freeze_wave(
     database: &Database,
     seed: u64,
     wave: usize,
-    lengths: &[u64],
+    trials: &[Freeze],
     rng: &mut Rng,
 ) -> Vec<String> {
     let label = format!("freezes seed {seed}");
+    let lengths: Vec<u64> = trials.iter().map(|trial| trial.seconds).collect();
+    let mut proxies = Vec::new();
+    for trial in trials {
+        proxies.push(if trial.wake == Wake::Silent {
+            let target = (
+                database.options.get_host().to_owned(),
+                database.options.get_port(),
+            );
+            Some(Proxy::start(target, Duration::ZERO).await)
+        } else {
+            None
+        });
+    }
     let queues: Vec<String> = (0..lengths.len())
         .map(|trial| format!("freeze{wave}_{trial}"))
         .collect();
@@ -1278,13 +1315,14 @@ async fn freeze_wave(
         .collect();
     let children: Vec<ChildWorker> = queues
         .iter()
-        .zip(lengths)
+        .zip(&lengths)
+        .zip(&proxies)
         .enumerate()
-        .map(|(trial, (queue, &seconds))| {
-            let link = if seconds < 10 {
-                Link::Shared
-            } else {
-                Link::OwnProbePool
+        .map(|(trial, ((queue, &seconds), proxy))| {
+            let link = match proxy {
+                Some(proxy) => Link::Proxied(proxy.port),
+                None if seconds < 10 => Link::Shared,
+                None => Link::OwnProbePool,
             };
             ChildWorker::spawn(database, &format!("f{wave}_{trial}"), &[(queue, 1)], link)
         })
@@ -1293,8 +1331,8 @@ async fn freeze_wave(
         child.wait_ready().await;
     }
     let mut firsts = Vec::new();
-    for ((queue, key), seconds) in queues.iter().zip(&keys).zip(lengths) {
-        firsts.push(enqueue_work(queue, Some(key), seconds * 1000 + 2500, 500).await);
+    for ((queue, key), seconds) in queues.iter().zip(&keys).zip(&lengths) {
+        firsts.push(enqueue_work(queue, Some(key), seconds * 1000 + 6000, 500).await);
     }
     for (child, first) in children.iter().zip(&firsts) {
         wait_started(database, *first, 1, &child.name).await;
@@ -1314,14 +1352,26 @@ async fn freeze_wave(
     for child in &children {
         sessions.push(lifeline_session(database, child).await);
     }
+    let mut holders = Vec::new();
+    for (child, trial) in children.iter().zip(trials) {
+        if trial.wake == Wake::StaleReply {
+            holders.push(hold_beat(database, child).await);
+        }
+    }
     let mut stopped = Vec::new();
-    for child in &children {
+    for (child, proxy) in children.iter().zip(&proxies) {
+        if let Some(proxy) = proxy {
+            proxy.set_blocked(true);
+        }
         child.signal("STOP");
         stopped.push((Instant::now(), db_now(&database.pool).await));
     }
+    for holder in holders {
+        holder.commit().await.unwrap();
+    }
     let watchers: Vec<JoinHandle<Option<f64>>> = sessions
         .into_iter()
-        .zip(lengths)
+        .zip(&lengths)
         .map(|(session, seconds)| {
             watch_session(
                 database.pool.clone(),
@@ -1338,6 +1388,12 @@ async fn freeze_wave(
         tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
         children[trial].signal("CONT");
         resumed[trial] = db_now(&database.pool).await;
+    }
+    if proxies.iter().any(Option::is_some) {
+        tokio::time::sleep(SILENCE_AFTER_RESUME).await;
+        for proxy in proxies.iter().flatten() {
+            proxy.set_blocked(false);
+        }
     }
 
     let ids: Vec<i64> = firsts.iter().chain(&siblings).copied().collect();
@@ -1359,7 +1415,11 @@ async fn freeze_wave(
     let jobs = database.jobs().await;
     let history = database.history().await;
     for (trial, &seconds) in lengths.iter().enumerate() {
-        let trial_label = format!("{label} freeze {seconds}s");
+        let trial_label = match trials[trial].wake {
+            Wake::Closed => format!("{label} freeze {seconds}s"),
+            Wake::Silent => format!("{label} freeze {seconds}s behind a silent link"),
+            Wake::StaleReply => format!("{label} freeze {seconds}s during a heartbeat"),
+        };
         let (first, sibling) = (firsts[trial], siblings[trial]);
         let base = stopped[trial].1;
         let runs = runs(database, &[first, sibling]).await;
@@ -1458,12 +1518,63 @@ async fn freeze_wave(
                     takeover.describe(base)
                 )),
             }
+            match old {
+                Some(old) if old.alive_until() - resumed[trial] <= RESUME_BOUND => eprintln!(
+                    "{trial_label}: the old run stopped {:.3} s after the worker woke up",
+                    old.alive_until() - resumed[trial]
+                ),
+                _ => failures.push(format!(
+                    "{trial_label}: the frozen run should stop within {RESUME_BOUND} s of the \
+                     worker waking up at {:+.2} s, but {}",
+                    resumed[trial] - base,
+                    old.map_or_else(|| "it never ran".to_owned(), |old| old.describe(base))
+                )),
+            }
             for overlap in audit.overlaps.iter().chain(&audit.alive_overlaps) {
                 eprintln!("  documented limitation of freezes over 10 s: {overlap}");
             }
         }
     }
     failures
+}
+
+async fn hold_beat(
+    database: &Database,
+    child: &ChildWorker,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut holder = database.pool.begin().await.unwrap();
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "SELECT 1 FROM {} WHERE pid = $1 FOR UPDATE",
+        database.table("worker")
+    )))
+    .bind(child.pid())
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    let pool = &database.pool;
+    common::wait_until(
+        &format!("a heartbeat of child {} to wait on its row", child.name),
+        Duration::from_secs(5),
+        move || async move {
+            sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE application_name LIKE 'jalari lifeline %'
+                         AND $1 = ANY(pg_blocking_pids(pid))
+                 )",
+            )
+            .bind(holder_pid)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        },
+    )
+    .await;
+    holder
 }
 
 async fn check_partitions(database: &Database, seed: u64) -> Vec<String> {

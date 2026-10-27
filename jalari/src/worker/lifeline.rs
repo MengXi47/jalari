@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -27,6 +28,9 @@ const APPLICATION_NAME: &str = "jalari lifeline";
 const _: () =
     assert!(SELF_FENCE.as_millis() >= PING_INTERVAL.as_millis() + PING_TIMEOUT.as_millis());
 const _: () = assert!(TAKEOVER_GRACE.as_millis() >= 2 * SELF_FENCE.as_millis());
+const _: () = assert!(
+    LIFELINE_IDLE_TIMEOUT.as_millis() >= PING_INTERVAL.as_millis() + 2 * PING_TIMEOUT.as_millis()
+);
 const _: () = assert!(
     LIFELINE_IDLE_TIMEOUT.as_millis() >= FREEZE_TOLERANCE.as_millis() + PING_INTERVAL.as_millis()
 );
@@ -94,6 +98,7 @@ struct OwnedRow {
 struct Lifeline {
     connection: PgConnection,
     incarnation: Arc<Incarnation>,
+    acked: Instant,
 }
 
 pub(super) async fn lifeline(
@@ -164,6 +169,7 @@ impl Lifeline {
         .execute(&mut connection)
         .await?;
         let prefix = lock_prefix(schema);
+        let acked = Instant::now();
         let registered: Registered = sqlx::query_as(AssertSqlSafe(format!(
             "WITH registered AS (
                  INSERT INTO {worker} (hostname, pid, queues, scheduler, tasks)
@@ -208,6 +214,7 @@ impl Lifeline {
                 worker_id: Arc::from(registered.id),
                 dead: CancellationToken::new(),
             }),
+            acked,
         }))
     }
 
@@ -218,18 +225,24 @@ impl Lifeline {
                 () = retire.cancelled() => return Some(self),
                 () = tokio::time::sleep(PING_INTERVAL) => {}
             }
+            let sent_at = Instant::now();
+            let deadline = (self.acked + LIFELINE_IDLE_TIMEOUT).min(sent_at + PING_TIMEOUT);
             let sent = shared.runs.running(&worker_id);
-            let failure = match tokio::time::timeout(PING_TIMEOUT, self.beat(shared)).await {
-                Ok(Ok(Some(owned))) => {
+            let failure = match tokio::time::timeout_at(deadline, self.beat(shared)).await {
+                Ok(Ok(Some(owned))) if Instant::now() < deadline => {
+                    self.acked = sent_at;
                     let (orphans, abandoned) = shared.runs.deliver(&worker_id, &sent, &owned);
                     if !orphans.is_empty() || !abandoned.is_empty() {
                         tokio::spawn(release(Arc::clone(shared), orphans, abandoned));
                     }
                     continue;
                 }
+                Ok(Ok(Some(_))) | Err(_) => format!(
+                    "no heartbeat was acknowledged for {:?}",
+                    Instant::now().duration_since(self.acked)
+                ),
                 Ok(Ok(None)) => "the worker row was removed".to_owned(),
                 Ok(Err(e)) => e.to_string(),
-                Err(_) => format!("the database did not answer within {PING_TIMEOUT:?}"),
             };
             warn!(
                 worker_id = %worker_id,
