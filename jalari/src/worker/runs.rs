@@ -25,13 +25,21 @@ pub(super) struct Verdict {
     pub(super) lost: Vec<i64>,
     pub(super) commands: Vec<(i64, Command)>,
     pub(super) orphans: Vec<Hold>,
+    pub(super) abandoned: Vec<Hold>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Running,
+    Closing,
+    Retired,
+    Abandoned,
 }
 
 struct Entry {
     hold: Hold,
     control: Arc<RunControl>,
-    closing: bool,
-    retired: bool,
+    phase: Phase,
 }
 
 #[derive(Default)]
@@ -63,7 +71,7 @@ impl RunBook {
             .unwrap()
             .runs
             .values()
-            .filter(|entry| &*entry.hold.worker_id == worker_id && !entry.closing && !entry.retired)
+            .filter(|entry| &*entry.hold.worker_id == worker_id && entry.phase == Phase::Running)
             .map(|entry| entry.hold.token)
             .collect()
     }
@@ -73,8 +81,11 @@ impl RunBook {
         worker_id: &Arc<str>,
         sent: &HashSet<i64>,
         owned: &[Owned],
-    ) -> Vec<Hold> {
-        let book = self.book.lock().unwrap();
+    ) -> (Vec<Hold>, Vec<Hold>) {
+        let mut book = self.book.lock().unwrap();
+        book.runs.retain(|_, entry| {
+            entry.phase != Phase::Abandoned || entry.hold.worker_id == *worker_id
+        });
         let known: HashSet<i64> = book
             .pending
             .iter()
@@ -83,11 +94,20 @@ impl RunBook {
             .chain(
                 book.runs
                     .values()
-                    .filter(|entry| entry.hold.worker_id == *worker_id && !entry.retired)
+                    .filter(|entry| {
+                        entry.hold.worker_id == *worker_id
+                            && matches!(entry.phase, Phase::Running | Phase::Closing)
+                    })
                     .map(|entry| entry.hold.token),
             )
             .collect();
-        let verdict = reconcile(worker_id, sent, &known, owned);
+        let abandoned: HashSet<i64> = book
+            .runs
+            .values()
+            .filter(|entry| entry.phase == Phase::Abandoned)
+            .map(|entry| entry.hold.token)
+            .collect();
+        let verdict = reconcile(worker_id, sent, &known, &abandoned, owned);
         for token in &verdict.lost {
             if let Some(entry) = book.runs.get(token) {
                 entry.control.lost().cancel();
@@ -98,7 +118,14 @@ impl RunBook {
                 entry.control.request(*command);
             }
         }
-        verdict.orphans
+        (verdict.orphans, verdict.abandoned)
+    }
+
+    pub(super) fn forget(&self, holds: &[Hold]) {
+        let mut book = self.book.lock().unwrap();
+        for hold in holds {
+            book.runs.remove(&hold.token);
+        }
     }
 
     pub(super) fn live(&self) -> Vec<Hold> {
@@ -108,7 +135,7 @@ impl RunBook {
             .unwrap()
             .runs
             .values()
-            .filter(|entry| !entry.retired)
+            .filter(|entry| matches!(entry.phase, Phase::Running | Phase::Closing))
             .map(|entry| entry.hold.clone())
             .collect();
         holds.sort_by_key(|hold| hold.job_id);
@@ -134,15 +161,20 @@ impl RunBook {
             .lock()
             .unwrap()
             .runs
-            .retain(|_, entry| !entry.retired || entry.control.is_dirty());
+            .retain(|_, entry| entry.phase != Phase::Retired || entry.control.is_dirty());
     }
 
-    fn retire(&self, token: i64, closed: bool) {
+    fn retire(&self, token: i64, ending: Option<Phase>) {
         let mut book = self.book.lock().unwrap();
-        if closed {
-            book.runs.remove(&token);
-        } else if let Some(entry) = book.runs.get_mut(&token) {
-            entry.retired = true;
+        match ending {
+            None => {
+                book.runs.remove(&token);
+            }
+            Some(phase) => {
+                if let Some(entry) = book.runs.get_mut(&token) {
+                    entry.phase = phase;
+                }
+            }
         }
     }
 }
@@ -151,6 +183,7 @@ pub(super) fn reconcile(
     worker_id: &Arc<str>,
     sent: &HashSet<i64>,
     known: &HashSet<i64>,
+    abandoned: &HashSet<i64>,
     owned: &[Owned],
 ) -> Verdict {
     let held: HashSet<i64> = owned.iter().map(|row| row.token).collect();
@@ -161,17 +194,23 @@ pub(super) fn reconcile(
         ..Verdict::default()
     };
     for row in owned {
-        if !known.contains(&row.token) {
-            verdict.orphans.push(Hold {
-                job_id: row.job_id,
-                worker_id: Arc::clone(worker_id),
-                token: row.token,
-            });
-        } else if let Some(command) = row.command {
-            verdict.commands.push((row.token, command));
+        let hold = || Hold {
+            job_id: row.job_id,
+            worker_id: Arc::clone(worker_id),
+            token: row.token,
+        };
+        if known.contains(&row.token) {
+            if let Some(command) = row.command {
+                verdict.commands.push((row.token, command));
+            }
+        } else if abandoned.contains(&row.token) {
+            verdict.abandoned.push(hold());
+        } else {
+            verdict.orphans.push(hold());
         }
     }
     verdict.orphans.sort_by_key(|hold| hold.job_id);
+    verdict.abandoned.sort_by_key(|hold| hold.job_id);
     verdict
 }
 
@@ -193,14 +232,13 @@ impl<'a> PendingClaim<'a> {
             Entry {
                 hold,
                 control,
-                closing: false,
-                retired: false,
+                phase: Phase::Running,
             },
         );
         Registration {
             book: self.book,
             token: self.token,
-            closed: false,
+            ending: Some(Phase::Retired),
         }
     }
 }
@@ -214,24 +252,28 @@ impl Drop for PendingClaim<'_> {
 pub(super) struct Registration<'a> {
     book: &'a RunBook,
     token: i64,
-    closed: bool,
+    ending: Option<Phase>,
 }
 
 impl Registration<'_> {
     pub(super) fn closing(&self) {
         if let Some(entry) = self.book.book.lock().unwrap().runs.get_mut(&self.token) {
-            entry.closing = true;
+            entry.phase = Phase::Closing;
         }
     }
 
     pub(super) fn close(mut self) {
-        self.closed = true;
+        self.ending = None;
+    }
+
+    pub(super) fn abandon(mut self) {
+        self.ending = Some(Phase::Abandoned);
     }
 }
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        self.book.retire(self.token, self.closed);
+        self.book.retire(self.token, self.ending);
     }
 }
 
@@ -258,6 +300,7 @@ mod tests {
             &worker,
             &tokens(&[1, 2]),
             &tokens(&[1, 2]),
+            &tokens(&[]),
             &[owned(10, 1, None)],
         );
         assert_eq!(verdict.lost, [2]);
@@ -268,7 +311,7 @@ mod tests {
     #[test]
     fn test_run_registered_after_the_beat_was_sent_is_not_judged() {
         let worker: Arc<str> = Arc::from("w");
-        let verdict = reconcile(&worker, &tokens(&[]), &tokens(&[3]), &[]);
+        let verdict = reconcile(&worker, &tokens(&[]), &tokens(&[3]), &tokens(&[]), &[]);
         assert_eq!(verdict, Verdict::default());
     }
 
@@ -279,6 +322,7 @@ mod tests {
             &worker,
             &tokens(&[1]),
             &tokens(&[1]),
+            &tokens(&[]),
             &[owned(10, 1, None), owned(11, 7, Some(Command::Stop))],
         );
         assert_eq!(
@@ -289,14 +333,49 @@ mod tests {
                 token: 7,
             }]
         );
+        assert!(verdict.abandoned.is_empty());
         assert!(verdict.lost.is_empty());
         assert!(verdict.commands.is_empty());
     }
 
     #[test]
+    fn test_owned_row_of_an_abandoned_run_is_not_an_orphan() {
+        let worker: Arc<str> = Arc::from("w");
+        let verdict = reconcile(
+            &worker,
+            &tokens(&[]),
+            &tokens(&[]),
+            &tokens(&[4]),
+            &[owned(10, 4, None), owned(11, 9, None)],
+        );
+        assert_eq!(
+            verdict.abandoned,
+            [Hold {
+                job_id: 10,
+                worker_id: Arc::clone(&worker),
+                token: 4,
+            }]
+        );
+        assert_eq!(
+            verdict.orphans,
+            [Hold {
+                job_id: 11,
+                worker_id: Arc::clone(&worker),
+                token: 9,
+            }]
+        );
+    }
+
+    #[test]
     fn test_pending_claim_is_neither_orphan_nor_lost() {
         let worker: Arc<str> = Arc::from("w");
-        let verdict = reconcile(&worker, &tokens(&[]), &tokens(&[5]), &[owned(12, 5, None)]);
+        let verdict = reconcile(
+            &worker,
+            &tokens(&[]),
+            &tokens(&[5]),
+            &tokens(&[]),
+            &[owned(12, 5, None)],
+        );
         assert_eq!(verdict, Verdict::default());
     }
 
@@ -307,6 +386,7 @@ mod tests {
             &worker,
             &tokens(&[1, 2]),
             &tokens(&[1, 2]),
+            &tokens(&[]),
             &[owned(10, 1, Some(Command::Cancel)), owned(11, 2, None)],
         );
         assert_eq!(verdict.commands, [(1, Command::Cancel)]);

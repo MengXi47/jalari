@@ -21,6 +21,9 @@ const CHILD_ENV: &str = "JALARI_RACE_CHILD";
 const SCHEMA_ENV: &str = "JALARI_RACE_CHILD_SCHEMA";
 const QUEUES_ENV: &str = "JALARI_RACE_CHILD_QUEUES";
 const LINK_ENV: &str = "JALARI_RACE_CHILD_LINK";
+const SCHEDULER_ENV: &str = "JALARI_RACE_CHILD_SCHEDULER";
+const TICK: &str = "proc_tick";
+const TICK_MS: i64 = 1000;
 const STEP: Duration = Duration::from_millis(100);
 const POLL: Duration = Duration::from_millis(200);
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
@@ -141,6 +144,18 @@ impl Job for Fragile {
     }
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct Tick;
+
+#[jalari::job(cron = "*/1 * * * * *", queue = "cron")]
+impl Job for Tick {
+    const NAME: &'static str = TICK;
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
 async fn perform(work: Work) -> JobResult {
     let run = Run::begin(work.key).await;
     let length = Duration::from_millis(if run.attempt == 1 {
@@ -221,7 +236,7 @@ async fn test_race_process_child() {
     let mut builder = Worker::builder()
         .config(common::worker_config(POLL))
         .retry_policy(common::fast_retry())
-        .scheduler(false);
+        .scheduler(std::env::var_os(SCHEDULER_ENV).is_some());
     for (queue, concurrency) in &queues {
         builder = builder.queue(queue, *concurrency);
     }
@@ -265,6 +280,20 @@ struct ChildWorker {
 
 impl ChildWorker {
     fn spawn(database: &Database, name: &str, queues: &[(&str, usize)], link: Link) -> Self {
+        Self::launch(database, name, queues, link, false)
+    }
+
+    fn spawn_scheduler(database: &Database, name: &str, queues: &[(&str, usize)]) -> Self {
+        Self::launch(database, name, queues, Link::Shared, true)
+    }
+
+    fn launch(
+        database: &Database,
+        name: &str,
+        queues: &[(&str, usize)],
+        link: Link,
+        scheduler: bool,
+    ) -> Self {
         let queues = queues
             .iter()
             .map(|(queue, concurrency)| format!("{queue}:{concurrency}"))
@@ -286,6 +315,9 @@ impl ChildWorker {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if scheduler {
+            command.env(SCHEDULER_ENV, "1");
+        }
         Self {
             name: name.to_owned(),
             process: command.spawn().unwrap(),
@@ -853,6 +885,15 @@ async fn test_race_process() {
     }
     if selected("long_freeze") {
         failures.extend(timed("long_freeze", check_long_freeze(&database, seed)).await);
+    }
+    if selected("many_processes_fire_each_tick_once") {
+        failures.extend(
+            timed(
+                "many_processes_fire_each_tick_once",
+                check_many_processes_fire_each_tick_once(&database),
+            )
+            .await,
+        );
     }
 
     database.finish().await;
@@ -1590,5 +1631,250 @@ async fn check_partitions(database: &Database, seed: u64) -> Vec<String> {
             "{label}: the healed worker never ran the job enqueued after the heal"
         )),
     }
+    failures
+}
+
+async fn install_tick_audit(database: &Database) {
+    let schema = &database.schema_name;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE TABLE \"{schema}\".tick_fire (
+             tick bigint NOT NULL,
+             app text NOT NULL,
+             txid bigint NOT NULL
+         );
+         CREATE TABLE \"{schema}\".tick_job (
+             job_id bigint PRIMARY KEY,
+             txid bigint NOT NULL
+         );
+         CREATE TABLE \"{schema}\".tick_hold (tick bigint);
+         INSERT INTO \"{schema}\".tick_hold VALUES (NULL);
+         CREATE SEQUENCE \"{schema}\".tick_hold_seq;
+         CREATE FUNCTION \"{schema}\".tick_fire() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE
+             fired bigint := (extract(epoch FROM NEW.last_run_at) * 1000)::bigint;
+         BEGIN
+             IF NEW.name = '{TICK}' AND NEW.last_run_at IS DISTINCT FROM OLD.last_run_at THEN
+                 INSERT INTO \"{schema}\".tick_fire (tick, app, txid)
+                 VALUES (fired, current_setting('application_name'), txid_current());
+                 IF fired = (SELECT hold.tick FROM \"{schema}\".tick_hold AS hold) THEN
+                     IF nextval('\"{schema}\".tick_hold_seq') = 1 THEN
+                         PERFORM pg_advisory_xact_lock(hashtextextended('{schema}:tick_hold', 0));
+                     END IF;
+                 END IF;
+             END IF;
+             RETURN NULL;
+         END $$;
+         CREATE TRIGGER tick_fire AFTER UPDATE ON \"{schema}\".recurring
+             FOR EACH ROW EXECUTE FUNCTION \"{schema}\".tick_fire();
+         CREATE FUNCTION \"{schema}\".tick_job() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.task = '{TICK}' THEN
+                 INSERT INTO \"{schema}\".tick_job (job_id, txid) VALUES (NEW.id, txid_current());
+             END IF;
+             RETURN NULL;
+         END $$;
+         CREATE TRIGGER tick_job AFTER INSERT ON \"{schema}\".job
+             FOR EACH ROW EXECUTE FUNCTION \"{schema}\".tick_job();"
+    )))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+}
+
+async fn db_millis(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn held_fire(database: &Database) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT application_name FROM pg_stat_activity
+         WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'
+             AND starts_with(application_name, $1)
+         LIMIT 1",
+    )
+    .bind(format!("{}_", database.schema_name))
+    .fetch_optional(&database.pool)
+    .await
+    .unwrap()
+}
+
+async fn sessions_of(database: &Database, app: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1")
+        .bind(app)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+}
+
+async fn check_many_processes_fire_each_tick_once(database: &Database) -> Vec<String> {
+    let label = "many_processes_fire_each_tick_once";
+    let mut failures = Vec::new();
+    install_tick_audit(database).await;
+    let duration = Duration::from_secs(9 * common::scale());
+    let queues = [("cron", 2)];
+    let mut children: Vec<ChildWorker> = (0..4)
+        .map(|index| ChildWorker::spawn_scheduler(database, &format!("t{index}"), &queues))
+        .collect();
+    for child in &children {
+        child.wait_ready().await;
+    }
+    let started = Instant::now();
+    let begin = db_millis(&database.pool).await;
+
+    let mut holder = database.pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(format!("{}:tick_hold", database.schema_name))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    tokio::time::sleep(duration / 2).await;
+    let held_tick = (db_millis(&database.pool).await / TICK_MS + 2) * TICK_MS;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET tick = $1",
+        database.table("tick_hold")
+    )))
+    .bind(held_tick)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut victim_app = None;
+    while victim_app.is_none() && Instant::now() < deadline {
+        victim_app = held_fire(database).await;
+        if victim_app.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let victim_name = victim_app.as_deref().and_then(|app| {
+        children
+            .iter()
+            .map(|child| child.name.clone())
+            .find(|name| app == format!("{}_{name}", database.schema_name))
+    });
+    match &victim_name {
+        Some(name) => {
+            let index = children
+                .iter()
+                .position(|child| child.name == *name)
+                .unwrap();
+            children.swap_remove(index).kill(database).await;
+        }
+        None => failures.push(format!(
+            "{label}: no child was caught inside the fire of tick {held_tick} within 10 s \
+             (waiting session {victim_app:?})"
+        )),
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        .bind(format!("{}:tick_hold", database.schema_name))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    drop(holder);
+    let released = db_millis(&database.pool).await;
+    if let Some(app) = &victim_app {
+        common::wait_until(
+            "the killed child's sessions to end",
+            Duration::from_secs(10),
+            || async { sessions_of(database, app).await == 0 },
+        )
+        .await;
+    }
+    let replacement = ChildWorker::spawn_scheduler(database, "t_replacement", &queues);
+    replacement.wait_ready().await;
+    children.push(replacement);
+    tokio::time::sleep_until((started + duration).into()).await;
+    let stop = db_millis(&database.pool).await;
+    for child in children {
+        child.kill(database).await;
+    }
+
+    let fires: Vec<(i64, String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT tick, app, txid FROM {} ORDER BY tick",
+        database.table("tick_fire")
+    )))
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    let jobs: Vec<(i64, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT job_id, txid FROM {} ORDER BY job_id",
+        database.table("tick_job")
+    )))
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+
+    let mut by_tick: std::collections::BTreeMap<i64, Vec<&(i64, String, i64)>> =
+        std::collections::BTreeMap::new();
+    for fire in &fires {
+        by_tick.entry(fire.0).or_default().push(fire);
+    }
+    for (tick, fired) in &by_tick {
+        if tick % TICK_MS != 0 {
+            failures.push(format!("{label}: fired for {tick}, which is not a tick"));
+        }
+        if fired.len() > 1 {
+            failures.push(format!(
+                "{label}: tick {tick} fired {} times: {fired:?}",
+                fired.len()
+            ));
+        }
+    }
+    let first = (begin / TICK_MS + 1) * TICK_MS;
+    let last = (stop - TICK_MS) / TICK_MS * TICK_MS;
+    for tick in (first..=last).step_by(usize::try_from(TICK_MS).unwrap()) {
+        if !by_tick.contains_key(&tick) {
+            failures.push(format!(
+                "{label}: tick {tick} ({:+} ms from the start) never fired",
+                tick - begin
+            ));
+        }
+    }
+    for (tick, app, txid) in &fires {
+        let inserted: Vec<i64> = jobs
+            .iter()
+            .filter(|(_, job_txid)| job_txid == txid)
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        if inserted.len() != 1 {
+            failures.push(format!(
+                "{label}: the fire of tick {tick} by {app} enqueued jobs {inserted:?}, expected \
+                 exactly one"
+            ));
+        }
+    }
+    for (job_id, txid) in &jobs {
+        if !fires.iter().any(|(_, _, fire_txid)| fire_txid == txid) {
+            failures.push(format!(
+                "{label}: job {job_id} of {TICK} came from no committed fire"
+            ));
+        }
+    }
+    match (by_tick.get(&held_tick), &victim_app) {
+        (Some(fired), Some(app)) if fired.iter().any(|fire| fire.1 == *app) => {
+            failures.push(format!(
+                "{label}: the killed child's fire of tick {held_tick} committed: {fired:?}"
+            ));
+        }
+        (None, _) => failures.push(format!(
+            "{label}: tick {held_tick}, whose first fire was killed, never fired"
+        )),
+        _ => {}
+    }
+    let refired = by_tick
+        .get(&held_tick)
+        .and_then(|fired| fired.first())
+        .map(|fire| fire.1.clone());
+    eprintln!(
+        "{label}: {} fires and {} jobs for ticks {first}..={last} ({} ticks), killed {victim_name:?} \
+         inside the fire of tick {held_tick}, released {} ms after the tick, refired by {refired:?}",
+        fires.len(),
+        jobs.len(),
+        (last - first) / TICK_MS + 1,
+        released - held_tick
+    );
     failures
 }

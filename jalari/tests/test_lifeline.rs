@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use common::{Database, LEDGER, RunningWorker, fast_retry, worker_config};
 use jalari::sqlx::{self, AssertSqlSafe};
-use jalari::{Job, JobResult, Worker};
+use jalari::{Job, JobError, JobResult, Worker};
 use serde::{Deserialize, Serialize};
 
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
@@ -41,6 +41,22 @@ impl Job for Ticker {
         }
         LEDGER.record(&self.label, "done");
         Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Unsaveable;
+
+#[jalari::job(queue = "lifeline")]
+impl Job for Unsaveable {
+    const NAME: &'static str = "lifeline_unsaveable";
+    const MAX_ATTEMPTS: i32 = 2;
+
+    async fn run(self) -> JobResult {
+        LEDGER.record("unsaveable", "start");
+        let (_, checkpoint) = jalari::resume::<String>()?;
+        checkpoint.save(&"\u{0}".to_owned()).await?;
+        Err(JobError::new("boom".to_owned()))
     }
 }
 
@@ -115,7 +131,9 @@ async fn test_lifeline() {
     check_lifeline_session(&database).await;
     check_terminated_lifeline_registers_again(&database).await;
     check_terminated_lifeline_aborts_and_hands_over(&database).await;
-    check_orphaned_claim_is_released(&database).await;
+    check_orphaned_claim_is_released(&database, "orphan", 3).await;
+    check_orphaned_claim_is_released(&database, "last_orphan", 1).await;
+    check_abandoned_close_counts_the_attempt(&database).await;
     database.finish().await;
 }
 
@@ -241,7 +259,7 @@ async fn check_terminated_lifeline_aborts_and_hands_over(database: &Database) {
     worker.stop().await;
 }
 
-async fn check_orphaned_claim_is_released(database: &Database) {
+async fn check_orphaned_claim_is_released(database: &Database, label: &str, max_attempts: i32) {
     let worker = spawn_worker().await;
     common::wait_until("the lifeline", Duration::from_secs(10), || async {
         database.lifelines().await.len() == 1
@@ -249,19 +267,20 @@ async fn check_orphaned_claim_is_released(database: &Database) {
     .await;
     let (_, worker_id) = database.lifelines().await.remove(0);
     let payload = serde_json::to_vec(&Ticker {
-        label: "orphan".to_owned(),
+        label: label.to_owned(),
         millis: 10,
     })
     .unwrap();
     let id: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "INSERT INTO {} (queue, task, payload, state, attempts, max_attempts, locked_by,
              locked_at, lock_token)
-         VALUES ('lifeline', 'lifeline_ticker', $1, 'running', 1, 3, $2::uuid, now(), -1)
+         VALUES ('lifeline', 'lifeline_ticker', $1, 'running', 1, $3, $2::uuid, now(), -1)
          RETURNING id",
         database.table("job")
     )))
     .bind(&payload)
     .bind(&worker_id)
+    .bind(max_attempts)
     .fetch_one(&database.pool)
     .await
     .unwrap();
@@ -279,17 +298,37 @@ async fn check_orphaned_claim_is_released(database: &Database) {
         || async { job_shape(database, id).await.0 == "succeeded" },
     )
     .await;
-    eprintln!("orphan: released {released_after:?} after it appeared");
+    eprintln!("{label}: released {released_after:?} after it appeared");
     assert!(
         released_after <= Duration::from_secs(3),
         "{released_after:?}"
     );
-    assert_eq!(starts("orphan").len(), 1);
+    assert_eq!(starts(label).len(), 1);
+    assert_eq!(
+        job_shape(database, id).await.1,
+        [
+            ("scheduled".to_owned(), 0, Some(INTERRUPTED.to_owned())),
+            ("succeeded".to_owned(), 1, None)
+        ]
+    );
+    worker.stop().await;
+}
+
+async fn check_abandoned_close_counts_the_attempt(database: &Database) {
+    let worker = spawn_worker().await;
+    let id = jalari::enqueue(&Unsaveable).await.unwrap().id().0;
+    common::wait_until(
+        "the job to fail after its abandoned close",
+        Duration::from_secs(30),
+        || async { job_shape(database, id).await.0 == "failed" },
+    )
+    .await;
+    assert_eq!(starts("unsaveable").len(), 2);
     assert_eq!(
         job_shape(database, id).await.1,
         [
             ("scheduled".to_owned(), 1, Some(INTERRUPTED.to_owned())),
-            ("succeeded".to_owned(), 2, None)
+            ("failed".to_owned(), 2, Some("boom".to_owned()))
         ]
     );
     worker.stop().await;

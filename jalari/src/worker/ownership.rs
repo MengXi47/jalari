@@ -53,6 +53,7 @@ pub(super) enum Closed {
 pub(super) enum Target<'a> {
     DeadOwners { sweep_orphans: bool },
     Orphans(&'a [Hold]),
+    Abandoned(&'a [Hold]),
     Shutdown(&'a [Hold]),
 }
 
@@ -60,7 +61,14 @@ impl Target<'_> {
     fn delay(&self) -> Duration {
         match self {
             Self::DeadOwners { .. } => Duration::ZERO,
-            Self::Orphans(_) | Self::Shutdown(_) => TAKEOVER_GRACE,
+            Self::Orphans(_) | Self::Abandoned(_) | Self::Shutdown(_) => TAKEOVER_GRACE,
+        }
+    }
+
+    fn refund(&self) -> i32 {
+        match self {
+            Self::Orphans(_) => 1,
+            Self::DeadOwners { .. } | Self::Abandoned(_) | Self::Shutdown(_) => 0,
         }
     }
 }
@@ -271,7 +279,7 @@ pub(super) async fn interrupt(
                      )
              )"
         ),
-        Target::Orphans(_) | Target::Shutdown(_) => String::new(),
+        Target::Orphans(_) | Target::Abandoned(_) | Target::Shutdown(_) => String::new(),
     };
     let doomed = match target {
         Target::DeadOwners { .. } => format!(
@@ -292,16 +300,16 @@ pub(super) async fn interrupt(
                  WHERE pg_try_advisory_xact_lock(hashtextextended($4 || suspects.id::text, 0))
              ),
              doomed AS (
-                 SELECT job.id, job.command FROM {job} AS job
+                 SELECT job.id, job.command, 0 AS refund FROM {job} AS job
                  WHERE job.state = 'running' AND job.locked_by IN (SELECT id FROM dead)
                  ORDER BY job.id
                  LIMIT $6
                  FOR NO KEY UPDATE SKIP LOCKED
              )"
         ),
-        Target::Orphans(_) | Target::Shutdown(_) => format!(
+        Target::Orphans(_) | Target::Abandoned(_) | Target::Shutdown(_) => format!(
             "doomed AS (
-                 SELECT job.id, job.command FROM {job} AS job
+                 SELECT job.id, job.command, $6::int AS refund FROM {job} AS job
                  JOIN unnest($3::bigint[], $4::text[], $5::bigint[]) AS hold (job_id, worker_id, token)
                      ON job.id = hold.job_id AND job.locked_by = hold.worker_id::uuid
                          AND job.lock_token = hold.token
@@ -317,9 +325,9 @@ pub(super) async fn interrupt(
              UPDATE {job} AS job
              SET state = CASE WHEN doomed.command = 'cancel' THEN 'deleted'
                      WHEN doomed.command = 'stop' THEN 'stopped'
-                     WHEN job.attempts >= job.max_attempts THEN 'failed'
+                     WHEN job.attempts - doomed.refund >= job.max_attempts THEN 'failed'
                      ELSE 'scheduled' END,
-                 attempts = CASE WHEN doomed.command IS NULL THEN job.attempts
+                 attempts = CASE WHEN doomed.command IS NULL THEN job.attempts - doomed.refund
                      ELSE job.attempts - 1 END,
                  last_error = $1,
                  run_at = statement_timestamp() + $2,
@@ -350,6 +358,7 @@ pub(super) async fn interrupt(
         job_control = schema.table("job_control"),
     );
     let delay = target.delay();
+    let refund = target.refund();
     let query = sqlx::query_as::<_, Interrupted>(AssertSqlSafe(sql))
         .bind(INTERRUPTED)
         .bind(interval(delay));
@@ -363,7 +372,7 @@ pub(super) async fn interrupt(
                 .fetch_all(pool)
                 .await?
         }
-        Target::Orphans(holds) | Target::Shutdown(holds) => {
+        Target::Orphans(holds) | Target::Abandoned(holds) | Target::Shutdown(holds) => {
             let job_ids: Vec<i64> = holds.iter().map(|hold| hold.job_id).collect();
             let worker_ids: Vec<&str> = holds.iter().map(|hold| &*hold.worker_id).collect();
             let tokens: Vec<i64> = holds.iter().map(|hold| hold.token).collect();
@@ -371,6 +380,7 @@ pub(super) async fn interrupt(
                 .bind(job_ids)
                 .bind(worker_ids)
                 .bind(tokens)
+                .bind(refund)
                 .fetch_all(pool)
                 .await?
         }

@@ -221,9 +221,9 @@ impl Lifeline {
             let sent = shared.runs.running(&worker_id);
             let failure = match tokio::time::timeout(PING_TIMEOUT, self.beat(shared)).await {
                 Ok(Ok(Some(owned))) => {
-                    let orphans = shared.runs.deliver(&worker_id, &sent, &owned);
-                    if !orphans.is_empty() {
-                        tokio::spawn(release(Arc::clone(shared), orphans));
+                    let (orphans, abandoned) = shared.runs.deliver(&worker_id, &sent, &owned);
+                    if !orphans.is_empty() || !abandoned.is_empty() {
+                        tokio::spawn(release(Arc::clone(shared), orphans, abandoned));
                     }
                     continue;
                 }
@@ -280,16 +280,20 @@ impl Lifeline {
     }
 }
 
-async fn release(shared: Arc<Shared>, orphans: Vec<Hold>) {
+async fn release(shared: Arc<Shared>, orphans: Vec<Hold>, abandoned: Vec<Hold>) {
     shared.flush_logged().await;
-    if let Err(e) = interrupt(
-        &shared.config.pool.pool(),
-        &shared.config.schema,
-        Target::Orphans(&orphans),
-    )
-    .await
+    let pool = shared.config.pool.pool();
+    let schema = &shared.config.schema;
+    if !orphans.is_empty()
+        && let Err(e) = interrupt(&pool, schema, Target::Orphans(&orphans)).await
     {
-        warn!(error = %e, "failed to release jobs this worker no longer runs");
+        warn!(error = %e, "failed to release jobs this worker claimed but never ran");
+    }
+    if !abandoned.is_empty() {
+        match interrupt(&pool, schema, Target::Abandoned(&abandoned)).await {
+            Ok(_) => shared.runs.forget(&abandoned),
+            Err(e) => warn!(error = %e, "failed to release jobs whose outcome was not recorded"),
+        }
     }
 }
 

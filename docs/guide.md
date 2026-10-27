@@ -526,6 +526,12 @@ more, for example by a virtual machine pause, may still run code for a moment af
 and before it notices; the job's writes to the job tables are rejected, but its own side
 effects are not.
 
+A worker also hands back jobs it owns but no longer runs, within a second, and they run again 7
+seconds later. When the database committed a claim but the reply never reached the
+worker, the job never started, so the attempt does not count. When a finished attempt's outcome
+cannot be recorded after five tries a second apart, the attempt counts and is recorded as
+interrupted, so a job whose outcome can never be saved still stops at `MAX_ATTEMPTS`.
+
 If no worker runs at all, a dead worker's jobs stay `running` until a worker starts, and
 `jalari::admin::stranded()` lists them. Do not end lifeline sessions from scripts that clean up
 idle connections: every job of that worker is aborted and taken over.

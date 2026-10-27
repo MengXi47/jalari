@@ -146,11 +146,13 @@ impl Shared {
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to record the job outcome, giving up");
+                    registration.abandon();
                     return;
                 }
             }
         }
         warn!("the job outcome kept changing, giving up");
+        registration.abandon();
     }
 }
 
