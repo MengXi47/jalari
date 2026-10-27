@@ -149,3 +149,241 @@ fn test_checkpoints_flag_leaves_the_fingerprint_alone() {
         stamped(&expanded("fingerprint = true", SHORT))
     );
 }
+
+const UNNAMED: &str = "impl Job for SendEmail {
+    async fn run(self) -> JobResult { Ok(()) }
+}";
+
+fn rejected(attribute: &str, item: &str) -> String {
+    let item: ItemImpl = syn::parse_str(item).unwrap();
+    expand(arguments(attribute), item, None)
+        .expect_err("the expansion is rejected")
+        .to_string()
+}
+
+fn impl_block(expansion: &str) -> &str {
+    &expansion[..expansion
+        .find(":: jalari :: __private :: inventory :: submit !")
+        .expect("the registration follows the impl")]
+}
+
+#[test]
+fn test_default_name_is_the_type_identifier() {
+    assert!(
+        impl_block(&expanded("", UNNAMED)).contains("const NAME : & 'static str = \"SendEmail\" ;")
+    );
+    let pathed = "impl Job for crate::jobs::SendEmail {
+        async fn run(self) -> JobResult { Ok(()) }
+    }";
+    assert!(
+        impl_block(&expanded("", pathed)).contains("const NAME : & 'static str = \"SendEmail\" ;")
+    );
+}
+
+#[test]
+fn test_explicit_name_sets_the_const() {
+    let expansion = expanded("name = \"send_email\"", UNNAMED);
+    let block = impl_block(&expansion);
+    assert!(block.contains("const NAME : & 'static str = \"send_email\" ;"));
+    assert!(!block.contains("\"SendEmail\""));
+}
+
+#[test]
+fn test_impl_name_is_kept_without_the_attribute() {
+    let block = impl_block(&expanded("", SHORT)).to_owned();
+    assert_eq!(block.matches("const NAME").count(), 1);
+    assert!(block.contains("const NAME : & 'static str = \"j\" ;"));
+}
+
+#[test]
+fn test_name_in_attribute_and_impl_is_an_error() {
+    assert_eq!(
+        rejected("name = \"k\"", SHORT),
+        "`name` is set both here and by `const NAME` in the impl; keep one"
+    );
+}
+
+#[test]
+fn test_every_injected_const_conflicts_with_the_impl() {
+    for (attribute, constant, declared) in [
+        (
+            "max_attempts = 3",
+            "MAX_ATTEMPTS",
+            "const MAX_ATTEMPTS: i32 = 3;",
+        ),
+        (
+            "timeout = 30",
+            "TIMEOUT",
+            "const TIMEOUT: Option<Duration> = None;",
+        ),
+        (
+            "priority = \"high\"",
+            "PRIORITY",
+            "const PRIORITY: Priority = Priority::Low;",
+        ),
+        (
+            "aliases = [\"old\"]",
+            "ALIASES",
+            "const ALIASES: &'static [&'static str] = &[];",
+        ),
+    ] {
+        let item = format!(
+            "impl Job for J {{
+                const NAME: &'static str = \"j\";
+                {declared}
+                async fn run(self) -> JobResult {{ Ok(()) }}
+            }}"
+        );
+        let argument = attribute.split(' ').next().unwrap();
+        assert_eq!(
+            rejected(attribute, &item),
+            format!(
+                "`{argument}` is set both here and by `const {constant}` in the impl; keep one"
+            ),
+        );
+    }
+}
+
+#[test]
+fn test_max_attempts_attribute_injects_the_const() {
+    assert!(
+        impl_block(&expanded("max_attempts = 5", SHORT)).contains("const MAX_ATTEMPTS : i32 = 5 ;")
+    );
+    for text in [
+        "max_attempts = \"5\"",
+        "max_attempts = 3000000000",
+        "max_attempts = 2.5",
+    ] {
+        assert!(
+            parse_arguments(arguments(text)).is_err(),
+            "{text} is rejected"
+        );
+    }
+}
+
+#[test]
+fn test_timeout_attribute_injects_seconds() {
+    assert!(impl_block(&expanded("timeout = 30", SHORT)).contains(
+        "const TIMEOUT : :: core :: option :: Option < :: core :: time :: Duration > = \
+         :: core :: option :: Option :: Some (:: core :: time :: Duration :: from_secs (30)) ;"
+    ));
+    for text in ["timeout = \"30s\"", "timeout = 1.5", "timeout = -1"] {
+        assert!(
+            parse_arguments(arguments(text)).is_err(),
+            "{text} is rejected"
+        );
+    }
+}
+
+#[test]
+fn test_priority_attribute_injects_the_variant() {
+    for (text, variant) in [
+        ("low", "Low"),
+        ("normal", "Normal"),
+        ("high", "High"),
+        ("urgent", "Urgent"),
+    ] {
+        let expansion = expanded(&format!("priority = \"{text}\""), SHORT);
+        assert!(
+            impl_block(&expansion).contains(&format!(
+                "const PRIORITY : :: jalari :: Priority = :: jalari :: Priority :: {variant} ;"
+            )),
+            "{text} injects {variant}"
+        );
+    }
+}
+
+#[test]
+fn test_priority_attribute_rejects_unknown_levels() {
+    for text in [
+        "priority = \"High\"",
+        "priority = \"critical\"",
+        "priority = 1",
+    ] {
+        assert!(
+            parse_arguments(arguments(text)).is_err(),
+            "{text} is rejected"
+        );
+    }
+    let message = parse_arguments(arguments("priority = \"critical\""))
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        message,
+        "expected \"low\", \"normal\", \"high\" or \"urgent\""
+    );
+}
+
+#[test]
+fn test_aliases_attribute_injects_the_slice() {
+    assert!(
+        impl_block(&expanded("aliases = [\"old\", \"older\"]", SHORT))
+            .contains("const ALIASES : & 'static [& 'static str] = & [\"old\" , \"older\"] ;")
+    );
+    assert!(
+        impl_block(&expanded("aliases = []", SHORT))
+            .contains("const ALIASES : & 'static [& 'static str] = & [] ;")
+    );
+    for text in [
+        "aliases = \"old\"",
+        "aliases = [old]",
+        "aliases = [\"old\", 1]",
+    ] {
+        assert!(
+            parse_arguments(arguments(text)).is_err(),
+            "{text} is rejected"
+        );
+    }
+}
+
+#[test]
+fn test_metadata_arguments_reject_duplicates() {
+    for text in [
+        "name = \"a\", name = \"b\"",
+        "max_attempts = 1, max_attempts = 2",
+        "timeout = 1, timeout = 2",
+        "priority = \"low\", priority = \"high\"",
+        "aliases = [], aliases = []",
+    ] {
+        assert!(
+            parse_arguments(arguments(text)).is_err(),
+            "{text} is rejected"
+        );
+    }
+}
+
+#[test]
+fn test_non_path_type_requires_a_name() {
+    for item in [
+        "impl Job for Wrapper<u8> { async fn run(self) -> JobResult { Ok(()) } }",
+        "impl Job for &'static Ping { async fn run(self) -> JobResult { Ok(()) } }",
+        "impl Job for (A, B) { async fn run(self) -> JobResult { Ok(()) } }",
+    ] {
+        assert!(
+            rejected("", item).contains("set `name = \"...\"`"),
+            "{item} asks for a name"
+        );
+        assert!(
+            expand(
+                arguments("name = \"wrapped\""),
+                syn::parse_str(item).unwrap(),
+                None
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn test_fingerprint_covers_attribute_max_attempts_and_timeout() {
+    let base = stamped(&expanded("fingerprint = true", SHORT));
+    let five = stamped(&expanded("fingerprint = true, max_attempts = 5", SHORT));
+    let six = stamped(&expanded("fingerprint = true, max_attempts = 6", SHORT));
+    assert_ne!(base, five);
+    assert_ne!(five, six);
+    let thirty = stamped(&expanded("fingerprint = true, timeout = 30", SHORT));
+    let sixty = stamped(&expanded("fingerprint = true, timeout = 60", SHORT));
+    assert_ne!(base, thirty);
+    assert_ne!(thirty, sixty);
+}

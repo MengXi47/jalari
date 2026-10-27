@@ -2,16 +2,19 @@ mod fingerprint;
 #[cfg(test)]
 mod tests;
 
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use proc_macro::{Span, TokenStream};
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Ident, Span as Span2, TokenStream as TokenStream2};
 use quote::{quote, quote_spanned};
+use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitBool, LitStr, MetaNameValue, Token,
-    parse_macro_input, parse_quote,
+    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitBool, LitInt, LitStr, MetaNameValue, Token, Type,
+    parse_macro_input, parse_quote, parse_quote_spanned,
 };
 
 /// Registers an `impl Job for T` so workers can run `T`, optionally on a cron schedule.
@@ -21,13 +24,23 @@ use syn::{
 ///
 /// # Arguments
 ///
+/// * `name` - Sets `Job::NAME`; the type's name, as written, when neither this nor the impl
+///   sets it. Renaming such a type renames the job, so add the old name to `aliases`
 /// * `queue` - Default queue for the job; `default` when omitted
+/// * `max_attempts` - Sets `Job::MAX_ATTEMPTS` from an integer literal
+/// * `timeout` - Sets `Job::TIMEOUT` from an integer literal of seconds; a limit below one
+///   second needs `const TIMEOUT` in the impl
+/// * `priority` - Sets `Job::PRIORITY` from `"low"`, `"normal"`, `"high"` or `"urgent"`
+/// * `aliases` - Sets `Job::ALIASES` from an array of string literals
 /// * `cron` - Cron expression with five or six fields; makes the job recurring. `T` must
 ///   implement `Default`, which provides the arguments of every run
 /// * `timezone` - IANA time zone for `cron`; `UTC` when omitted. Only valid with `cron`
 /// * `fingerprint` - `true` turns the code fingerprint on for this job; `false` when omitted
 /// * `checkpoints` - `true` declares that the job reaches checkpoints regularly; an abort at
 ///   `stop_timeout` or `shutdown_timeout` is then logged as an error. `false` when omitted
+///
+/// `name`, `max_attempts`, `timeout`, `priority` and `aliases` are an alternative to declaring
+/// the constant in the impl. Setting one both ways is a compile error.
 ///
 /// A schedule declared with `cron` follows the deployed code: workers sync it at startup, remove
 /// it when the declaration is gone, and it cannot be changed at runtime. Use
@@ -41,7 +54,7 @@ use syn::{
 /// The job's constants are checked at compile time, computed values included: `NAME` must not
 /// be empty, `MAX_ATTEMPTS` must be at least 1, and `TIMEOUT`, when set, must be longer than
 /// zero and at most `i32::MAX` milliseconds. A violation is a compile error that names the job
-/// and points at the constant.
+/// and points at the constant, or at the argument that set it.
 ///
 /// # Code fingerprint
 ///
@@ -117,7 +130,32 @@ struct JobArguments {
     queue: Option<LitStr>,
     fingerprint: Option<LitBool>,
     checkpoints: Option<LitBool>,
+    constants: Vec<Constant>,
 }
+
+struct Constant {
+    argument: &'static str,
+    name: &'static str,
+    span: Span2,
+    item: ImplItem,
+}
+
+type ConstantItem = fn(&MetaNameValue, Span2) -> syn::Result<ImplItem>;
+
+const CONSTANTS: [(&str, &str, ConstantItem); 5] = [
+    ("name", "NAME", name_item),
+    ("max_attempts", "MAX_ATTEMPTS", max_attempts_item),
+    ("timeout", "TIMEOUT", timeout_item),
+    ("priority", "PRIORITY", priority_item),
+    ("aliases", "ALIASES", aliases_item),
+];
+
+const PRIORITIES: [(&str, &str); 4] = [
+    ("low", "Low"),
+    ("normal", "Normal"),
+    ("high", "High"),
+    ("urgent", "Urgent"),
+];
 
 fn expand(
     arguments: Punctuated<MetaNameValue, Token![,]>,
@@ -143,6 +181,8 @@ fn expand(
             "#[jalari::job] does not support generic jobs",
         ));
     }
+
+    inject_constants(&mut item_impl, arguments.constants)?;
 
     let fingerprint = if arguments.fingerprint.as_ref().is_some_and(LitBool::value) {
         let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_file));
@@ -188,6 +228,58 @@ fn expand(
 
         #checks
     })
+}
+
+fn declares(item_impl: &ItemImpl, name: &str) -> bool {
+    item_impl
+        .items
+        .iter()
+        .any(|item| matches!(item, ImplItem::Const(constant) if constant.ident == name))
+}
+
+fn inject_constants(item_impl: &mut ItemImpl, constants: Vec<Constant>) -> syn::Result<()> {
+    for constant in constants {
+        if declares(item_impl, constant.name) {
+            return Err(syn::Error::new(
+                constant.span,
+                format!(
+                    "`{}` is set both here and by `const {}` in the impl; keep one",
+                    constant.argument, constant.name
+                ),
+            ));
+        }
+        item_impl.items.push(constant.item);
+    }
+    if !declares(item_impl, "NAME") {
+        let name = default_name(&item_impl.self_ty)?;
+        let span = item_impl.self_ty.span();
+        item_impl.items.push(parse_quote_spanned! {span=>
+            const NAME: &'static str = #name;
+        });
+    }
+    Ok(())
+}
+
+fn default_name(self_ty: &Type) -> syn::Result<LitStr> {
+    match self_ty {
+        Type::Group(group) => default_name(&group.elem),
+        Type::Path(path) if path.qself.is_none() => match path.path.segments.last() {
+            Some(segment) if segment.arguments.is_none() => Ok(LitStr::new(
+                &segment.ident.unraw().to_string(),
+                segment.ident.span(),
+            )),
+            _ => Err(unnamed(self_ty)),
+        },
+        _ => Err(unnamed(self_ty)),
+    }
+}
+
+fn unnamed(self_ty: &Type) -> syn::Error {
+    syn::Error::new_spanned(
+        self_ty,
+        "#[jalari::job] takes the job's name from a plain type name; set `name = \"...\"` for \
+         this type",
+    )
 }
 
 fn constant_checks(item_impl: &ItemImpl) -> TokenStream2 {
@@ -268,8 +360,29 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         queue: None,
         fingerprint: None,
         checkpoints: None,
+        constants: Vec::new(),
     };
     for argument in arguments {
+        let span = argument.path.span();
+        if let Some(&(key, name, item)) = CONSTANTS
+            .iter()
+            .find(|(key, _, _)| argument.path.is_ident(key))
+        {
+            if parsed
+                .constants
+                .iter()
+                .any(|constant| constant.name == name)
+            {
+                return Err(syn::Error::new(span, "duplicate argument"));
+            }
+            parsed.constants.push(Constant {
+                argument: key,
+                name,
+                span,
+                item: item(&argument, span)?,
+            });
+            continue;
+        }
         if argument.path.is_ident("fingerprint") || argument.path.is_ident("checkpoints") {
             let slot = if argument.path.is_ident("fingerprint") {
                 &mut parsed.fingerprint
@@ -277,15 +390,11 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
                 &mut parsed.checkpoints
             };
             if slot.is_some() {
-                return Err(syn::Error::new_spanned(
-                    &argument.path,
-                    "duplicate argument",
-                ));
+                return Err(syn::Error::new(span, "duplicate argument"));
             }
             *slot = Some(bool_value(&argument)?);
             continue;
         }
-        let value = string_value(&argument)?;
         let slot = if argument.path.is_ident("cron") {
             &mut parsed.cron
         } else if argument.path.is_ident("timezone") {
@@ -295,16 +404,14 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         } else {
             return Err(syn::Error::new_spanned(
                 &argument.path,
-                "expected `cron`, `timezone`, `queue`, `fingerprint` or `checkpoints`",
+                "expected `name`, `queue`, `max_attempts`, `timeout`, `priority`, `aliases`, \
+                 `cron`, `timezone`, `fingerprint` or `checkpoints`",
             ));
         };
         if slot.is_some() {
-            return Err(syn::Error::new_spanned(
-                &argument.path,
-                "duplicate argument",
-            ));
+            return Err(syn::Error::new(span, "duplicate argument"));
         }
-        *slot = Some(value);
+        *slot = Some(string_value(&argument)?);
     }
     if let (None, Some(timezone)) = (&parsed.cron, &parsed.timezone) {
         return Err(syn::Error::new_spanned(
@@ -313,6 +420,64 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         ));
     }
     Ok(parsed)
+}
+
+fn name_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+    let name = string_value(argument)?;
+    Ok(parse_quote_spanned! {span=> const NAME: &'static str = #name; })
+}
+
+fn max_attempts_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+    let max_attempts = LitInt::new(&integer_value::<i32>(argument)?.to_string(), span);
+    Ok(parse_quote_spanned! {span=> const MAX_ATTEMPTS: i32 = #max_attempts; })
+}
+
+fn timeout_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+    let seconds = LitInt::new(&integer_value::<u64>(argument)?.to_string(), span);
+    Ok(parse_quote_spanned! {span=>
+        const TIMEOUT: ::core::option::Option<::core::time::Duration> =
+            ::core::option::Option::Some(::core::time::Duration::from_secs(#seconds));
+    })
+}
+
+fn priority_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+    let level = string_value(argument)?;
+    let variant = PRIORITIES
+        .iter()
+        .find(|(text, _)| level.value() == *text)
+        .map(|(_, variant)| Ident::new(variant, span))
+        .ok_or_else(|| {
+            syn::Error::new_spanned(
+                &level,
+                "expected \"low\", \"normal\", \"high\" or \"urgent\"",
+            )
+        })?;
+    Ok(parse_quote_spanned! {span=>
+        const PRIORITY: ::jalari::Priority = ::jalari::Priority::#variant;
+    })
+}
+
+fn aliases_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+    let Expr::Array(array) = &argument.value else {
+        return Err(syn::Error::new_spanned(
+            &argument.value,
+            "expected an array of string literals",
+        ));
+    };
+    let aliases = array
+        .elems
+        .iter()
+        .map(|alias| match alias {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(alias),
+                ..
+            }) => Ok(alias),
+            other => Err(syn::Error::new_spanned(other, "expected a string literal")),
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    Ok(parse_quote_spanned! {span=>
+        const ALIASES: &'static [&'static str] = &[#(#aliases),*];
+    })
 }
 
 fn string_value(argument: &MetaNameValue) -> syn::Result<LitStr> {
@@ -332,5 +497,22 @@ fn bool_value(argument: &MetaNameValue) -> syn::Result<LitBool> {
             ..
         }) => Ok(value.clone()),
         other => Err(syn::Error::new_spanned(other, "expected `true` or `false`")),
+    }
+}
+
+fn integer_value<N>(argument: &MetaNameValue) -> syn::Result<N>
+where
+    N: FromStr,
+    N::Err: Display,
+{
+    match &argument.value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(value),
+            ..
+        }) => value.base10_parse(),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "expected an integer literal",
+        )),
     }
 }

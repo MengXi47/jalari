@@ -62,6 +62,9 @@ pub type JobResult = std::result::Result<(), JobError>;
 pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// Stable name stored with each job and used to find the type that runs it.
     ///
+    /// `#[jalari::job(name = "...")]` can set it instead of the impl. When neither sets it,
+    /// `#[jalari::job]` uses the type's name as written, so renaming the type renames the job.
+    ///
     /// Must be unique within a binary. Jobs already enqueued under an old name keep waiting
     /// until a worker that knows that name picks them up. Jobs enqueued by another build of
     /// the same name wait the same way, for a worker of that build.
@@ -106,6 +109,21 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     ///     }
     /// }
     /// ```
+    ///
+    /// The same holds when `#[jalari::job(max_attempts = ...)]` sets it:
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct Ping;
+    /// #[jalari::job(name = "ping", max_attempts = 0)]
+    /// impl Job for Ping {
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
     const MAX_ATTEMPTS: i32 = DEFAULT_MAX_ATTEMPTS;
 
     /// Longest time one attempt may run before it is cancelled and counted as failed.
@@ -144,6 +162,21 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     ///     const NAME: &'static str = "ping";
     ///     const TIMEOUT: Option<Duration> = Some(Duration::from_secs(3_000_000));
     ///
+    ///     async fn run(self) -> JobResult {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The same holds when `#[jalari::job(timeout = ...)]` sets it in seconds:
+    ///
+    /// ```rust,compile_fail,E0080
+    /// # use jalari::{Job, JobResult};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct Ping;
+    /// #[jalari::job(name = "ping", timeout = 0)]
+    /// impl Job for Ping {
     ///     async fn run(self) -> JobResult {
     ///         Ok(())
     ///     }
