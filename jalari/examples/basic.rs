@@ -52,11 +52,7 @@ impl Job for SyncInventory {
     async fn run(self) -> JobResult {
         for batch in 1..=self.batches {
             tokio::select! {
-                () = jalari::shutdown_requested() => {
-                    return Err(jalari::JobError::new(format!(
-                        "stopped for shutdown before batch {batch}"
-                    )));
-                }
+                error = jalari::interrupted() => return Err(error),
                 () = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
             println!(

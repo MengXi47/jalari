@@ -61,6 +61,22 @@ impl Job for Reindex {
 }
 
 #[derive(Serialize, Deserialize)]
+struct Upload;
+
+#[jalari::job(queue = "exports")]
+impl Job for Upload {
+    const NAME: &'static str = "upload";
+
+    async fn run(self) -> JobResult {
+        println!("  [upload] waiting on one long transfer");
+        tokio::select! {
+            error = jalari::interrupted() => Err(error),
+            () = tokio::time::sleep(Duration::from_secs(600)) => Ok(()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct LegacyImport;
 
 #[jalari::job(queue = "exports")]
@@ -220,6 +236,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     println!("enqueue with the cancelled job's key -> {again:?}");
     wait_for_state(&pool, again.id(), "succeeded").await?;
+
+    println!("\n== Stop a job blocked in one long await");
+    let upload = jalari::enqueue(&Upload).await?.id();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let asked = std::time::Instant::now();
+    stop_and_wait(upload).await?;
+    println!(
+        "interrupted() stopped it {:?} after the request, without waiting for stop_timeout",
+        asked.elapsed()
+    );
+    cancel_and_wait(upload).await?;
 
     println!("\n== Stop a job that never reaches a checkpoint");
     let legacy = jalari::enqueue(&LegacyImport).await?.id();
