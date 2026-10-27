@@ -138,16 +138,89 @@ async fn test_version_7_adds_the_fingerprint_columns() {
         "worker.tasks:jsonb:YES:".to_owned(),
     ];
 
-    assert_eq!(SCHEMA_VERSION, 7);
     jalari::migrate_to(&pool, &schema, 6).await.unwrap();
     let before = snapshot(&pool, &name).await;
     assert!(columns.iter().all(|column| !before.contains(column)));
-    jalari::migrate(&pool, &schema).await.unwrap();
+    jalari::migrate_to(&pool, &schema, 7).await.unwrap();
     let after = snapshot(&pool, &name).await;
     assert!(columns.iter().all(|column| after.contains(column)));
     assert_eq!(
         jalari::schema_version(&pool, &schema).await.unwrap(),
         Some(7)
+    );
+
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
+async fn test_version_8_adds_the_lock_columns_and_constraints() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    let columns = [
+        "job.locked_by:uuid:YES:",
+        "job.locked_at:timestamp with time zone:YES:",
+        "job.lock_token:bigint:YES:",
+        "job.queue_key_slot:smallint:YES:",
+        "job.command:text:YES:",
+    ];
+
+    assert_eq!(SCHEMA_VERSION, 8);
+    jalari::migrate_to(&pool, &schema, 7).await.unwrap();
+    let before = snapshot(&pool, &name).await;
+    assert!(
+        columns
+            .iter()
+            .all(|column| !before.iter().any(|row| row == column))
+    );
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let after = snapshot(&pool, &name).await;
+    for column in columns {
+        assert!(after.iter().any(|row| row == column), "{column}");
+    }
+    for index in [
+        "job_job_key_active_idx",
+        "job_queue_key_running_idx",
+        "job_running_idx",
+    ] {
+        assert!(
+            after
+                .iter()
+                .any(|row| row.starts_with(&format!("{index}:CREATE"))),
+            "{index}"
+        );
+    }
+    assert!(
+        !after
+            .iter()
+            .any(|row| row.starts_with("job_job_key_held_idx:"))
+    );
+    for constraint in ["job_state_check", "job_command_check", "job_running_check"] {
+        let definition = after
+            .iter()
+            .find(|row| row.starts_with(&format!("job.{constraint}:")))
+            .unwrap_or_else(|| panic!("{constraint} is missing"));
+        assert!(definition.ends_with("NOT VALID"), "{definition}");
+    }
+
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO \"{name}\".job (task, payload, state, max_attempts)
+         VALUES ('shape', '\\x00', 'enqueued', 1)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let ownerless = sqlx::query(AssertSqlSafe(format!(
+        "UPDATE \"{name}\".job SET state = 'running'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        ownerless.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
     );
 
     drop_schema(&pool, &name).await;

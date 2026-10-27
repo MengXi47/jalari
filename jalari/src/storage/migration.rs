@@ -174,6 +174,7 @@ fn render(template: &str, version: i32, schema: &Schema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::JobState;
 
     fn schemas() -> [Schema; 3] {
         [
@@ -218,6 +219,44 @@ mod tests {
             assert!(last_statement.contains(&schema.table("schema_version")));
             assert!(last_statement.contains(&format!("VALUES (TRUE, {})", migration.version)));
         }
+    }
+
+    fn states_after(sql: &str, marker: &str) -> Vec<String> {
+        let defined = &sql[sql.find(marker).unwrap()..];
+        let list = &defined[defined.find("state IN (").unwrap() + "state IN (".len()..];
+        list[..list.find(')').unwrap()]
+            .split(',')
+            .map(|state| state.trim().trim_matches('\'').to_owned())
+            .collect()
+    }
+
+    fn latest_defining(marker: &str) -> &'static str {
+        TEMPLATES
+            .iter()
+            .rev()
+            .map(|&(_, template)| template)
+            .find(|template| template.contains(marker))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_state_checks_list_every_job_state() {
+        let all: Vec<String> = JobState::ALL
+            .iter()
+            .map(|state| state.to_string())
+            .collect();
+        for marker in ["job_state_check", "job_history_state_check"] {
+            assert_eq!(
+                states_after(latest_defining(marker), marker),
+                all,
+                "{marker}"
+            );
+        }
+        let finished = states_after(latest_defining("job_finished_idx"), "job_finished_idx");
+        assert_eq!(
+            format!("('{}')", finished.join("', '")),
+            JobState::finished_sql()
+        );
     }
 
     #[test]
