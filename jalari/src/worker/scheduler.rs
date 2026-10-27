@@ -13,6 +13,8 @@ use crate::enqueue::{EnqueueOutcome, EnqueueRequest, timeout_ms};
 use crate::recurring::store::{Plan, SCHEDULE_COLUMNS, StoredSchedule, lock_schedule};
 use crate::{Error, ErrorKind, Result, Schedule};
 
+const HELD_FIRE_BACKOFF: Duration = Duration::from_millis(100);
+
 #[derive(sqlx::FromRow)]
 struct DueRecurring {
     name: String,
@@ -230,10 +232,12 @@ impl Shared {
         .fetch_one(&pool)
         .await?;
         let poll_interval = self.settings.poll_interval;
-        Ok(seconds.map_or(poll_interval, |seconds| {
-            Duration::try_from_secs_f64(seconds.max(0.0))
+        Ok(match seconds {
+            None => poll_interval,
+            Some(seconds) if seconds <= 0.0 => HELD_FIRE_BACKOFF.min(poll_interval),
+            Some(seconds) => Duration::try_from_secs_f64(seconds)
                 .unwrap_or(poll_interval)
-                .min(poll_interval)
-        }))
+                .min(poll_interval),
+        })
     }
 }

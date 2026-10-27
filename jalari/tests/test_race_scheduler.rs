@@ -439,6 +439,11 @@ async fn test_race_scheduler() {
         let violations = check_trigger_kept_exactly_when_pending(&database).await;
         report("trigger_kept_exactly_when_pending", violations, at);
     }
+    if selected("held_fire_does_not_spin") {
+        let at = Instant::now();
+        let violations = check_held_fire_does_not_spin(&database).await;
+        report("held_fire_does_not_spin", violations, at);
+    }
     report("occupancy", occupancy_violations(), Instant::now());
 
     eprintln!("test_race_scheduler finished in {:?}", started.elapsed());
@@ -1150,4 +1155,153 @@ async fn check_trigger_kept_exactly_when_pending(database: &Database) -> Vec<Str
     );
     worker.stop().await;
     violations
+}
+
+async fn recurring_scans(database: &Database) -> i64 {
+    sqlx::query_scalar(
+        "SELECT coalesce(seq_scan, 0) + coalesce(idx_scan, 0) FROM pg_stat_user_tables
+         WHERE schemaname = $1 AND relname = 'recurring'",
+    )
+    .bind(&database.schema_name)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap()
+}
+
+async fn settled_recurring_scans(database: &Database) -> i64 {
+    let mut last = recurring_scans(database).await;
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let now = recurring_scans(database).await;
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
+async fn check_held_fire_does_not_spin(database: &Database) -> Vec<String> {
+    let mut violations = Vec::new();
+    let schema = &database.schema_name;
+    let name = "held-fire";
+    let lock_key = format!("{schema}:held_fire");
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE TABLE \"{schema}\".held_fire (tick BIGINT);
+         INSERT INTO \"{schema}\".held_fire VALUES (NULL);
+         CREATE SEQUENCE \"{schema}\".held_fire_seq;
+         CREATE FUNCTION \"{schema}\".held_fire() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.name = '{name}' AND NEW.last_run_at IS DISTINCT FROM OLD.last_run_at
+                 AND \"{schema}\".race_ms(NEW.last_run_at)
+                     = (SELECT held.tick FROM \"{schema}\".held_fire AS held) THEN
+                 IF nextval('\"{schema}\".held_fire_seq') = 1 THEN
+                     PERFORM pg_advisory_xact_lock(hashtextextended('{lock_key}', 0));
+                 END IF;
+             END IF;
+             RETURN NULL;
+         END $$;
+         CREATE TRIGGER held_fire AFTER UPDATE ON \"{schema}\".recurring
+             FOR EACH ROW EXECUTE FUNCTION \"{schema}\".held_fire();"
+    )))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    jalari::recurring::add_or_update(name, cron(CRONS[0], "UTC"), &Pulse { op: 0, millis: 0 })
+        .await
+        .unwrap();
+
+    let schedulers = 3;
+    let held = Duration::from_secs(2);
+    let workers = start_schedulers(schedulers).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut holder = database.pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(&lock_key)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let held_tick = (db_now(&database.pool).await / 1000 + 2) * 1000;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET tick = $1",
+        database.table("held_fire")
+    )))
+    .bind(held_tick)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let caught = wait_for_held_fire(database).await;
+    if !caught {
+        violations.push(format!(
+            "no scheduler was caught inside the fire of tick {held_tick} within 10 s"
+        ));
+    }
+    let before = recurring_scans(database).await;
+    tokio::time::sleep(held).await;
+    let during = recurring_scans(database).await;
+    sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        .bind(&lock_key)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    drop(holder);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for worker in workers {
+        worker.stop().await;
+    }
+    let after = settled_recurring_scans(database).await;
+    jalari::recurring::remove(name).await.unwrap();
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "DROP TRIGGER held_fire ON \"{schema}\".recurring"
+    )))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let fires = audit(database, 0)
+        .await
+        .into_iter()
+        .filter(|row| row.fired() && row.name == name && row.new_last == Some(held_tick))
+        .count();
+    if caught && fires != 1 {
+        violations.push(format!(
+            "the held tick {held_tick} fired {fires} times after the hold was released"
+        ));
+    }
+    let scans = after - before;
+    let backoffs = i64::try_from(held.as_millis() / 100).unwrap() + 2;
+    let bound = i64::try_from(schedulers).unwrap() * backoffs * 2 * 3;
+    eprintln!(
+        "held_fire_does_not_spin: {scans} scans of the recurring table from the hold until the \
+         schedulers stopped ({} visible while held), bound {bound}",
+        during - before
+    );
+    if scans > bound {
+        violations.push(format!(
+            "the schedulers scanned the recurring table {scans} times while one fire was held for \
+             {held:?} and until they stopped; more than {bound} means they did not back off"
+        ));
+    }
+    violations
+}
+
+async fn wait_for_held_fire(database: &Database) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'
+                     AND application_name = $1
+             )",
+        )
+        .bind(&database.schema_name)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        if waiting {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
 }
