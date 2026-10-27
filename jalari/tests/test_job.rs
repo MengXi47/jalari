@@ -1,8 +1,7 @@
 use std::io;
-use std::time::Duration;
 
 use jalari::__private::Provided;
-use jalari::{ErrorKind, Job, JobError, JobResult, Worker, WorkerConfig};
+use jalari::{ErrorKind, Job, JobError, JobResult, Worker};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -139,17 +138,6 @@ async fn test_worker_build_validates_queues_before_init() {
         .err()
         .unwrap();
     assert_eq!(error.kind, ErrorKind::DuplicateQueue);
-
-    let mut config = WorkerConfig::default();
-    config.heartbeat_interval = Duration::ZERO;
-    let error = Worker::builder()
-        .queue("a", 1)
-        .config(config)
-        .build()
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.kind, ErrorKind::InvalidHeartbeatInterval);
 
     let error = Worker::builder().queue("a", 1).build().await.err().unwrap();
     assert_eq!(error.kind, ErrorKind::NotInitialized);

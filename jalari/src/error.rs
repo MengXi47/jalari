@@ -93,9 +93,9 @@ pub enum ErrorKind {
     /// The pool's `max_connections` is lower than the worker needs: the sum of all queue
     /// concurrencies plus two.
     InsufficientConnections,
-    /// The worker's heartbeat interval is zero or not shorter than the cluster's
-    /// [`worker_timeout`](crate::ClusterConfig::worker_timeout).
-    InvalidHeartbeatInterval,
+    /// The pool does not keep a PostgreSQL session across statements, as behind a transaction
+    /// pooler; a worker needs a real session for its lifeline and its notification listener.
+    NoSessionConnection,
     /// A job whose default queue the worker serves needs a [`Job::Context`](crate::Job::Context)
     /// that no registered [`JobMiddleware`](crate::JobMiddleware) provides.
     MissingContext,

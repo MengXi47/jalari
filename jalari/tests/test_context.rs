@@ -273,7 +273,6 @@ fn unique_schema_name() -> String {
 fn worker_config() -> WorkerConfig {
     let mut config = WorkerConfig::default();
     config.poll_interval = Duration::from_millis(100);
-    config.heartbeat_interval = Duration::from_millis(100);
     config
 }
 

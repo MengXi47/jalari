@@ -301,7 +301,6 @@ fn fast_retry() -> ExponentialBackoff {
 fn worker_config(poll_interval: Duration) -> WorkerConfig {
     let mut config = WorkerConfig::default();
     config.poll_interval = poll_interval;
-    config.heartbeat_interval = Duration::from_millis(100);
     config
 }
 

@@ -2,9 +2,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jalari::sqlx::postgres::PgPoolOptions;
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
-use jalari::{
-    CancellationToken, ClusterConfig, ErrorKind, Job, JobResult, Schema, Worker, WorkerConfig,
-};
+use jalari::{CancellationToken, ClusterConfig, ErrorKind, Job, JobResult, Schema, Worker};
 use serde::{Deserialize, Serialize};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -152,7 +150,7 @@ async fn test_config() {
 
     check_defaults().await;
     check_invalid_values_are_rejected().await;
-    check_heartbeat_must_be_shorter_than_worker_timeout().await;
+    check_short_worker_timeout_builds_a_worker().await;
     check_housekeeping(&fixture).await;
 
     sqlx::raw_sql(AssertSqlSafe(format!(
@@ -194,17 +192,11 @@ async fn check_invalid_values_are_rejected() {
     assert_eq!(jalari::cluster::get().await.unwrap(), saved);
 }
 
-async fn check_heartbeat_must_be_shorter_than_worker_timeout() {
+async fn check_short_worker_timeout_builds_a_worker() {
     jalari::cluster::update(|cluster| cluster.worker_timeout = Duration::from_secs(10))
         .await
         .unwrap();
-    let err = Worker::builder()
-        .queue("default", 1)
-        .build()
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(err.kind, ErrorKind::InvalidHeartbeatInterval);
+    Worker::builder().queue("default", 1).build().await.unwrap();
 }
 
 async fn check_housekeeping(fixture: &Fixture) {
@@ -223,15 +215,8 @@ async fn check_housekeeping(fixture: &Fixture) {
     fixture.insert_stale_worker().await;
     let everything = fixture.remaining_jobs().await;
 
-    let mut settings = WorkerConfig::default();
-    settings.heartbeat_interval = Duration::from_secs(1);
     let shutdown = CancellationToken::new();
-    let worker = Worker::builder()
-        .queue("default", 1)
-        .config(settings)
-        .build()
-        .await
-        .unwrap();
+    let worker = Worker::builder().queue("default", 1).build().await.unwrap();
     let running = tokio::spawn(worker.run(shutdown.child_token()));
 
     wait_until("the stale worker to expire", async || {

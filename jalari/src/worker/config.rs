@@ -3,12 +3,13 @@ use std::time::Duration;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_CLAIM_TRIES: u32 = 10;
-const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timings of a single worker, set with [`WorkerBuilder::config`](crate::WorkerBuilder::config).
 ///
-/// Cluster-wide settings such as retention live in [`ClusterConfig`](crate::ClusterConfig).
+/// Cluster-wide settings such as retention live in [`ClusterConfig`](crate::ClusterConfig). How
+/// fast a dead or frozen worker's jobs are taken over is fixed by jalari, not configured here; see
+/// the guide's "Crashes and lost connections".
 ///
 /// # Examples
 ///
@@ -33,10 +34,6 @@ pub struct WorkerConfig {
     /// How many jobs a queue skips in one pass when their `queue_key` is held by another
     /// running job; defaults to 10.
     pub max_claim_tries: u32,
-    /// How often the worker records its heartbeat; defaults to 30 seconds.
-    ///
-    /// Must be shorter than the cluster's [`worker_timeout`](crate::ClusterConfig::worker_timeout).
-    pub heartbeat_interval: Duration,
     /// How long a running job may take to reach a [`checkpoint`](crate::checkpoint) after
     /// [`stop`](crate::stop) or [`cancel`](crate::cancel) before it is aborted; defaults to 30
     /// seconds.
@@ -49,7 +46,6 @@ impl Default for WorkerConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             max_claim_tries: DEFAULT_MAX_CLAIM_TRIES,
-            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
         }
     }

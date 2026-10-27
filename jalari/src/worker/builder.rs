@@ -2,6 +2,7 @@ use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use sqlx::Connection;
 use tokio_util::sync::CancellationToken;
 
 use super::flusher::RunBook;
@@ -67,7 +68,7 @@ impl WorkerBuilder {
         self
     }
 
-    /// Replaces the default timings such as the poll and heartbeat intervals.
+    /// Replaces the default timings such as the poll interval.
     pub fn config(mut self, settings: WorkerConfig) -> Self {
         self.settings = settings;
         self
@@ -108,18 +109,17 @@ impl WorkerBuilder {
     /// - [`init`](crate::init) has not completed ([`NotInitialized`](ErrorKind::NotInitialized))
     /// - The pool's `max_connections` is below the total concurrency plus two
     ///   ([`InsufficientConnections`](ErrorKind::InsufficientConnections))
-    /// - The heartbeat interval is zero or not shorter than the cluster's `worker_timeout`
-    ///   ([`InvalidHeartbeatInterval`](ErrorKind::InvalidHeartbeatInterval))
+    /// - The pool does not keep a session across statements, as behind a transaction pooler
+    ///   ([`NoSessionConnection`](ErrorKind::NoSessionConnection))
     pub async fn build(self) -> Result<Worker> {
         validate_queues(&self.queues)?;
-        validate_heartbeat(&self.settings)?;
         let jobs = collect_jobs()?;
         let crons = parse_crons(&jobs)?;
         let provided = collect_providers(&self.middlewares)?;
         let jobs = select_jobs(jobs, &provided, &self.queues)?;
         let config = config()?;
         check_connections(config, &self.queues)?;
-        check_worker_timeout(config, &self.settings).await?;
+        check_session(config).await?;
         check_middlewares(&self.middlewares).await?;
         let task_names = jobs.keys().map(|name| (*name).to_owned()).collect();
         let served = fingerprint::served(jobs.values().copied());
@@ -142,27 +142,33 @@ impl WorkerBuilder {
     }
 }
 
-fn validate_heartbeat(settings: &WorkerConfig) -> Result<()> {
-    if settings.heartbeat_interval.is_zero() {
+async fn check_session(config: &Config) -> Result<()> {
+    let mut connection = config.pool.pool().acquire().await?.detach();
+    let key = config.schema.lock_key("session_check");
+    let (pid, locked): (i32, bool) = sqlx::query_as(
+        "SELECT pg_backend_pid(),
+             pg_try_advisory_lock(hashtextextended($1 || pg_backend_pid()::text, 0))",
+    )
+    .bind(&key)
+    .fetch_one(&mut connection)
+    .await?;
+    let kept: bool = sqlx::query_scalar(
+        "SELECT pg_backend_pid() = $1 AND EXISTS (
+             SELECT 1 FROM pg_locks
+             WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()
+         )",
+    )
+    .bind(pid)
+    .fetch_one(&mut connection)
+    .await?;
+    connection.close().await?;
+    if !locked || !kept {
         return Err(Error::new(
-            ErrorKind::InvalidHeartbeatInterval,
-            "heartbeat_interval must be greater than zero".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-async fn check_worker_timeout(config: &Config, settings: &WorkerConfig) -> Result<()> {
-    let mut connection = config.pool.pool().acquire().await?;
-    let cluster = crate::cluster::store::load(&mut connection, &config.schema).await?;
-    if settings.heartbeat_interval >= cluster.worker_timeout {
-        return Err(Error::new(
-            ErrorKind::InvalidHeartbeatInterval,
-            format!(
-                "heartbeat_interval {:?} must be shorter than the cluster worker_timeout {:?}; \
-                 lower it or raise worker_timeout with jalari::cluster::update",
-                settings.heartbeat_interval, cluster.worker_timeout
-            ),
+            ErrorKind::NoSessionConnection,
+            "a session advisory lock taken on a pooled connection was gone at the next \
+             statement; point the pool at PostgreSQL or a session-mode pooler, not a \
+             transaction pooler"
+                .to_owned(),
         ));
     }
     Ok(())

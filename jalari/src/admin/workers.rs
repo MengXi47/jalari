@@ -19,10 +19,14 @@ pub struct QueueInfo {
 }
 
 /// Running worker as recorded by its heartbeat.
+///
+/// A worker that loses its lifeline session registers again under a new id, so one process may
+/// appear twice until the old entry passes the cluster's
+/// [`worker_timeout`](crate::ClusterConfig::worker_timeout).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerInfo {
-    /// UUID generated when the worker started.
+    /// UUID generated when the worker registered.
     pub id: String,
     /// Host the worker runs on.
     pub hostname: String,
@@ -39,7 +43,7 @@ pub struct WorkerInfo {
     pub tasks: BTreeMap<String, Option<String>>,
     /// When the worker registered.
     pub started_at: DateTime<Utc>,
-    /// Last heartbeat.
+    /// Last heartbeat, recorded every second while the worker lives.
     pub heartbeat_at: DateTime<Utc>,
 }
 

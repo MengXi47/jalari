@@ -3,16 +3,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::builder::WorkerBuilder;
 use super::flusher::{self, RunBook};
-use super::heartbeat::{self, WorkerRegistration};
+use super::lifeline::{self, WorkerRegistration};
 use super::middleware::ErasedMiddleware;
-use super::{housekeeping, listener, scheduler};
+use super::{housekeeping, listener, reaper, scheduler};
 use crate::init::Config;
 use crate::job::registry::{CronRegistration, JobRegistration};
 use crate::{Cron, RetryPolicy, WorkerConfig};
@@ -135,12 +135,21 @@ impl Worker {
             Arc::clone(&wakers.housekeeping),
             shutdown.clone(),
         ));
-        let heartbeat_shutdown = CancellationToken::new();
-        let heartbeat = tokio::spawn(heartbeat::heartbeat(
+        let registration = WorkerRegistration::new(&self.queues, self.scheduler);
+        let (current, registered) = watch::channel(None);
+        tasks.spawn(reaper::reap(
             Arc::clone(&self.shared),
-            WorkerRegistration::new(&self.queues, self.scheduler),
-            heartbeat_shutdown.clone(),
+            registration.queue_names.clone(),
+            registered,
+            shutdown.clone(),
         ));
+        let retire = CancellationToken::new();
+        let mut lifeline = AbortOnDrop(tokio::spawn(lifeline::lifeline(
+            Arc::clone(&self.shared),
+            registration,
+            current,
+            retire.clone(),
+        )));
         let flusher_shutdown = CancellationToken::new();
         let mut flusher = AbortOnDrop(tokio::spawn(flusher::flush_progress(
             Arc::clone(&self.shared),
@@ -175,9 +184,9 @@ impl Worker {
         if let Err(e) = (&mut flusher.0).await {
             warn!(error = %e, "the progress flusher ended unexpectedly");
         }
-        heartbeat_shutdown.cancel();
-        if let Err(e) = heartbeat.await {
-            warn!(error = %e, "the heartbeat task ended unexpectedly");
+        retire.cancel();
+        if let Err(e) = (&mut lifeline.0).await {
+            warn!(error = %e, "the worker lifeline ended unexpectedly");
         }
     }
 }

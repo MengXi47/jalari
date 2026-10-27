@@ -30,6 +30,10 @@ pub struct ClusterConfig {
     /// How long a worker may miss heartbeats before it leaves
     /// [`jalari::admin::workers`](crate::admin::workers); defaults to 5 minutes, at least
     /// 1 second.
+    ///
+    /// It only governs the worker list: rows of departed workers are deleted once their
+    /// heartbeat is older than this or 12 seconds, whichever is longer. How fast the jobs of a
+    /// dead worker are taken over does not depend on it.
     pub worker_timeout: Duration,
 }
 

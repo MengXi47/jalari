@@ -209,6 +209,40 @@ impl Database {
         terminated.into_iter().filter(|ok| *ok).count()
     }
 
+    pub async fn lifelines(&self) -> Vec<(i32, String)> {
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT activity.pid, worker.id::text
+             FROM pg_stat_activity AS activity
+             JOIN {} AS worker ON activity.application_name = 'jalari lifeline ' || worker.id::text
+             WHERE activity.datname = current_database()
+             ORDER BY worker.started_at, worker.id",
+            self.table("worker")
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    pub async fn terminate_lifelines(&self, at_most: usize) -> usize {
+        let terminated: Vec<bool> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT pg_terminate_backend(pid) FROM (
+                 SELECT activity.pid
+                 FROM pg_stat_activity AS activity
+                 JOIN {} AS worker
+                     ON activity.application_name = 'jalari lifeline ' || worker.id::text
+                 WHERE activity.datname = current_database()
+                 ORDER BY random()
+                 LIMIT $1
+             ) AS victims",
+            self.table("worker")
+        )))
+        .bind(i64::try_from(at_most).unwrap())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        terminated.into_iter().filter(|ok| *ok).count()
+    }
+
     pub async fn finish(self) {
         sqlx::raw_sql(AssertSqlSafe(format!(
             "DROP SCHEMA \"{}\" CASCADE",
@@ -339,7 +373,6 @@ where
 pub fn worker_config(poll_interval: Duration) -> WorkerConfig {
     let mut config = WorkerConfig::default();
     config.poll_interval = poll_interval;
-    config.heartbeat_interval = Duration::from_millis(200);
     config.shutdown_timeout = Duration::from_secs(10);
     config
 }
