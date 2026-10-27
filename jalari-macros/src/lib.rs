@@ -24,7 +24,7 @@ use syn::{
 /// * `cron` - Cron expression with five or six fields; makes the job recurring. `T` must
 ///   implement `Default`, which provides the arguments of every run
 /// * `timezone` - IANA time zone for `cron`; `UTC` when omitted. Only valid with `cron`
-/// * `fingerprint` - `false` turns the code fingerprint off for this job; `true` when omitted
+/// * `fingerprint` - `true` turns the code fingerprint on for this job; `false` when omitted
 ///
 /// A schedule declared with `cron` follows the deployed code: workers sync it at startup, remove
 /// it when the declaration is gone, and it cannot be changed at runtime. Use
@@ -35,7 +35,8 @@ use syn::{
 ///
 /// # Code fingerprint
 ///
-/// The attribute hashes the job's code at compile time into 32 hex digits. The hash covers the
+/// With `fingerprint = true` the attribute hashes the job's code at compile time into 32 hex
+/// digits. The hash covers the
 /// `impl` block, the job's struct, every item that the job's code reaches by name in its crate
 /// and in its `path` dependencies, the `Cargo.lock` version of each registry crate that the
 /// reached code names, and the jalari version. Formatting, comments and unreachable code do not
@@ -43,13 +44,13 @@ use syn::{
 ///
 /// Every enqueue stores the fingerprint with the job, and a worker takes a job only when the
 /// stored fingerprint is empty or equals its own build's. A job enqueued by another build of
-/// its code waits for a worker of that build. With `fingerprint = false` the job is enqueued
+/// its code waits for a worker of that build. Without `fingerprint = true` the job is enqueued
 /// without a fingerprint and its workers take its jobs from any build.
 ///
 /// ```rust,ignore
-/// #[jalari::job(queue = "maintenance", fingerprint = false)]
-/// impl Job for VacuumTables {
-///     const NAME: &'static str = "vacuum_tables";
+/// #[jalari::job(queue = "exports", fingerprint = true)]
+/// impl Job for ExportReport {
+///     const NAME: &'static str = "export_report";
 ///
 ///     async fn run(self) -> JobResult {
 ///         Ok(())
@@ -132,7 +133,7 @@ fn expand(
         ));
     }
 
-    let fingerprint = if arguments.fingerprint.as_ref().is_none_or(LitBool::value) {
+    let fingerprint = if arguments.fingerprint.as_ref().is_some_and(LitBool::value) {
         let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_file));
         quote!(::core::option::Option::Some(#hex))
     } else {

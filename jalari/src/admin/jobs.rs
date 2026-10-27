@@ -172,8 +172,8 @@ pub struct JobInfo {
     pub context: Option<Value>,
     /// Fingerprint of the build that enqueued the job; only a worker of that build runs it.
     ///
-    /// `None` for a job enqueued without one: before migration 7, by a task declared with
-    /// `fingerprint = false`, by a process that does not link the task, or after
+    /// `None` for a job enqueued without one: before migration 7, by a task declared without
+    /// `fingerprint = true`, by a process that does not link the task, or after
     /// [`clear_fingerprint`](super::clear_fingerprint). Any worker that runs the task takes
     /// such a job.
     pub fingerprint: Option<String>,

@@ -9,7 +9,7 @@ pub struct SendEmail {
     pub subject: String,
 }
 
-#[jalari::job(queue = "emails")]
+#[jalari::job(queue = "emails", fingerprint = true)]
 impl Job for SendEmail {
     const NAME: &'static str = "send_email";
 
@@ -29,7 +29,12 @@ pub struct DailyReport {
     pub include_failed: bool,
 }
 
-#[jalari::job(cron = "0 0 3 * * *", timezone = "Asia/Taipei", queue = "reports")]
+#[jalari::job(
+    cron = "0 0 3 * * *",
+    timezone = "Asia/Taipei",
+    queue = "reports",
+    fingerprint = true
+)]
 impl Job for DailyReport {
     const NAME: &'static str = "daily_report";
 
@@ -53,7 +58,7 @@ struct Cursor {
     next_row: u64,
 }
 
-#[jalari::job(queue = "exports")]
+#[jalari::job(queue = "exports", fingerprint = true)]
 impl Job for Export {
     const NAME: &'static str = "export";
 
@@ -86,7 +91,7 @@ impl Job for Export {
 #[derive(Serialize, Deserialize)]
 pub struct VacuumTables;
 
-#[jalari::job(queue = "maintenance", fingerprint = false)]
+#[jalari::job(queue = "maintenance")]
 impl Job for VacuumTables {
     const NAME: &'static str = "vacuum_tables";
 

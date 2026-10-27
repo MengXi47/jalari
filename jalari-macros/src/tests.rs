@@ -51,25 +51,23 @@ fn test_fingerprint_argument_takes_a_boolean() {
 }
 
 #[test]
-fn test_expansion_stamps_a_fingerprint_unless_turned_off() {
-    let stamped_default = stamped(&expanded("", SHORT)).expect("a fingerprint by default");
-    assert_eq!(stamped_default.len(), 32);
-    assert!(stamped_default.chars().all(|c| c.is_ascii_hexdigit()));
-    assert_eq!(
-        stamped(&expanded("fingerprint = true", SHORT)),
-        Some(stamped_default)
-    );
-    let off = expanded("fingerprint = false", SHORT);
-    assert_eq!(stamped(&off), None);
-    assert!(
-        off.contains(":: core :: option :: Option :: None , :: core :: option :: Option :: None)")
-    );
+fn test_expansion_stamps_a_fingerprint_only_when_turned_on() {
+    let on = stamped(&expanded("fingerprint = true", SHORT)).expect("a fingerprint when on");
+    assert_eq!(on.len(), 32);
+    assert!(on.chars().all(|c| c.is_ascii_hexdigit()));
+    for text in ["", "fingerprint = false"] {
+        let off = expanded(text, SHORT);
+        assert_eq!(stamped(&off), None, "{text:?} stamps no fingerprint");
+        assert!(off.contains(
+            ":: core :: option :: Option :: None , :: core :: option :: Option :: None)"
+        ));
+    }
 }
 
 #[test]
 fn test_fingerprint_covers_the_impl_as_written() {
     assert_ne!(
-        stamped(&expanded("", SHORT)),
-        stamped(&expanded("", FILLED))
+        stamped(&expanded("fingerprint = true", SHORT)),
+        stamped(&expanded("fingerprint = true", FILLED))
     );
 }

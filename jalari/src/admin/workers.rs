@@ -34,7 +34,7 @@ pub struct WorkerInfo {
     pub scheduler: bool,
     /// Each task the worker runs, with the fingerprint of its build.
     ///
-    /// The fingerprint is `None` for a task declared with `fingerprint = false`. The map is
+    /// The fingerprint is `None` for a task declared without `fingerprint = true`. The map is
     /// empty for a worker on a jalari release without fingerprints.
     pub tasks: BTreeMap<String, Option<String>>,
     /// When the worker registered.

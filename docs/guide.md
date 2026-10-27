@@ -156,7 +156,7 @@ impl Job for SendEmail {
 | `TIMEOUT` | Longest time one attempt may run | none |
 | `type Context` | Value `run` receives from the worker's middleware; see [Context and middleware](#context-and-middleware) | `()` |
 | `queue = "..."` | Queue the job goes to unless the enqueue says otherwise | `default` |
-| `fingerprint = false` | Enqueue without a [code fingerprint](#code-fingerprints) and run jobs of any build | `true` |
+| `fingerprint = true` | Enqueue with a [code fingerprint](#code-fingerprints) and run only jobs of the same build | `false` |
 
 `run` returns `Ok(())` on success. Any error converts into a retryable `jalari::JobError`
 through `?`. Return `jalari::JobError::permanent(e)` when retrying cannot help, for example
@@ -167,8 +167,26 @@ A job can run more than once if its worker dies mid-run, so keep `run` idempoten
 
 ### Code fingerprints
 
-`#[jalari::job]` hashes the job's code when the crate compiles, giving a fingerprint of 32 hex
-digits. Every enqueue stores the fingerprint of the build that enqueued the job. A worker takes
+Fingerprints are off by default. Turn them on for a job with `fingerprint = true`:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct ExportReport {
+    report_id: i64,
+}
+
+#[jalari::job(queue = "exports", fingerprint = true)]
+impl Job for ExportReport {
+    const NAME: &'static str = "export_report";
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+```
+
+`#[jalari::job]` then hashes the job's code when the crate compiles, giving a fingerprint of 32
+hex digits. Every enqueue stores the fingerprint of the build that enqueued the job. A worker takes
 a job only when the job has no fingerprint or when the job's fingerprint equals the worker's
 own fingerprint for that task. A job enqueued by another build of its code waits for a worker
 of that build, the same way a job under an unknown name waits for a worker that knows the name.
@@ -200,25 +218,10 @@ another build of the task` when it starts and every five minutes after. Restart 
 that enqueues the task too, or release the waiting jobs with
 [`jalari::admin::clear_fingerprint`](#jobs-that-wait-for-another-build).
 
-To let a job run on any build, turn the check off for it:
-
-```rust
-#[derive(Serialize, Deserialize, Default)]
-struct VacuumTables;
-
-#[jalari::job(queue = "maintenance", fingerprint = false)]
-impl Job for VacuumTables {
-    const NAME: &'static str = "vacuum_tables";
-
-    async fn run(self) -> JobResult {
-        Ok(())
-    }
-}
-```
-
-Jobs of such a task are enqueued without a fingerprint, and the workers of that build run
-them whatever fingerprint they carry. Use it for jobs whose arguments and behavior stay
-compatible across deploys. [Deployment](#deployment) describes rolling deploys, and
+A job without `fingerprint = true` is enqueued without a fingerprint, and the workers of any
+build run it whatever fingerprint it carries, including the jobs that jalari 0.6.0 and 0.6.1
+stamped by default. Leave it off for jobs whose arguments and behavior stay compatible across
+deploys. [Deployment](#deployment) describes rolling deploys, and
 [Jobs that wait for another build](#jobs-that-wait-for-another-build) shows how to find and
 release them.
 
@@ -293,9 +296,9 @@ There are two kinds of schedules, and they never affect each other.
 | Arguments | `Default::default()` | Any value you pass |
 | Name | The job's `NAME` | Any name you choose |
 
-Each run carries the [code fingerprint](#code-fingerprints) of the task as registered in the
-process that enqueues it, the scheduler or a `recurring::trigger` call, so a schedule follows
-the deployed code. A `trigger` from a process that does not link the task enqueues the run
+Each run of a task with `fingerprint = true` carries the [code fingerprint](#code-fingerprints)
+of the task as registered in the process that enqueues it, the scheduler or a
+`recurring::trigger` call, so a schedule follows the deployed code. A `trigger` from a process that does not link the task enqueues the run
 without a fingerprint.
 
 ### Declared in code
@@ -793,9 +796,9 @@ The same jobs can run in several shapes; pick per process.
   schedules firing if one stops. Turn it off with `.scheduler(false)` on workers that should
   only process jobs, but keep at least one with it on.
 
-A worker runs only the jobs enqueued by its own build of each task's code, as
-[code fingerprints](#code-fingerprints) describes. A task whose code a deploy did not change
-keeps its fingerprint, so both builds run its jobs. For a task whose code changed, jobs that
+For a task with `fingerprint = true`, a worker runs only the jobs enqueued by its own build of
+the task's code, as [code fingerprints](#code-fingerprints) describes. A task whose code a
+deploy did not change keeps its fingerprint, so both builds run its jobs. For a task whose code changed, jobs that
 the old build enqueued wait for an old worker, and jobs that the new build enqueued wait for a
 new worker. During a rolling deploy, keep at least one old worker running until the old build's
 jobs have drained. Jobs left behind after the last old worker stops wait until you release them
@@ -885,7 +888,7 @@ queue, the task, the fingerprint, the count and since when the oldest job is due
 matches the filter, so any worker that knows the task runs it, and notifies the workers of
 their queues. Use it when the build those jobs wait for will not run again. `JobInfo` carries
 each job's `fingerprint`, and `WorkerInfo::tasks` maps every task a worker runs to its
-fingerprint, `None` for a task declared with `fingerprint = false`.
+fingerprint, `None` for a task declared without `fingerprint = true`.
 
 ### Listing jobs
 
@@ -982,7 +985,7 @@ cargo run -p jalari --example split_control -- stranded
 | [`basic`](../jalari/examples/basic.rs) | Defining, enqueueing and running jobs in one process: errors and retries, `job_key` with `KeepExisting` and `Replace`, `queue_key`, delays, transactions, recurring schedules, `current_job`, `shutdown_requested`, cluster settings and monitoring. It runs until Ctrl-C |
 | [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
 | [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, and a job that passes its context to the jobs it enqueues. It exits when done |
-| [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job, lists the jobs no live worker can run (`stranded`) or releases a task's jobs to any build (`release <task>`) from yet another process. `vacuum_tables` is declared with `fingerprint = false`; edit `common/jobs.rs` and rebuild only `split_worker` to see the other jobs wait for the build that enqueued them |
+| [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job, lists the jobs no live worker can run (`stranded`) or releases a task's jobs to any build (`release <task>`) from yet another process. `vacuum_tables` is the only job without `fingerprint = true`; edit `common/jobs.rs` and rebuild only `split_worker` to see the other jobs wait for the build that enqueued them |
 
 The examples use `jalari::Schema::default()`, so they share the `jalari` schema of the
 database they run against.

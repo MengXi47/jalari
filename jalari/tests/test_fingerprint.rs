@@ -91,7 +91,7 @@ struct Pinned {
     label: String,
 }
 
-#[jalari::job(queue = "fingerprint")]
+#[jalari::job(queue = "fingerprint", fingerprint = true)]
 impl Job for Pinned {
     const NAME: &'static str = "fp_pinned";
 
@@ -106,7 +106,7 @@ struct Unpinned {
     label: String,
 }
 
-#[jalari::job(queue = "fingerprint", fingerprint = false)]
+#[jalari::job(queue = "fingerprint")]
 impl Job for Unpinned {
     const NAME: &'static str = "fp_unpinned";
 
