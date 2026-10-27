@@ -14,10 +14,8 @@ struct Cursor {
     next_row: u64,
 }
 
-#[jalari::job(queue = "exports", checkpoints = true)]
+#[jalari::job(name = "export", queue = "exports", checkpoints = true)]
 impl Job for Export {
-    const NAME: &'static str = "export";
-
     async fn run(self) -> JobResult {
         let (saved, checkpoint) = jalari::resume::<Cursor>()?;
         let mut cursor = saved.unwrap_or_default();
@@ -46,10 +44,8 @@ struct Reindex {
     tables: Vec<String>,
 }
 
-#[jalari::job(queue = "exports")]
+#[jalari::job(name = "reindex", queue = "exports")]
 impl Job for Reindex {
-    const NAME: &'static str = "reindex";
-
     async fn run(self) -> JobResult {
         for table in &self.tables {
             jalari::checkpoint().await?;
@@ -63,10 +59,8 @@ impl Job for Reindex {
 #[derive(Serialize, Deserialize)]
 struct Upload;
 
-#[jalari::job(queue = "exports")]
+#[jalari::job(name = "upload", queue = "exports")]
 impl Job for Upload {
-    const NAME: &'static str = "upload";
-
     async fn run(self) -> JobResult {
         println!("  [upload] waiting on one long transfer");
         tokio::select! {
@@ -79,10 +73,8 @@ impl Job for Upload {
 #[derive(Serialize, Deserialize)]
 struct LegacyImport;
 
-#[jalari::job(queue = "exports")]
+#[jalari::job(name = "legacy_import", queue = "exports")]
 impl Job for LegacyImport {
-    const NAME: &'static str = "legacy_import";
-
     async fn run(self) -> JobResult {
         println!("  [legacy_import] importing without checkpoints");
         tokio::time::sleep(Duration::from_secs(600)).await;

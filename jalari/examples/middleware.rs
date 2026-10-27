@@ -87,9 +87,8 @@ struct BuildReport {
     month: String,
 }
 
-#[jalari::job(queue = "reports")]
+#[jalari::job(name = "build_report", queue = "reports")]
 impl Job for BuildReport {
-    const NAME: &'static str = "build_report";
     type Context = TenantDb;
 
     async fn run(self, db: &TenantDb) -> JobResult {
@@ -117,9 +116,8 @@ struct NotifyUser {
     message: String,
 }
 
-#[jalari::job(queue = "reports")]
+#[jalari::job(name = "notify_user", queue = "reports")]
 impl Job for NotifyUser {
-    const NAME: &'static str = "notify_user";
     type Context = TenantDb;
 
     async fn run(self, db: &TenantDb) -> JobResult {
@@ -134,10 +132,8 @@ impl Job for NotifyUser {
 #[derive(Serialize, Deserialize)]
 struct PurgeCache;
 
-#[jalari::job(queue = "reports")]
+#[jalari::job(name = "purge_cache", queue = "reports")]
 impl Job for PurgeCache {
-    const NAME: &'static str = "purge_cache";
-
     async fn run(self) -> JobResult {
         println!("     purging the cache, no tenant needed");
         Ok(())

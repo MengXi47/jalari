@@ -9,10 +9,8 @@ pub struct SendEmail {
     pub subject: String,
 }
 
-#[jalari::job(queue = "emails", fingerprint = true)]
+#[jalari::job(name = "send_email", queue = "emails", fingerprint = true)]
 impl Job for SendEmail {
-    const NAME: &'static str = "send_email";
-
     async fn run(self) -> JobResult {
         println!(
             "[pid {}] sending {:?} to {}",
@@ -30,14 +28,13 @@ pub struct DailyReport {
 }
 
 #[jalari::job(
+    name = "daily_report",
     cron = "0 0 3 * * *",
     timezone = "Asia/Taipei",
     queue = "reports",
     fingerprint = true
 )]
 impl Job for DailyReport {
-    const NAME: &'static str = "daily_report";
-
     async fn run(self) -> JobResult {
         println!(
             "[pid {}] daily report, include_failed = {}",
@@ -58,10 +55,8 @@ struct Cursor {
     next_row: u64,
 }
 
-#[jalari::job(queue = "exports", fingerprint = true)]
+#[jalari::job(name = "export", queue = "exports", fingerprint = true)]
 impl Job for Export {
-    const NAME: &'static str = "export";
-
     async fn run(self) -> JobResult {
         let (saved, checkpoint) = jalari::resume::<Cursor>()?;
         let mut cursor = saved.unwrap_or_default();
@@ -91,10 +86,8 @@ impl Job for Export {
 #[derive(Serialize, Deserialize)]
 pub struct VacuumTables;
 
-#[jalari::job(queue = "maintenance")]
+#[jalari::job(name = "vacuum_tables", queue = "maintenance")]
 impl Job for VacuumTables {
-    const NAME: &'static str = "vacuum_tables";
-
     async fn run(self) -> JobResult {
         println!(
             "[pid {}] vacuuming tables; this task runs on any build",

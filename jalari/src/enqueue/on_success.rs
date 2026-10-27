@@ -22,9 +22,8 @@ use crate::{EnqueueOptions, Error, ErrorKind, Job, OnConflict, Result, current_j
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct EmailReport { id: i64 }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "email_report")]
 /// # impl jalari::Job for EmailReport {
-/// #     const NAME: &'static str = "email_report";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// # async fn build_report() -> Result<i64, std::io::Error> { Ok(1) }
@@ -59,9 +58,8 @@ pub fn enqueue_on_success<T: Job>(job: &T) -> Result<()> {
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct PollFeed { feed: String }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "poll_feed")]
 /// # impl jalari::Job for PollFeed {
-/// #     const NAME: &'static str = "poll_feed";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// # fn run(feed: String) -> jalari::JobResult {

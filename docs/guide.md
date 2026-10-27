@@ -10,9 +10,12 @@ reference with every option is on docs.rs; this guide shows how the pieces fit t
 - [Recurring jobs](#recurring-jobs)
 - [Running workers](#running-workers)
 - [Stopping, restarting and cancelling](#stopping-restarting-and-cancelling)
+- [Pausing queues](#pausing-queues)
+- [Context and middleware](#context-and-middleware)
 - [Deployment](#deployment)
 - [Cluster settings and cleanup](#cluster-settings-and-cleanup)
 - [Monitoring](#monitoring)
+- [Known limits](#known-limits)
 - [Errors](#errors)
 - [Examples](#examples)
 
@@ -128,6 +131,15 @@ the tables to validate them; run `ALTER TABLE ... VALIDATE CONSTRAINT` later if 
 marked valid. Building the indexes reads the job table and blocks writes to it until the
 upgrade commits.
 
+Version 9 ships with 0.7.0 as well. It adds a `priority` column to the `recurring` table, the
+`parent_id`, `root_id`, `queue_key_limit` and `expires_at` columns to the job table, and the
+`queue_pause` table. The new columns are nullable or have a constant default, so adding them
+is instant. It moves any job priority outside the four [levels](#priority) to the nearest one,
+which scans the job table once, and adds the job table's checks `NOT VALID`. It builds three partial
+indexes, on `parent_id`, `root_id` and `expires_at`; each build reads the job table, and writes
+to the job table wait until the upgrade commits. [Upgrading from 0.6](#upgrading-from-06)
+lists the steps for both versions.
+
 ## Defining jobs
 
 A job is a serializable struct with an `impl Job` inside `#[jalari::job]`. Its fields are the
@@ -135,7 +147,6 @@ job's arguments.
 
 ```rust
 use std::io;
-use std::time::Duration;
 
 use jalari::{Job, JobResult};
 use serde::{Deserialize, Serialize};
@@ -146,12 +157,8 @@ struct SendEmail {
     subject: String,
 }
 
-#[jalari::job(queue = "emails")]
+#[jalari::job(name = "send_email", queue = "emails", max_attempts = 5, timeout = 30)]
 impl Job for SendEmail {
-    const NAME: &'static str = "send_email";
-    const MAX_ATTEMPTS: i32 = 5;
-    const TIMEOUT: Option<Duration> = Some(Duration::from_secs(30));
-
     async fn run(self) -> JobResult {
         if !self.to.contains('@') {
             return Err(jalari::JobError::permanent(io::Error::new(
@@ -165,21 +172,70 @@ impl Job for SendEmail {
 }
 ```
 
-| Item | Meaning | Default |
+| `#[jalari::job(..)]` argument | Meaning | Default |
 |---|---|---|
-| `NAME` | Stable name stored with every job; must be unique in the binary | required |
-| `MAX_ATTEMPTS` | Attempts before the job is marked failed, including the first and any interrupted by a crash | 10 |
-| `TIMEOUT` | Longest time one attempt may run | none |
-| `type Context` | Value `run` receives from the worker's middleware; see [Context and middleware](#context-and-middleware) | `()` |
+| `name = "..."` | Stable name stored with every job; must be unique in the binary, among names and aliases | the type's name, as written |
 | `queue = "..."` | Queue the job goes to unless the enqueue says otherwise | `default` |
+| `max_attempts = 5` | Attempts before the job is marked failed, including the first and any interrupted by a crash | 10 |
+| `timeout = 30` | Longest time one attempt may run, in seconds | none |
+| `priority = "high"` | Which due jobs of the queue run first: `"low"`, `"normal"`, `"high"` or `"urgent"`; see [Priority](#priority) | `"normal"` |
+| `aliases = ["old_name"]` | Earlier names whose waiting jobs and schedules this type still runs; see [Renaming a job](#renaming-a-job) | none |
+| `checkpoints = true` | Declares that the job reaches [checkpoints](#checkpoints) regularly, so an abort at `stop_timeout` or `shutdown_timeout` is logged as an error | `false` |
+| `cron = "..."`, `timezone = "..."` | Makes the job [recurring](#declared-in-code); the time zone is only valid with `cron` | none, `UTC` |
 | `fingerprint = true` | Enqueue with a [code fingerprint](#code-fingerprints) and run only jobs of the same build | `false` |
+
+`name`, `max_attempts`, `timeout`, `priority` and `aliases` set the `Job` constants `NAME`,
+`MAX_ATTEMPTS`, `TIMEOUT`, `PRIORITY` and `ALIASES`. Declaring a constant in the impl instead,
+as 0.6 did, still works; setting one both ways is a compile error, and a timeout below one
+second needs `const TIMEOUT` in the impl. `#[jalari::job]` rejects an empty name, a
+`max_attempts` below 1, a zero timeout or one above `i32::MAX` milliseconds, and an alias that
+is empty, equals the name or repeats, at compile time. A struct that is not a plain path, such
+as a generic one, needs `name`.
+
+Two items stay in the impl. `type Context` is the value `run` receives from the worker's
+middleware, `()` by default; see [Context and middleware](#context-and-middleware).
+`RETRY_POLICY` replaces the worker's retry policy for this job type; see [Retries](#retries).
 
 `run` returns `Ok(())` on success. Any error converts into a retryable `jalari::JobError`
 through `?`. Return `jalari::JobError::permanent(e)` when retrying cannot help, for example
-invalid input.
-A panic or a timeout counts as a failed attempt.
+invalid input. A panic or a timeout counts as a failed attempt. [How an attempt
+ends](#retries) lists every outcome, including snoozing and discarding.
+
+Inside `run`, `jalari::current_job()` returns the attempt: its id, name, queue, attempt number
+and `max_attempts`, when the job was created and when this attempt became due, its priority,
+the previous attempt's error, and the job that enqueued it.
 
 A job can run more than once if its worker dies mid-run, so keep `run` idempotent.
+
+### Renaming a job
+
+The name is stored with every job and schedule. Keep the old name in `aliases` when you rename
+a job, so the jobs and schedules stored under it still run:
+
+```rust
+#[jalari::job(name = "send_welcome", queue = "emails", aliases = ["welcome_email"])]
+impl Job for SendWelcome {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+```
+
+New enqueues use the new name. A job stored under an alias runs through this type, and
+`current_job().name()` reports the new name. A runtime schedule stored under an alias is
+moved to the new name the next time it fires; `recurring::trigger` before that enqueues under
+the alias, which still runs. A schedule declared in code under the old name is deleted and
+created again under the new one, which resets its run count and last run. Code fingerprints
+leave out names and aliases, so a fingerprinted job enqueued under the old name stays runnable
+by the renamed build.
+
+Once `jalari::admin::count(&JobFilter::new().task("welcome_email"))` is 0 and
+`jalari::recurring::list()` shows no schedule with that task, remove the alias.
+
+A job without `name` takes the struct's name, so renaming the struct renames the job. Add the
+struct's old name to `aliases` in the same change. With `fingerprint = true`, renaming the
+struct also changes the hashed code, so the jobs waiting under the old name wait for the old
+build until you release them with `clear_fingerprint`; a rename through `name` does not.
 
 ### Code fingerprints
 
@@ -191,10 +247,8 @@ struct ExportReport {
     report_id: i64,
 }
 
-#[jalari::job(queue = "exports", fingerprint = true)]
+#[jalari::job(name = "export_report", queue = "exports", fingerprint = true)]
 impl Job for ExportReport {
-    const NAME: &'static str = "export_report";
-
     async fn run(self) -> JobResult {
         Ok(())
     }
@@ -218,6 +272,12 @@ The fingerprint covers:
 
 Formatting, comments and code that the job cannot reach leave it unchanged. The same sources
 and the same `Cargo.lock` give the same fingerprint on every machine and in every directory.
+
+The name, the aliases, the priority, `RETRY_POLICY` and the `checkpoints` flag are left out, in
+the attribute and in the impl, so renaming a job with an alias, changing its priority or
+retry policy, or declaring checkpoints leaves waiting jobs runnable by the new build.
+`max_attempts` and `timeout` are covered in either form, and the two forms hash differently:
+moving `const MAX_ATTEMPTS: i32 = 4` into `max_attempts = 4` changes the fingerprint.
 
 The analysis matches names rather than resolving paths, so it errs toward a change. Editing a
 function with the same name as one the job calls, in any module, changes the fingerprint too.
@@ -256,10 +316,15 @@ jalari::enqueue_with(&job, options).await?;
 |---|---|
 | `delay(d)` / `run_at(t)` | Run no earlier than the given time |
 | `queue(name)` | Use another queue than the job's default |
+| `priority(p)` | Override the job type's [priority](#priority) for this job |
 | `job_key(key)` | At most one waiting or running job per key |
 | `on_conflict(..)` | `KeepExisting` (default) or `Replace` the waiting job with the same key |
 | `queue_key(key)` | Jobs sharing the key never run at the same time |
-| `timeout(d)` | Override `Job::TIMEOUT` for this job |
+| `queue_key_limit(n)` | Let up to `n` jobs sharing the `queue_key` run at once; see [Key limits](#key-limits) |
+| `expire_after(d)` / `expires_at(t)` | Discard the job if it is still waiting at that time; see [Expiry](#expiry) |
+| `max_attempts(n)` | Override `max_attempts` for this job; a value below 1 is `InvalidOptions` |
+| `timeout(d)` | Override the job type's timeout for this job |
+| `context(&value)` / `no_context()` | Set or drop the stored [context](#capturing-a-context) |
 
 Every enqueue returns a `jalari::EnqueueOutcome`:
 
@@ -270,12 +335,88 @@ Every enqueue returns a `jalari::EnqueueOutcome`:
 | `Replaced(id)` | The waiting job with the same `job_key` was overwritten |
 | `Running(id)` | The job with the same `job_key` is running and could not be replaced |
 
-`Replace` overwrites a job that is waiting or waiting for a retry. A running job returns
+`Replace` overwrites a job that is waiting, waiting for a retry or snoozed, including its
+priority, `max_attempts`, key limit, expiry and the enqueuing job. A kept job keeps its own.
+A running job returns
 `Running` at once, including a job whose worker died less than about 8 seconds ago (see
 [Crashes and lost connections](#crashes-and-lost-connections)); once another worker records
 the interrupted attempt, the job is waiting again and the next `Replace` overwrites it. A job
 that is stopped, or has a pending stop or cancel, is never replaced and returns `Kept` (see
 [What a stop keeps and releases](#what-a-stop-keeps-and-releases)).
+
+### Priority
+
+```rust
+#[jalari::job(name = "password_reset", queue = "emails", priority = "urgent")]
+impl Job for PasswordReset {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
+let options = jalari::EnqueueOptions::new().priority(jalari::Priority::Low);
+jalari::enqueue_with(&digest, options).await?;
+```
+
+Workers take the due jobs of a queue from the highest priority down, `Urgent`, `High`,
+`Normal` and `Low`, and within a level the earliest `run_at` first. Priority never makes a job
+run before its `run_at`, never interrupts a running job and is kept across retries. A lower
+level runs only while no higher job of the queue is due, so keep `Urgent` for few jobs; a
+steady stream of them holds every other level back. A future job of a high priority does not
+delay due jobs of a lower one. `jalari::admin::set_priority` moves jobs that are already
+waiting; see [Retrying and rescheduling](#retrying-and-rescheduling).
+
+On PostgreSQL 14 to 17 the claim reads the queue's waiting jobs in priority order from an
+index that also holds jobs that are not due yet. Every claim reads past the future jobs of
+the higher levels before it reaches a due job of a lower one, so many far-future
+high-priority jobs, such as 100,000 urgent jobs scheduled for tomorrow, slow every claim of
+their queue on those versions. PostgreSQL 18 skips them with a skip scan. On the older
+versions, keep such jobs in a queue of their own.
+
+The levels are stored as -1, 0, 1 and 2 in the job table's `priority` column, which a check
+keeps in that range.
+
+### Key limits
+
+```rust
+let options = jalari::EnqueueOptions::new()
+    .queue_key(&format!("tenant:{tenant_id}"))
+    .queue_key_limit(4);
+jalari::enqueue_with(&SyncInvoices { tenant_id }, options).await?;
+```
+
+A `queue_key` without a limit lets one job of the key run at a time. With `queue_key_limit(n)`
+a job runs only while one of the first `n` slots of its key is free, `n` being its own limit,
+so jobs of one key with different limits share the same slots: a job with no limit needs slot
+0 and waits while a wider job holds it. A claim takes the highest free slot below the job's
+limit, which leaves slot 0 to jobs without a limit as long as possible. A limit of 0 or one
+without a `queue_key` is `InvalidOptions`. A slot is freed when the job leaves `running`,
+including a takeover after its worker crashed, so a slot never has two runs at once.
+
+Jobs without a limit cost what a `queue_key` always cost: the claim finds the keys whose slot
+0 is taken once per statement. A job with a limit counts the running jobs of its key for
+every waiting candidate the claim passes, so a queue with thousands of waiting limited jobs on
+saturated keys pays that count on every claim. Two claims that race for the last slot of a
+key are settled by the database; the loser tries again, up to `max_claim_tries`.
+
+### Expiry
+
+```rust
+let options = jalari::EnqueueOptions::new()
+    .job_key(&format!("otp:{user_id}"))
+    .expire_after(Duration::from_secs(120));
+jalari::enqueue_with(&SendOneTimeCode { user_id }, options).await?;
+```
+
+A job with an expiry is discarded if it is still waiting at `expires_at`; a running attempt is
+never cut short. That covers every wait: the first run, a retry, a snooze, a job given back at
+shutdown and a restarted job. `expire_after` counts from the enqueue on the database clock,
+`delay` included. No worker starts a job past its expiry, and every worker settles expired
+jobs within about a second: the job becomes `discarded` with `the job expired while waiting to
+run`, its `job_key` is free again and housekeeping removes it after `deleted_retention`.
+Paused queues expire too. `jalari::admin::retry` of a failed job past its expiry answers
+`Expired` and leaves it failed, and `jalari::restart` of a stopped one answers `Expired` and
+leaves it stopped.
 
 ### Inside your transaction
 
@@ -297,6 +438,87 @@ jalari::enqueue_in(
 transaction.commit().await?;
 ```
 
+### Many jobs at once
+
+```rust
+let digests: Vec<_> = users
+    .iter()
+    .map(|user| {
+        let options = jalari::EnqueueOptions::new().job_key(&format!("digest:{}", user.id));
+        (SendDigest { user_id: user.id }, options)
+    })
+    .collect();
+let outcomes = jalari::enqueue_many(&digests).await?;
+```
+
+`jalari::enqueue_many` inserts every job with one statement per 5,000 jobs or 32 MiB of
+payload, all in one transaction, and wakes each queue's workers once. The outcomes come back
+in input order. A `job_key` that appears twice in the batch answers `Kept` with the first
+job's id. `jalari::enqueue_many_in` does the same on your connection, inside your transaction.
+Both reject `OnConflict::Replace` with `InvalidOptions` before anything is sent. Two batches
+whose keys overlap take the keys in the same order, so they wait on each other instead of
+deadlocking.
+
+### After the job succeeds
+
+A job that enqueues follow-up work with `jalari::enqueue` creates it at once, so a retry of
+the job creates it again. `jalari::enqueue_on_success` creates it only when the attempt
+succeeds, in the same statement that records the success:
+
+```rust
+async fn run(self) -> JobResult {
+    let report = build_report(self.month).await?;
+    jalari::enqueue_on_success(&EmailReport { id: report.id })?;
+    Ok(())
+}
+```
+
+```rust
+let options = jalari::EnqueueOptions::new()
+    .job_key(&format!("poll:{}", self.feed))
+    .delay(Duration::from_secs(60));
+jalari::enqueue_on_success_with(&PollFeed { feed: self.feed.clone() }, options)?;
+```
+
+- The job is serialized at the call, with the running job's context, and kept with the
+  attempt. It is inserted only if the attempt ends `succeeded`. A retry, a failure, a snooze, a
+  discard, a stop, a cancel, a shutdown or a crash drops it, and the next attempt enqueues
+  again. A job that returns `Ok` after a stop was requested still succeeds and inserts it.
+- Its delay counts from the success. It may reuse the running job's own `job_key`, since the
+  same statement frees that key, so a job can reschedule itself as in the second example.
+- Only `KeepExisting` is accepted: a job whose key is taken at the success is dropped.
+  `Replace` is `InvalidOptions`. The call returns no id; use `jalari::enqueue` when you need
+  one.
+- Called outside a running job's own task, including tasks the job spawns, it returns
+  `NotInJob` instead of enqueueing.
+- The keyed jobs are inserted in key order, so two jobs that succeed together with crossing
+  keys never deadlock. A key held by a transaction that has not committed, such as your own
+  `enqueue_in`, can hold the success back for at most 2 seconds. After that, or on any other
+  database error from the insert, the attempt is recorded as a failed attempt with `could not
+  enqueue the jobs buffered for success`, the retry policy decides what follows, and the next
+  attempt enqueues again.
+
+### Jobs enqueued by jobs
+
+A job enqueued from inside a running job records that job as its parent, and the first job of
+the chain as its root. `jalari::current_job()` reports both:
+
+```rust
+for page in 0..self.pages {
+    jalari::enqueue(&ExportPage { export_id: self.export_id, page }).await?;
+}
+
+let run = jalari::current_job().expect("inside a job");
+tracing::info!(root = %run.root_id(), parent = ?run.parent_id(), "page export");
+```
+
+`parent_id()` is `None` for a job enqueued from outside a job, and `root_id()` is then the
+job's own id. Jobs from `enqueue_many` and `enqueue_on_success` record the same. Only the
+job's own task records a parent: a task the job spawns has no running job, and an enqueue
+whose future was created outside the job records none either. A `Replace` from inside a job
+gives the replaced job the replacer's parent and root, and a `Replace` from outside clears
+them. [Listing jobs](#listing-jobs) finds a job's children and its whole tree.
+
 ## Recurring jobs
 
 There are two kinds of schedules, and they never affect each other.
@@ -311,8 +533,14 @@ There are two kinds of schedules, and they never affect each other.
 
 Each run of a task with `fingerprint = true` carries the [code fingerprint](#code-fingerprints)
 of the task as registered in the process that enqueues it, the scheduler or a
-`recurring::trigger` call, so a schedule follows the deployed code. A `trigger` from a process that does not link the task enqueues the run
-without a fingerprint.
+`recurring::trigger` call, so a schedule follows the deployed code. A `trigger` from a process
+that does not link the task enqueues the run without a fingerprint.
+
+A schedule stores the job type's [priority](#priority) when it is written, and every run is
+enqueued with it, also by a `trigger` from a process that does not link the task. A schedule
+declared in code takes the current priority whenever a worker with the scheduler starts; a runtime schedule takes it
+at its next `add_or_update`. Schedules created before 0.7.0 run at `Normal` until then.
+`RecurringInfo::priority` shows it.
 
 ### Declared in code
 
@@ -320,10 +548,13 @@ without a fingerprint.
 #[derive(Serialize, Deserialize, Default)]
 struct NightlyReport;
 
-#[jalari::job(cron = "0 0 3 * * *", timezone = "Asia/Taipei", queue = "reports")]
+#[jalari::job(
+    name = "nightly_report",
+    cron = "0 0 3 * * *",
+    timezone = "Asia/Taipei",
+    queue = "reports"
+)]
 impl Job for NightlyReport {
-    const NAME: &'static str = "nightly_report";
-
     async fn run(self) -> JobResult {
         Ok(())
     }
@@ -453,14 +684,66 @@ statements; `build()` checks this. Each worker also opens one session of its own
 |---|---|---|
 | `poll_interval` | Fallback check when no notification arrives | 5 s |
 | `shutdown_timeout` | How long shutdown waits for running jobs before aborting them | 30 s |
-| `max_claim_tries` | Retries of a claim that lost a race for the same `queue_key` | 10 |
+| `max_claim_tries` | Retries of a claim that lost a race for the same `queue_key` slot | 10 |
 | `stop_timeout` | How long a stopped or cancelled job may take to reach a checkpoint before it is aborted | 30 s |
+
+Each free slot of a queue claims one job with a single statement: the due job with the highest
+[priority](#priority), then the earliest `run_at`, then the lowest id. The claim skips the
+jobs of a [paused queue](#pausing-queues), jobs past their [expiry](#expiry), jobs whose
+`queue_key` has no free [slot](#key-limits), and jobs enqueued by another build of a
+fingerprinted task. A claim that loses a race for a key's last slot tries again at once, up
+to `max_claim_tries` times; out of tries, it waits for the next notification or
+`poll_interval`.
 
 ### Retries
 
-The default `jalari::ExponentialBackoff` waits 5 s, 10 s, 20 s... up to 1 hour, with 20%
-jitter. Implement `jalari::RetryPolicy` for a different strategy. A job is marked failed when it reaches
-`MAX_ATTEMPTS` or returns a permanent error.
+| The attempt | The job becomes | Attempt counted | `last_error` | Saved progress |
+|---|---|---|---|---|
+| Returns `Ok(())` | `succeeded` | yes | cleared | dropped |
+| Returns an error with attempts left | `scheduled`, after the retry policy's delay | yes | the error | kept |
+| Returns an error on its last attempt, or a `JobError::permanent` | `failed` | yes | the error | dropped |
+| Returns `JobError::discard(e)` | `discarded` | yes | the error | dropped |
+| Returns `jalari::snooze(delay)` | `scheduled`, after `delay` | no | unchanged, except that an interrupted attempt's note is cleared | kept |
+| Returns the error from a checkpoint or `jalari::interrupted()` during [shutdown](#shutdown) | `enqueued` | no | unchanged | kept |
+| Panics or times out | as for an error | yes | the panic or timeout | as for an error |
+
+A pending [stop or cancel](#stopping-restarting-and-cancelling) wins over every row but the
+first. The default `jalari::ExponentialBackoff` waits 5 s, 10 s, 20 s... up to 1 hour, with 20%
+jitter. Implement `jalari::RetryPolicy` for a different strategy, and set it for the worker
+with `WorkerBuilder::retry_policy` or for one job type with `RETRY_POLICY` in the impl:
+
+```rust
+#[jalari::job(name = "deliver_webhook", queue = "webhooks", max_attempts = 20)]
+impl Job for DeliverWebhook {
+    const RETRY_POLICY: Option<&'static dyn jalari::RetryPolicy> =
+        Some(&jalari::ExponentialBackoff {
+            base: Duration::from_secs(30),
+            max: Duration::from_secs(6 * 60 * 60),
+            jitter: 0.3,
+        });
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+```
+
+The policy comes from the build that runs the attempt, so jobs already waiting follow a new
+policy after a deploy. `EnqueueOptions::max_attempts` overrides the job type's `max_attempts`
+for one job, and `jalari::admin::retry` gives that job as many attempts again.
+
+`JobError::retry_after(delay)` keeps the failure but replaces the policy's delay, for a rate
+limit that says when to come back. The attempt still counts, and on the last attempt or for a
+permanent error it changes nothing. `jalari::snooze(delay)` is not a failure: the job runs
+again after `delay` with the same attempt number, its progress and `job_key`, and its
+`queue_key` is free while it waits. Middleware can return a snooze too, for example from a
+rate limiter. There is no limit on how often a job snoozes, so a job that always snoozes runs
+forever. Every delay is capped at 100 years.
+
+`JobError::discard(e)` ends the job for good without making it a failure: a discarded job is
+not `failed`, so `retry` and `retry_failed` leave it alone, `throughput` counts it apart, and
+housekeeping removes it after `deleted_retention`. Use it when the work no longer makes
+sense, such as a user that was deleted.
 
 An attempt is counted when it starts, so an attempt cut short by a crash counts too, unless it
 ends in a [stop or cancel](#stopping-restarting-and-cancelling). When another worker takes
@@ -474,26 +757,32 @@ Cancelling the token stops the worker from claiming new jobs and waits for runni
 Jobs still running after `shutdown_timeout` are aborted and count as an attempt; the worker
 saves their progress and hands them back, and another worker runs them again 7 seconds later,
 so whatever the aborted run spawned has time to stop. A job that reaches a
-[checkpoint](#checkpoints) during the shutdown
-gets an error from it; when it returns that error, the job goes back to its queue without
-counting the attempt and keeps its saved progress.
+[checkpoint](#checkpoints) during the shutdown gets an error from it; when it returns that
+error, the job goes back to its queue without counting the attempt and keeps its saved
+progress.
 
-A long job can notice the shutdown and stop early, for example after saving its progress:
+A job blocked in a long `.await` can notice the shutdown, a stop or a cancel at once:
 
 ```rust
 for id in ids {
     tokio::select! {
-        () = jalari::shutdown_requested() => {
-            return Err(jalari::JobError::new("stopped for shutdown".to_owned()));
-        }
+        error = jalari::interrupted() => return Err(error),
         result = export(id) => result?,
     }
 }
 ```
 
-`jalari::current_job()` returns the running attempt's id, name, queue and attempt number. The
-id stays the same across retries, so it works as an idempotency key. Both functions only work
-in the job's own task, not in tasks it spawns.
+`jalari::interrupted()` completes with the error to return: the same one a checkpoint would
+return. Return it unchanged. During a shutdown any other error counts as a failed attempt; a
+stop or a cancel settles the job whatever it returns. When both branches
+are ready at once, either may win, so the unit of work must be safe to run again.
+`jalari::shutdown_requested()` covers shutdown only and gives no error; return
+`jalari::checkpoint().await?` from its branch.
+
+`jalari::current_job()` returns the running attempt. Its id stays the same across retries, so
+it works as an idempotency key. `current_job()` and `interrupted()` only work in the job's own
+task. A task the job spawns gets the same signal from `run.interrupted()`, where `run` is the
+`current_job()` value taken before the spawn.
 
 ### Crashes and lost connections
 
@@ -530,7 +819,7 @@ A worker also hands back jobs it owns but no longer runs, within a second, and t
 seconds later. When the database committed a claim but the reply never reached the
 worker, the job never started, so the attempt does not count. When a finished attempt's outcome
 cannot be recorded after five tries a second apart, the attempt counts and is recorded as
-interrupted, so a job whose outcome can never be saved still stops at `MAX_ATTEMPTS`.
+interrupted, so a job whose outcome can never be saved still stops at its `max_attempts`.
 
 If no worker runs at all, a dead worker's jobs stay `running` until a worker starts, and
 `jalari::admin::stranded()` lists them. Do not end lifeline sessions from scripts that clean up
@@ -583,6 +872,15 @@ latest copies every 5 seconds. It returns an error once the job should stop, and
 the job. Jobs without progress call `jalari::checkpoint().await?` instead. Both do nothing
 outside a job. A job that finishes discards its progress, and so does a `Replace`.
 
+A job that waits in one long `.await` between checkpoints races it against
+`jalari::interrupted()`, as in [Shutdown](#shutdown); it then stops within about a second of
+`stop` instead of waiting for `stop_timeout`.
+
+Declare `checkpoints = true` on a job that reaches checkpoints regularly. When such a job is
+aborted at `stop_timeout` or `shutdown_timeout`, the worker logs an error that says how long it
+went without a checkpoint, or that it kept running after a checkpoint asked it to stop. The
+flag changes nothing else.
+
 ### What each call does
 
 | Call | Waiting job | Running job | Stopped job | Finished job |
@@ -598,7 +896,7 @@ A running job sees a request within about a second. How it ends:
 
 | The job | It ends as |
 |---|---|
-| Returns the checkpoint's error | `stopped` (or `deleted` for a cancel) with the progress that checkpoint saved |
+| Returns the checkpoint's error, or the error from `interrupted()` | `stopped` (or `deleted` for a cancel) with the progress it saved last |
 | Reaches no checkpoint within `stop_timeout` | aborted at its current `.await`, then `stopped` with the last saved progress |
 | Returns any other error, panics or times out | `stopped` (or `deleted`), not retried |
 | Returns `Ok` first | `succeeded`; a later `stop` returns `Finished` |
@@ -606,6 +904,10 @@ A running job sees a request within about a second. How it ends:
 
 `stop` and `cancel` are safe to repeat and report the current state, so call them again until
 they stop returning `Requested`. A cancel wins over a stop that is still pending.
+
+A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snooze time, and
+`jalari::admin::run_now` after the restart makes it due at once. A stopped job past its
+[expiry](#expiry) cannot be restarted: `restart` answers `Expired`.
 
 ### What a stop keeps and releases
 
@@ -623,11 +925,43 @@ they stop returning `Requested`. A cancel wins over a stop that is still pending
 
 - The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
   work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
-  outlive the stop, as with `TIMEOUT` and shutdown aborts.
+  outlive the stop, as with `timeout` and shutdown aborts. `interrupted()` cannot reach them
+  either: it completes only where the job awaits it.
 - A crash loses at most about 6 seconds of progress: one second before a copy is kept, and
   five before it is written.
 - A job a worker aborted at shutdown keeps waiting the 7 seconds after the abort when it is
   stopped and restarted or retried in between.
+
+## Pausing queues
+
+```rust
+jalari::admin::pause_queue("exports").await?;
+run_database_maintenance().await?;
+jalari::admin::resume_queue("exports").await?;
+
+for paused in jalari::admin::paused_queues().await? {
+    println!("{} paused since {}", paused.queue, paused.paused_at);
+}
+```
+
+A paused queue starts no new jobs on any worker. Once `pause_queue` returns, no claim that
+starts afterwards takes a job of that queue; a claim already running at that instant can still
+start one. Running jobs finish. Enqueueing, retries, `stop`, `cancel`, `Replace` and expiry
+work as usual, and the jobs they make due wait. Recurring schedules keep enqueueing, and their
+`job_key` keeps one run waiting. `run_now` answers `Enqueued` and the job waits.
+
+The pause is a row in the `queue_pause` table, so it holds across worker restarts and covers
+workers that start later. `pause_queue` and `resume_queue` return whether they changed
+anything, and accept any queue name, including one no worker serves yet. Workers learn of a
+resume through a notification, or within `poll_interval` if it is lost. `stranded()` marks the
+jobs of a paused queue with `paused`, and the five-minute warning skips them.
+
+The CLI has the same commands, and `jalari status` lists the paused queues:
+
+```bash
+jalari pause exports
+jalari resume exports
+```
 
 ## Context and middleware
 
@@ -700,9 +1034,8 @@ impl JobMiddleware for TenantMiddleware {
     }
 }
 
-#[jalari::job(queue = "reports")]
+#[jalari::job(name = "build_report", queue = "reports")]
 impl Job for BuildReport {
-    const NAME: &'static str = "build_report";
     type Context = RequestContext;
 
     async fn run(self, context: &RequestContext) -> JobResult {
@@ -731,6 +1064,64 @@ let worker = jalari::Worker::builder()
   same type, and with `MiddlewareCheckFailed` when a `check` fails. Jobs on other queues whose
   context is missing are simply not taken, so workers with different middleware can share the
   database.
+- A middleware may return `jalari::snooze(..)` instead of calling `next.run()`, for example
+  from a rate limiter, and may call `jalari::enqueue_on_success`, also after `next.run()`
+  returned.
+- The error from a checkpoint or `jalari::interrupted()` must pass through unchanged, or a
+  shutdown counts the attempt as failed. `JobError::is_interruption()` tells such errors
+  apart.
+
+`JobMeta` describes the attempt: `id`, `name`, `queue`, `attempt`, `max_attempts` and
+`is_last_attempt`; `created_at`, when the job was first enqueued; `scheduled_at`, when this
+attempt became due, so `now - scheduled_at` is the time it waited in the queue; `priority`;
+`last_error`, the previous attempt's error; `parent_id` and `root_id`; and the stored context.
+
+### After the attempt
+
+`finished` runs after the outcome of an attempt is saved, with the outcome as the worker
+recorded it:
+
+```rust
+impl JobMiddleware for Alerts {
+    type Provides = ();
+
+    async fn call(&self, _job: &JobMeta, next: Next<'_>) -> JobResult {
+        next.run().await
+    }
+
+    async fn finished(&self, job: &JobMeta, outcome: &jalari::Finished) {
+        match outcome {
+            jalari::Finished::Failed { error } => self.pager.alert(job.id(), error).await,
+            jalari::Finished::Retrying { .. } if job.attempt() + 1 == job.max_attempts() => {
+                self.pager.warn_next_is_last(job.id()).await;
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+| `jalari::Finished` | The attempt |
+|---|---|
+| `Succeeded` | succeeded |
+| `Retrying { delay, error }` | failed and runs again after `delay` |
+| `Failed { error }` | failed and the job will not run again |
+| `Discarded { error }` | discarded the job |
+| `Snoozed { delay }` | snoozed |
+| `Released` | was given back at shutdown without counting |
+| `Stopped`, `Cancelled` | ended by a stop or a cancel |
+
+- It runs once per attempt, after the result is committed, so it reads the job's final state
+  and its history row. With [`enqueue_on_success`](#after-the-job-succeeds) it runs after the
+  follow-up jobs are inserted. When the insert was refused, it sees the failed attempt.
+- Only middleware that wrapped the attempt are called, innermost first. An attempt that never
+  ran through the middleware is not reported, and neither is anything that happens outside a
+  run: a crashed worker's job taken over by another worker, an attempt whose result could not
+  be saved, a stop or cancel of a waiting job, expiry, and admin calls.
+- It only observes. Each hook runs in its own task with the job's context, so
+  `jalari::enqueue` in it inherits the context; `current_job()` is `None` there. A panic is
+  logged and the next hook still runs. The worker waits for the hooks before it claims its
+  next job, so keep them short.
 
 ### Choosing a database per job
 
@@ -851,6 +1242,28 @@ with `jalari::admin::clear_fingerprint`. Every worker logs a warning every five 
 due jobs in its queues have no live worker that can run them, and
 `jalari::admin::stranded()` lists those jobs.
 
+### Upgrading from 0.6
+
+0.7.0 brings migrations 8 and 9 and changes how fingerprints are computed.
+
+1. Stop every 0.6 process, enqueuers included. Migration 8 refuses to run, with `LockTimeout`
+   and a message naming 0.6, while a 0.6 worker still runs a job.
+2. Run the migration: `.migrate()`, `jalari migrate`, or the SQL from `jalari sql`. Migration
+   9 scans the job table once and builds three indexes, and writes to the job table wait for
+   it; [Creating the tables](#creating-the-tables) has the details.
+3. Start the 0.7.0 workers. Their pool needs at least two connections, which `build()` checks,
+   and each worker opens one more session, its [lifeline](#crashes-and-lost-connections).
+
+Every fingerprint changes in 0.7.0: the name, the aliases, the priority and the retry policy
+are no longer hashed, and every release changes all fingerprints through the jalari version
+anyway. Jobs that a 0.6 build enqueued with `fingerprint = true` wait for a 0.6 worker, which
+can no longer run. Let those queues drain before you stop the last 0.6 worker, or find the
+jobs with `jalari::admin::stranded()` afterwards and release them with
+`jalari::admin::clear_fingerprint()`. A failed job that `jalari::admin::retry` or
+`retry_failed` retries gets the fingerprint of the caller's build when the caller links the
+task. Moving a job's `max_attempts` or `timeout` from the impl into the attribute changes its
+fingerprint once more, so make that move in the same deploy.
+
 ## Cluster settings and cleanup
 
 Settings shared by every worker live in the `config` table and change at runtime:
@@ -873,7 +1286,7 @@ jalari::cluster::update(|cluster| {
 | `housekeeping_enabled` | Delete finished jobs after their retention | off |
 | `housekeeping_interval` | How often the cleanup runs across the cluster | 10 min |
 | `succeeded_retention` | How long succeeded jobs are kept | 1 day |
-| `deleted_retention` | How long deleted and discarded jobs are kept | 7 days |
+| `deleted_retention` | How long deleted and discarded jobs are kept, expired jobs included | 7 days |
 | `failed_retention` | How long failed jobs are kept; `None` keeps them | `None` |
 | `worker_timeout` | Missed-heartbeat time before a worker leaves the list; departed workers are deleted after it or 12 s, whichever is longer. Takeover does not depend on it | 5 min |
 
@@ -898,14 +1311,17 @@ for count in jalari::admin::stats().await? {
 }
 
 for queue in jalari::admin::throughput(Duration::from_secs(3600)).await? {
-    println!("{}: {} succeeded, {} failed, {} retried, max {:?}",
-        queue.queue, queue.succeeded, queue.failed, queue.retried, queue.max_duration);
+    println!("{}: {} succeeded, {} failed, {} retried, {} snoozed, {} discarded, max {:?}",
+        queue.queue, queue.succeeded, queue.failed, queue.retried, queue.snoozed,
+        queue.discarded, queue.max_duration);
 }
 ```
 
 If no listed worker has `scheduler` set, recurring schedules are not firing. `stats` counts
 the jobs in every queue by state, `running` included; `throughput` sums up the job history of
-the last window, so it only sees as far back as the retention housekeeping keeps. A running
+the last window, so it only sees as far back as the retention housekeeping keeps. `retried`
+counts attempts that returned an error and run again and `snoozed` counts snoozes; `discarded` counts jobs
+that discarded themselves or expired, and they are not in `failed`. A running
 job's `JobInfo` names the worker in `worker_id`, when its attempt started in `running_since`,
 and a stop or cancel it has not acted on yet in `pending`.
 
@@ -931,13 +1347,16 @@ happens when no live worker is left to take them over. Each worker logs
 a warning for the groups in its own queues when it starts and every five minutes after: `no
 live worker runs these jobs, enqueued by another build of the task` when the worker knows the
 task, and `no live worker knows this task` when no running binary links it. Both carry the
-queue, the task, the fingerprint, the count and since when the oldest job is due.
+queue, the task, the fingerprint, the count and since when the oldest job is due. A group in
+a [paused queue](#pausing-queues) has `paused` set and is not warned about, and jobs past
+their [expiry](#expiry) are not listed. Jobs stored under an [alias](#renaming-a-job) of a
+linked job count as known.
 
 `clear_fingerprint` removes the fingerprint from every scheduled, enqueued or stopped job that
 matches the filter, so any worker that knows the task runs it, and notifies the workers of
 their queues. Use it when the build those jobs wait for will not run again. `JobInfo` carries
 each job's `fingerprint`, and `WorkerInfo::tasks` maps every task a worker runs to its
-fingerprint, `None` for a task declared without `fingerprint = true`.
+fingerprint, `None` for a task declared without `fingerprint = true`, aliases included.
 
 ### Listing jobs
 
@@ -947,6 +1366,10 @@ let filter = jalari::admin::JobFilter::new()
     .context(serde_json::json!({ "tenant_id": "acme" }));
 let total = jalari::admin::count(&filter).await?;
 let page = jalari::admin::jobs(&filter, 50, None).await?;
+let urgent = jalari::admin::count(&jalari::admin::JobFilter::new()
+    .priority(jalari::Priority::Urgent)
+    .state(jalari::JobState::Enqueued)).await?;
+let tree = jalari::admin::jobs(&jalari::admin::JobFilter::new().root(export_id), 100, None).await?;
 let next_page = jalari::admin::jobs(&filter, 50, page.last().map(|job| job.id)).await?;
 
 if let Some(detail) = jalari::admin::job(page[0].id).await? {
@@ -960,9 +1383,11 @@ if let Some(detail) = jalari::admin::job(page[0].id).await? {
 }
 ```
 
-`JobFilter` combines any of: states, queue, task, exact `job_key` or a prefix, a creation
-time range, and a context the stored context must contain (PostgreSQL's `@>`, so
-`{"tenant_id": "acme"}` matches whatever else the context holds). Pages are cut by id, newest
+`JobFilter` combines any of: states, priorities, queue, task, exact `job_key` or a prefix, a
+creation time range, a context the stored context must contain (PostgreSQL's `@>`, so
+`{"tenant_id": "acme"}` matches whatever else the context holds), the parent, and the root.
+`parent(id)` matches the jobs that job enqueued; `root(id)` matches that job and every job
+below it. Repeated `state` or `priority` calls match any of them. Pages are cut by id, newest
 first: pass the last id of a page as `before` for the next one, and they stay consistent while
 jobs come and go. `job` returns the job, every state change from its history and its control
 row with any pending stop or cancel and the progress saved at its last checkpoint. Payloads
@@ -983,6 +1408,9 @@ match jalari::admin::retry(id).await? {
 }
 let summary = jalari::admin::retry_failed(&filter).await?;
 jalari::admin::run_now(id).await?;
+
+let backlog = jalari::admin::JobFilter::new().queue("reports").priority(jalari::Priority::Normal);
+let moved = jalari::admin::set_priority(&backlog, jalari::Priority::High).await?;
 ```
 
 `retry` makes a failed job due now with its attempts reset, so it gets its full
@@ -991,11 +1419,32 @@ the history, and the queue's workers are notified. A failed job whose `job_key` 
 waiting, running or stopped job stays failed and the outcome names that job. `retry_failed`
 does the same for every failed job matching the filter, in batches of 100 that each commit on
 their own. Both give each job the [code fingerprint](#code-fingerprints) of the caller's build
-when the caller links the job's task, and keep the stored one otherwise. `run_now` makes a
-scheduled job, or a retry waiting for its backoff, due now; a
-running job, or one a worker aborted at shutdown less than 7 seconds ago, is reported as
-`Running` and left alone. To delete a job, [`cancel`](#stopping-restarting-and-cancelling)
-it: a waiting or stopped job is marked deleted at once, a running one once it stops.
+when the caller links the job's task, and keep the stored one otherwise. A discarded job is
+not failed, so both leave it alone. A failed job past its [expiry](#expiry) answers `Expired`
+and stays failed, and `RetrySummary::expired` counts those. `run_now` makes a scheduled job, a
+retry waiting for its backoff or a snoozed job due now; a running job, or one a worker
+aborted at shutdown less than 7 seconds ago, is reported as `Running` and left alone. To
+delete a job, [`cancel`](#stopping-restarting-and-cancelling) it: a waiting or stopped job is
+marked deleted at once, a running one once it stops.
+
+`set_priority` moves the scheduled, enqueued and stopped jobs that match the filter to another
+[priority](#priority), in batches of 100 that each commit on their own, and returns how many
+changed. Running and finished jobs keep theirs. It leaves `updated_at` alone and wakes no
+worker, since no job became due.
+
+## Known limits
+
+- One job's progress that PostgreSQL cannot store, such as a string with a `\u0000`, fails the
+  worker's batched progress write for every job it runs, until that job's run ends. Its own
+  outcome cannot be saved either, so its attempt is recorded as interrupted and counts.
+- Every enqueue's notification wakes the idle slots of every worker serving the queue, and all
+  but one find nothing. At about 4,000 enqueues a second over four workers this measured about
+  7 empty claims per job, which costs client CPU and pool time, not job latency.
+- While one scheduler holds a due schedule in its firing transaction, the other schedulers
+  check again every 100 ms, capped by `poll_interval`, instead of waiting for the next due
+  time. A fire commits in milliseconds, so this lasts as long as a fire does.
+- On PostgreSQL 14 to 17, many far-future jobs of a high [priority](#priority) slow every
+  claim of their queue.
 
 ## Errors
 
@@ -1014,6 +1463,13 @@ match jalari::recurring::pause("nightly_report").await {
 Database errors are classified by SQLSTATE. `ConnectionFailed`, `PoolTimedOut`,
 `SerializationFailure`, `Deadlock` and `LockTimeout` are usually worth retrying.
 
+`InvalidOptions` means an `EnqueueOptions` value cannot be used where it was passed: a value
+out of range, such as `max_attempts(0)` or a `queue_key_limit` without a `queue_key`, or
+`OnConflict::Replace` in `enqueue_many` or `enqueue_on_success_with`. Its message names the
+option. `NotInJob` means a function that only works in a running job's own task, such as
+`enqueue_on_success`, was called elsewhere. `DuplicateJobName` from `build()` names every
+name or alias that two linked jobs share.
+
 ## Examples
 
 ```bash
@@ -1031,8 +1487,8 @@ cargo run -p jalari --example split_control -- stranded
 | Example | Shows |
 |---|---|
 | [`migrate`](../jalari/examples/migrate.rs) | Creating and checking the tables; `--dry-run` prints the SQL instead |
-| [`basic`](../jalari/examples/basic.rs) | Defining, enqueueing and running jobs in one process: errors and retries, `job_key` with `KeepExisting` and `Replace`, `queue_key`, delays, transactions, recurring schedules, `current_job`, `shutdown_requested`, cluster settings and monitoring. It runs until Ctrl-C |
-| [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
+| [`basic`](../jalari/examples/basic.rs) | Defining, enqueueing and running jobs in one process: errors and retries, `job_key` with `KeepExisting` and `Replace`, `queue_key`, delays, transactions, recurring schedules, `current_job`, `interrupted`, a job that reschedules itself with `enqueue_on_success_with` under its own `job_key`, cluster settings and monitoring. It runs until Ctrl-C |
+| [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress and `checkpoints = true`, a job blocked in one long sleep that `interrupted()` stops within a second, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
 | [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, and a job that passes its context to the jobs it enqueues. It exits when done |
 | [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job, lists the jobs no live worker can run (`stranded`) or releases a task's jobs to any build (`release <task>`) from yet another process. `vacuum_tables` is the only job without `fingerprint = true`; edit `common/jobs.rs` and rebuild only `split_worker` to see the other jobs wait for the build that enqueued them |
 

@@ -36,7 +36,7 @@ pub struct WorkerInfo {
     pub queues: Vec<QueueInfo>,
     /// Whether the worker runs the recurring scheduler.
     pub scheduler: bool,
-    /// Each task the worker runs, with the fingerprint of its build.
+    /// Each task the worker runs, including aliases, with the fingerprint of its build.
     ///
     /// The fingerprint is `None` for a task declared without `fingerprint = true`. The map is
     /// empty for a worker on a jalari release without fingerprints.

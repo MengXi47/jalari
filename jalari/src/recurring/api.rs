@@ -58,9 +58,8 @@ struct InfoRow {
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct Digest { team: String }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "digest")]
 /// # impl Job for Digest {
-/// #     const NAME: &'static str = "digest";
 /// #     async fn run(self) -> JobResult { Ok(()) }
 /// # }
 /// # async fn example() -> jalari::Result<()> {

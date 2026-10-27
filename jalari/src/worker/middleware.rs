@@ -74,9 +74,8 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// #[derive(Serialize, Deserialize)]
 /// struct SendDigest;
 ///
-/// #[jalari::job(queue = "mail")]
+/// #[jalari::job(name = "send_digest", queue = "mail")]
 /// impl Job for SendDigest {
-///     const NAME: &'static str = "send_digest";
 ///     type Context = CurrentUser;
 ///
 ///     async fn run(self, user: &CurrentUser) -> JobResult {

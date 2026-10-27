@@ -186,7 +186,8 @@ pub async fn shutdown_requested() {
 /// It resolves when the job is asked to [`stop`](crate::stop) or [`cancel`](crate::cancel), when
 /// its worker starts shutting down, or when the worker has lost the job. The error is the one
 /// [`checkpoint`](crate::checkpoint) would return, so returning it releases or stops the job
-/// without counting the attempt; returning any other error counts it. Race it against long
+/// without counting the attempt. During a shutdown any other error counts the attempt; a stop
+/// or a cancel settles the job whatever it returns. Race it against long
 /// `.await`s with `tokio::select!`. Outside a job, and in tasks the job spawns, it never
 /// completes; use [`JobRun::interrupted`] there.
 ///

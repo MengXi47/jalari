@@ -60,9 +60,8 @@ impl Captured {
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct SendEmail { to: String }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "send_email")]
 /// # impl jalari::Job for SendEmail {
-/// #     const NAME: &'static str = "send_email";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// #[derive(Serialize, Deserialize)]

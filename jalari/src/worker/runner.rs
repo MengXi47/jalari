@@ -107,8 +107,9 @@ impl Worker {
     /// retried; they never end the loop.
     ///
     /// After cancellation it stops claiming jobs, signals running ones through
-    /// [`shutdown_requested`](crate::shutdown_requested) and waits for them to finish. A job that
-    /// returns the error of a [`checkpoint`](crate::checkpoint) or [`Checkpoint`](crate::Checkpoint)
+    /// [`interrupted`](crate::interrupted) and [`shutdown_requested`](crate::shutdown_requested)
+    /// and waits for them to finish. A job that returns the error of a
+    /// [`checkpoint`](crate::checkpoint), a [`Checkpoint`](crate::Checkpoint) or `interrupted`
     /// then is put back in its queue without counting the attempt, keeping its saved progress.
     /// Jobs still running after [`WorkerConfig::shutdown_timeout`] are aborted, which counts as
     /// an attempt, and another worker runs them again after a few seconds.

@@ -123,8 +123,8 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
 /// Retries every failed job matching `filter`, in batches of 100 that commit separately.
 ///
 /// Each job is handled as by [`retry`], including its fingerprint and its `expires_at`; the
-/// filter's states are ignored, only failed jobs are considered. A batch that fails leaves the earlier batches
-/// retried and returns the error.
+/// filter's states are ignored, only failed jobs are considered. A batch that fails leaves the
+/// earlier batches retried and returns the error.
 ///
 /// # Errors
 ///
@@ -199,8 +199,8 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
 
 /// Makes a waiting job due now instead of at its `run_at`.
 ///
-/// Works for a scheduled job, a retry waiting for its backoff, and a snoozed job. The change is recorded
-/// in the job's history and workers of its queue are notified. A pending
+/// Works for a scheduled job, a retry waiting for its backoff, and a snoozed job. The change is
+/// recorded in the job's history and workers of its queue are notified. A pending
 /// [`stop`](crate::stop) or [`cancel`](crate::cancel) still applies when a worker picks the
 /// job up.
 ///

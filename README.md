@@ -21,25 +21,38 @@ jalari = "0.6"
 
 ## Features
 
-- **Jobs** — immediate or delayed, enqueued alone or inside your own transaction.
+- **Jobs** — immediate or delayed, enqueued alone, thousands at once with `enqueue_many`, or
+  inside your own transaction; name, queue, attempts, timeout and priority declared in
+  `#[jalari::job(..)]`.
+- **Follow-up jobs** — `enqueue_on_success` enqueues the next job only when the current
+  attempt succeeds, in the same statement, and jobs record the job that enqueued them.
+- **Priority and expiry** — four priority levels per job type or per job, and jobs that are
+  discarded if they are still waiting past their deadline.
 - **Cron and intervals** — cron schedules declared in code, plus cron or every-N-units
   schedules added, changed and removed at runtime, with time zones, daylight saving and end
   conditions (`until`, `max_runs`) handled.
 - **Deduplication and exclusion** — `job_key` keeps one job per key; `queue_key` keeps jobs
-  with the same key from running at once.
-- **Retries** — exponential backoff with jitter, permanent errors, timeouts, and panics
-  isolated to the job that caused them.
-- **Named queues** — each worker chooses its queues and how many jobs run at once.
+  with the same key from running at once, or lets up to a set number run.
+- **Retries** — exponential backoff with jitter, per job type or per worker, `retry_after` for
+  rate limits, permanent errors, timeouts, and panics isolated to the job that caused them.
+- **Snooze and discard** — a job can ask to run again later without using an attempt, or end
+  itself without counting as a failure.
+- **Named queues** — each worker chooses its queues and how many jobs run at once; pause and
+  resume a queue across every worker.
 - **Context and middleware** — capture a tenant or user when enqueuing and rebuild it on the
-  worker with your own middleware; jobs declare what they need and workers check it at startup.
+  worker with your own middleware; jobs declare what they need and workers check it at startup,
+  and middleware hears how each attempt ended.
 - **Stop, restart and cancel** — stop a job to free everything it holds, restart it later from
-  the progress it saved at its last checkpoint, or cancel it for good.
+  the progress it saved at its last checkpoint, or cancel it for good; `interrupted()` reaches
+  a job blocked in a long `.await`.
 - **Graceful shutdown** — running jobs finish before a worker exits.
 - **Code fingerprints** — opt in per job to stamp it with a hash of the code it reaches, so a
   worker runs it only when the worker was built from the same code.
+- **Renaming** — `aliases` keep the jobs and schedules stored under a job's old name running.
 - **Monitoring and management** — a live list of workers, counts and throughput per queue,
-  job listing by state, queue, key, time or tenant context, each job's history, retrying
-  failed jobs and running scheduled ones now; optional deletion of finished jobs.
+  job listing by state, priority, queue, key, time, tenant context or parent job, each job's
+  history, retrying failed jobs, running scheduled ones now and moving waiting ones to another
+  priority; optional deletion of finished jobs.
 - **Table setup your way** — from code, with the `jalari` CLI, or as SQL for your own
   migrations.
 
@@ -74,8 +87,8 @@ Every job moves through the same states:
                failed   out of attempts, or an error that retrying cannot fix
 ```
 
-- A worker locks the job it takes and keeps the lock until the job is done, so no one else
-  can take it in the meantime.
+- A worker marks the job it takes as running under its own name until the job is done, so no
+  one else can take it in the meantime.
 - Workers wake up the moment a job arrives, and check on their own from time to time in case
   a wake-up is missed.
 - When a schedule is due, its job is created and the schedule moves to its next time in one
@@ -121,10 +134,8 @@ struct SendEmail {
     to: String,
 }
 
-#[jalari::job(queue = "emails")]
+#[jalari::job(name = "send_email", queue = "emails")]
 impl Job for SendEmail {
-    const NAME: &'static str = "send_email";
-
     async fn run(self) -> JobResult {
         println!("sending to {}", self.to);
         Ok(())

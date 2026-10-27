@@ -86,7 +86,8 @@ pub enum ErrorKind {
     /// other writers for the same `job_key` and gave up after several attempts, or the waiting
     /// job stayed locked by another transaction for about a second without starting to run.
     JobKeyContention,
-    /// Two `#[jalari::job]` types in the same binary use the same [`Job::NAME`](crate::Job::NAME).
+    /// Two `#[jalari::job]` types in the same binary use the same [`Job::NAME`](crate::Job::NAME)
+    /// or alias; the message lists every name they share.
     DuplicateJobName,
     /// [`WorkerBuilder::build`](crate::WorkerBuilder::build) found no `#[jalari::job]` linked
     /// into the binary.

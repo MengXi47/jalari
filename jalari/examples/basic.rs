@@ -11,12 +11,8 @@ struct SendEmail {
     subject: String,
 }
 
-#[jalari::job(queue = "emails")]
+#[jalari::job(name = "send_email", queue = "emails", max_attempts = 5, timeout = 30)]
 impl Job for SendEmail {
-    const NAME: &'static str = "send_email";
-    const MAX_ATTEMPTS: i32 = 5;
-    const TIMEOUT: Option<Duration> = Some(Duration::from_secs(30));
-
     async fn run(self) -> JobResult {
         if !self.to.contains('@') {
             return Err(jalari::JobError::permanent(io::Error::new(
@@ -45,10 +41,8 @@ struct SyncInventory {
     batches: u32,
 }
 
-#[jalari::job]
+#[jalari::job(name = "sync_inventory")]
 impl Job for SyncInventory {
-    const NAME: &'static str = "sync_inventory";
-
     async fn run(self) -> JobResult {
         for batch in 1..=self.batches {
             tokio::select! {
@@ -64,15 +58,42 @@ impl Job for SyncInventory {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct PollFeed {
+    feed: String,
+    generation: u32,
+}
+
+#[jalari::job(name = "poll_feed")]
+impl Job for PollFeed {
+    async fn run(self) -> JobResult {
+        println!("polled {} (generation {})", self.feed, self.generation);
+        if self.generation < 3 {
+            let next = PollFeed {
+                feed: self.feed.clone(),
+                generation: self.generation + 1,
+            };
+            let options = EnqueueOptions::new()
+                .job_key(&format!("poll:{}", self.feed))
+                .delay(Duration::from_secs(2));
+            jalari::enqueue_on_success_with(&next, options)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct DailyReport {
     include_failed: bool,
 }
 
-#[jalari::job(cron = "0 0 3 * * *", timezone = "Asia/Taipei", queue = "reports")]
+#[jalari::job(
+    name = "daily_report",
+    cron = "0 0 3 * * *",
+    timezone = "Asia/Taipei",
+    queue = "reports"
+)]
 impl Job for DailyReport {
-    const NAME: &'static str = "daily_report";
-
     async fn run(self) -> JobResult {
         println!("daily report, include_failed = {}", self.include_failed);
         Ok(())
@@ -159,6 +180,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     }
     println!("two inventory syncs share a queue_key, so they run one after the other");
+
+    jalari::enqueue_with(
+        &PollFeed {
+            feed: "releases".to_owned(),
+            generation: 1,
+        },
+        EnqueueOptions::new().job_key("poll:releases"),
+    )
+    .await?;
+    println!("poll_feed enqueues its next run under its own job_key when it succeeds, 3 times");
 
     let mut transaction = pool.begin().await?;
     jalari::enqueue_in(

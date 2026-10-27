@@ -16,11 +16,8 @@
 ///     user_id: i64,
 /// }
 ///
-/// #[jalari::job(queue = "emails")]
+/// #[jalari::job(name = "password_reset", queue = "emails", priority = "urgent")]
 /// impl Job for PasswordReset {
-///     const NAME: &'static str = "password_reset";
-///     const PRIORITY: Priority = Priority::Urgent;
-///
 ///     async fn run(self) -> JobResult {
 ///         Ok(())
 ///     }

@@ -56,9 +56,8 @@ const COLUMNS: [(&str, &str); 17] = [
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct SendDigest { user_id: i64 }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "send_digest")]
 /// # impl jalari::Job for SendDigest {
-/// #     const NAME: &'static str = "send_digest";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// # async fn example(user_ids: Vec<i64>) -> jalari::Result<()> {
@@ -96,9 +95,8 @@ pub fn enqueue_many<T: Job>(
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct ImportChunk { index: u32 }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "import_chunk")]
 /// # impl jalari::Job for ImportChunk {
-/// #     const NAME: &'static str = "import_chunk";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// # async fn example(pool: jalari::sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {

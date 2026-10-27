@@ -77,10 +77,8 @@ use syn::{
 /// without a fingerprint and its workers take its jobs from any build.
 ///
 /// ```rust,ignore
-/// #[jalari::job(queue = "exports", fingerprint = true)]
+/// #[jalari::job(name = "export_report", queue = "exports", fingerprint = true)]
 /// impl Job for ExportReport {
-///     const NAME: &'static str = "export_report";
-///
 ///     async fn run(self) -> JobResult {
 ///         Ok(())
 ///     }
@@ -98,10 +96,8 @@ use syn::{
 ///     to: String,
 /// }
 ///
-/// #[jalari::job(queue = "emails")]
+/// #[jalari::job(name = "send_email", queue = "emails")]
 /// impl Job for SendEmail {
-///     const NAME: &'static str = "send_email";
-///
 ///     async fn run(self) -> JobResult {
 ///         Ok(())
 ///     }
@@ -110,10 +106,13 @@ use syn::{
 /// #[derive(Serialize, Deserialize, Default)]
 /// struct NightlyReport;
 ///
-/// #[jalari::job(cron = "0 0 3 * * *", timezone = "Asia/Taipei", queue = "reports")]
+/// #[jalari::job(
+///     name = "nightly_report",
+///     cron = "0 0 3 * * *",
+///     timezone = "Asia/Taipei",
+///     queue = "reports"
+/// )]
 /// impl Job for NightlyReport {
-///     const NAME: &'static str = "nightly_report";
-///
 ///     async fn run(self) -> JobResult {
 ///         Ok(())
 ///     }

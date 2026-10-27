@@ -25,9 +25,8 @@ use crate::{Job, Result};
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct SendEmail { to: String }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "send_email")]
 /// # impl jalari::Job for SendEmail {
-/// #     const NAME: &'static str = "send_email";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// # async fn example() -> jalari::Result<()> {
@@ -60,9 +59,8 @@ pub fn enqueue<T: Job>(job: &T) -> impl Future<Output = Result<EnqueueOutcome>> 
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct SendEmail { to: String }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "send_email")]
 /// # impl jalari::Job for SendEmail {
-/// #     const NAME: &'static str = "send_email";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// # async fn example() -> jalari::Result<()> {
@@ -96,9 +94,8 @@ pub fn enqueue_with<T: Job>(
 /// # use serde::{Deserialize, Serialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct SendWelcome { user_id: i64 }
-/// # #[jalari::job]
+/// # #[jalari::job(name = "send_welcome")]
 /// # impl jalari::Job for SendWelcome {
-/// #     const NAME: &'static str = "send_welcome";
 /// #     async fn run(self) -> jalari::JobResult { Ok(()) }
 /// # }
 /// # async fn example(pool: jalari::sqlx::PgPool) -> jalari::Result<()> {

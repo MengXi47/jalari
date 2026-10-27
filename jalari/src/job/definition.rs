@@ -21,17 +21,15 @@ pub type JobResult = std::result::Result<(), JobError>;
 /// A job runs at least once: if its worker dies mid-run, another worker runs it again, so `run`
 /// should be idempotent.
 ///
-/// `#[jalari::job]` also stamps every enqueued job with a fingerprint of the code it reaches. A
-/// worker runs a job only when the job has no fingerprint or when the worker was built from
-/// the same code, so a job enqueued by another build waits the way a job under an unknown
-/// [`NAME`](Self::NAME) does. [`#[jalari::job]`](crate::job) lists what the fingerprint
-/// covers and how to turn it off for a job.
+/// With `#[jalari::job(fingerprint = true)]`, every enqueued job is stamped with a fingerprint
+/// of the code it reaches. A worker runs a job only when the job has no fingerprint or when the
+/// worker was built from the same code, so a job enqueued by another build waits the way a job
+/// under an unknown [`NAME`](Self::NAME) does. Fingerprints are off by default;
+/// [`#[jalari::job]`](crate::job) lists what they cover.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
-/// use std::time::Duration;
-///
 /// use jalari::{Job, JobResult};
 /// use serde::{Deserialize, Serialize};
 ///
@@ -41,12 +39,8 @@ pub type JobResult = std::result::Result<(), JobError>;
 ///     width: u32,
 /// }
 ///
-/// #[jalari::job(queue = "images")]
+/// #[jalari::job(name = "resize_image", queue = "images", max_attempts = 3, timeout = 60)]
 /// impl Job for ResizeImage {
-///     const NAME: &'static str = "resize_image";
-///     const MAX_ATTEMPTS: i32 = 3;
-///     const TIMEOUT: Option<Duration> = Some(Duration::from_secs(60));
-///
 ///     async fn run(self) -> JobResult {
 ///         let bytes = std::fs::read(&self.path)?;
 ///         println!("resizing {} bytes to {}px", bytes.len(), self.width);
@@ -244,11 +238,8 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// #[derive(Serialize, Deserialize)]
     /// struct SendWelcome;
     ///
-    /// #[jalari::job(queue = "emails")]
+    /// #[jalari::job(name = "send_welcome", queue = "emails", aliases = ["welcome_email"])]
     /// impl Job for SendWelcome {
-    ///     const NAME: &'static str = "send_welcome";
-    ///     const ALIASES: &'static [&'static str] = &["welcome_email"];
-    ///
     ///     async fn run(self) -> JobResult {
     ///         Ok(())
     ///     }
@@ -276,10 +267,8 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     ///     url: String,
     /// }
     ///
-    /// #[jalari::job(queue = "webhooks")]
+    /// #[jalari::job(name = "deliver_webhook", queue = "webhooks", max_attempts = 20)]
     /// impl Job for DeliverWebhook {
-    ///     const NAME: &'static str = "deliver_webhook";
-    ///     const MAX_ATTEMPTS: i32 = 20;
     ///     const RETRY_POLICY: Option<&'static dyn RetryPolicy> = Some(&ExponentialBackoff {
     ///         base: Duration::from_secs(30),
     ///         max: Duration::from_secs(6 * 60 * 60),
@@ -303,7 +292,8 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
 
     /// Runs the job.
     ///
-    /// An `Err` is retried according to the worker's [`RetryPolicy`](crate::RetryPolicy) until
+    /// An `Err` is retried according to [`RETRY_POLICY`](Self::RETRY_POLICY), or the worker's
+    /// [`RetryPolicy`](crate::RetryPolicy) when it is `None`, until
     /// [`MAX_ATTEMPTS`](Self::MAX_ATTEMPTS) is reached, unless it is [`JobError::permanent`].
     /// A panic or a timeout counts as a failed attempt and does not affect other jobs.
     ///
