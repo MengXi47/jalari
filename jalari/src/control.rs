@@ -34,6 +34,9 @@ pub enum RestartOutcome {
     /// The job is not stopped: it is waiting, running or finished, or its stop is still only
     /// [`Requested`](StopOutcome::Requested).
     NotStopped,
+    /// The job is stopped and its `expires_at` has passed, so it stays stopped; [`cancel`] it
+    /// to free its `job_key`.
+    Expired,
     /// No job has this id, or housekeeping already removed it.
     NotFound,
 }
@@ -145,7 +148,8 @@ pub async fn cancel(id: JobId) -> Result<CancelOutcome> {
 ///
 /// Its attempt count is what it was before the stop, and a job scheduled for later keeps its
 /// run time. A job stopped right after a worker aborted it at shutdown still waits the few
-/// seconds the aborted run needs to stop.
+/// seconds the aborted run needs to stop. A job whose `expires_at` has passed stays stopped,
+/// since it could never start again.
 ///
 /// # Errors
 ///
@@ -173,6 +177,7 @@ pub async fn restart(id: JobId) -> Result<RestartOutcome> {
                  run_at = greatest(run_at, statement_timestamp()),
                  updated_at = statement_timestamp()
              WHERE id = $1 AND state = 'stopped'
+                 AND (expires_at IS NULL OR expires_at > statement_timestamp())
              RETURNING id, state, attempts, queue
          ),
          logged AS (
@@ -191,10 +196,11 @@ pub async fn restart(id: JobId) -> Result<RestartOutcome> {
             notify(&mut transaction, schema, &queue).await?;
             RestartOutcome::Restarted
         }
-        None if job_state(&mut transaction, schema, id).await?.is_some() => {
-            RestartOutcome::NotStopped
-        }
-        None => RestartOutcome::NotFound,
+        None => match job_state(&mut transaction, schema, id).await? {
+            None => RestartOutcome::NotFound,
+            Some((state, true)) if state == JobState::Stopped.as_str() => RestartOutcome::Expired,
+            Some(_) => RestartOutcome::NotStopped,
+        },
     };
     transaction.commit().await?;
     Ok(outcome)
@@ -260,9 +266,10 @@ async fn job_state(
     connection: &mut PgConnection,
     schema: &Schema,
     id: JobId,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<(String, bool)>> {
     let state = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT state, queue FROM {job} WHERE id = $1",
+        "SELECT state, coalesce(expires_at <= statement_timestamp(), FALSE)
+         FROM {job} WHERE id = $1",
         job = schema.table("job"),
     )))
     .bind(id.0)

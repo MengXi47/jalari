@@ -27,6 +27,8 @@ pub enum RetryOutcome {
     /// Another job with the same `job_key` is waiting, running or stopped, so this one stays
     /// failed; the id is that other job's.
     KeyTaken(JobId),
+    /// The job failed and its `expires_at` has passed, so it stays failed.
+    Expired,
     /// No job has this id, or housekeeping already removed it.
     NotFound,
 }
@@ -39,6 +41,8 @@ pub struct RetrySummary {
     pub retried: u64,
     /// Jobs left failed because another job holds their `job_key`.
     pub key_taken: u64,
+    /// Jobs left failed because their `expires_at` has passed.
+    pub expired: u64,
 }
 
 /// What [`run_now`] did with the job.
@@ -61,8 +65,9 @@ pub enum RunNowOutcome {
 /// The job becomes due now with `attempts` reset to zero, so it gets its full `max_attempts`
 /// again. `last_error` stays until an attempt succeeds, the change is recorded in the job's
 /// history, and workers of its queue are notified. A job whose `job_key` is held by another
-/// waiting, running or stopped job stays failed, because two such jobs cannot share a key. A
-/// job a worker aborted at shutdown on its last attempt waits out the few seconds the aborted
+/// waiting, running or stopped job stays failed, because two such jobs cannot share a key, and
+/// so does a job whose `expires_at` has passed, since it could never start again. A job a
+/// worker aborted at shutdown on its last attempt waits out the few seconds the aborted
 /// run needs to stop, so it never overlaps the new one. When the calling process links the
 /// job's task with a fingerprint, the job gets that fingerprint, so it runs on the caller's
 /// build; otherwise it keeps the one it has.
@@ -90,8 +95,9 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
     let config = config()?;
     let schema = &config.schema;
     let mut transaction = config.pool.pool().begin().await?;
-    let locked: Option<(String, String)> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT state, queue FROM {job} WHERE id = $1 FOR NO KEY UPDATE",
+    let locked: Option<(String, String, bool)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT state, queue, coalesce(expires_at <= statement_timestamp(), FALSE)
+         FROM {job} WHERE id = $1 FOR NO KEY UPDATE",
         job = schema.table("job"),
     )))
     .bind(id.0)
@@ -100,8 +106,9 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
     let served = fingerprint::served(entries());
     let outcome = match locked {
         None => RetryOutcome::NotFound,
-        Some((state, _)) if state != JobState::Failed.as_str() => RetryOutcome::NotFailed,
-        Some((_, queue)) => {
+        Some((state, ..)) if state != JobState::Failed.as_str() => RetryOutcome::NotFailed,
+        Some((.., true)) => RetryOutcome::Expired,
+        Some((_, queue, false)) => {
             let outcome = retry_locked(&mut transaction, schema, id, &served).await?;
             if outcome == RetryOutcome::Retried {
                 notify(&mut transaction, schema, &queue).await?;
@@ -115,8 +122,8 @@ pub async fn retry(id: JobId) -> Result<RetryOutcome> {
 
 /// Retries every failed job matching `filter`, in batches of 100 that commit separately.
 ///
-/// Each job is handled as by [`retry`], including its fingerprint; the filter's states are
-/// ignored, only failed jobs are considered. A batch that fails leaves the earlier batches
+/// Each job is handled as by [`retry`], including its fingerprint and its `expires_at`; the
+/// filter's states are ignored, only failed jobs are considered. A batch that fails leaves the earlier batches
 /// retried and returns the error.
 ///
 /// # Errors
@@ -157,8 +164,9 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
         after = last;
 
         let mut transaction = pool.begin().await?;
-        let locked: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT id, queue FROM {job} WHERE id = ANY($1) AND state = 'failed'
+        let locked: Vec<(i64, String, bool)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT id, queue, coalesce(expires_at <= statement_timestamp(), FALSE)
+             FROM {job} WHERE id = ANY($1) AND state = 'failed'
              ORDER BY id FOR NO KEY UPDATE SKIP LOCKED",
             job = schema.table("job"),
         )))
@@ -166,13 +174,19 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
         .fetch_all(&mut *transaction)
         .await?;
         let mut queues = BTreeSet::new();
-        for (id, queue) in locked {
-            match retry_locked(&mut transaction, schema, JobId(id), &served).await? {
+        for (id, queue, expired) in locked {
+            let outcome = if expired {
+                RetryOutcome::Expired
+            } else {
+                retry_locked(&mut transaction, schema, JobId(id), &served).await?
+            };
+            match outcome {
                 RetryOutcome::Retried => {
                     summary.retried += 1;
                     queues.insert(queue);
                 }
                 RetryOutcome::KeyTaken(_) => summary.key_taken += 1,
+                RetryOutcome::Expired => summary.expired += 1,
                 RetryOutcome::NotFailed | RetryOutcome::NotFound => {}
             }
         }
@@ -185,7 +199,7 @@ pub async fn retry_failed(filter: &JobFilter) -> Result<RetrySummary> {
 
 /// Makes a waiting job due now instead of at its `run_at`.
 ///
-/// Works for a scheduled job and for a retry waiting for its backoff. The change is recorded
+/// Works for a scheduled job, a retry waiting for its backoff, and a snoozed job. The change is recorded
 /// in the job's history and workers of its queue are notified. A pending
 /// [`stop`](crate::stop) or [`cancel`](crate::cancel) still applies when a worker picks the
 /// job up.

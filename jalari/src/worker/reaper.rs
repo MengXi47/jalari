@@ -5,6 +5,7 @@ use sqlx::AssertSqlSafe;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::expiry::discard_expired;
 use super::lifeline::Current;
 use super::ownership::{Target, interrupt, reaped_full_batch};
 use super::runner::Shared;
@@ -33,6 +34,9 @@ pub(super) async fn reap(
         }
         if let Err(e) = shared.reap_until_clean(sweep_orphans).await {
             warn!(error = %e, "failed to take over the jobs of dead workers");
+        }
+        if let Err(e) = discard_expired(&shared.config.pool.pool(), &shared.config.schema).await {
+            warn!(error = %e, "failed to discard expired jobs");
         }
         if !forgotten || sweep_orphans {
             match shared.forget_departed().await {
@@ -100,7 +104,7 @@ impl Shared {
                 return;
             }
         };
-        for group in groups {
+        for group in groups.into_iter().filter(|group| !group.paused) {
             let message = if self.jobs.contains_key(group.task.as_str()) {
                 "no live worker runs these jobs, enqueued by another build of the task; start a \
                  worker of that build, or release them with jalari::admin::clear_fingerprint"
