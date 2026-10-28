@@ -210,6 +210,7 @@ async fn test_lifeline() {
     check_blocked_runtime_keeps_the_lifeline(&database).await;
     check_refused_heartbeats_keep_the_jobs(&database).await;
     check_lost_connection_during_a_stall_aborts_at_once(&database).await;
+    check_refusals_end_after_the_limit(&database).await;
     check_close_outlasts_an_outage(&database).await;
     check_close_after_takeover_is_fenced(&database).await;
     database.finish().await;
@@ -616,6 +617,85 @@ async fn check_lost_connection_during_a_stall_aborts_at_once(database: &Database
         stopped.saturating_duration_since(killed)
     );
     assert_ne!(database.lifelines().await[0].1, worker_id);
+    assert_eq!(
+        jalari::cancel(jalari::JobId(id)).await.unwrap(),
+        jalari::CancelOutcome::Requested
+    );
+    worker.stop().await;
+}
+
+async fn check_refusals_end_after_the_limit(database: &Database) {
+    const REFUSAL_LIMIT: Duration = Duration::from_secs(30);
+    let worker = spawn_worker().await;
+    common::wait_until(
+        "the lifeline to register",
+        Duration::from_secs(10),
+        || async { database.lifelines().await.len() == 1 },
+    )
+    .await;
+    let worker_id = database.lifelines().await.remove(0).1;
+    let id = jalari::enqueue(&Attempts {
+        label: "refused".to_owned(),
+    })
+    .await
+    .unwrap()
+    .id()
+    .0;
+    common::wait_until("the job to start", Duration::from_secs(10), || async {
+        !starts("refused#1").is_empty()
+    })
+    .await;
+    let mut blocker = PgConnection::connect_with(&database.options).await.unwrap();
+    let mut stall = blocker.begin().await.unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "SELECT 1 FROM {} WHERE id = $1::uuid FOR UPDATE",
+        database.table("worker")
+    )))
+    .bind(&worker_id)
+    .execute(&mut *stall)
+    .await
+    .unwrap();
+    let stalled = Instant::now();
+    common::wait_until(
+        "the worker to give up on its refused heartbeats",
+        REFUSAL_LIMIT + Duration::from_secs(5),
+        || async {
+            database
+                .lifelines()
+                .await
+                .iter()
+                .any(|(_, lifeline)| *lifeline != worker_id)
+        },
+    )
+    .await;
+    let replaced = Instant::now();
+    let gave_up_after = replaced.duration_since(stalled);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stopped = LEDGER
+        .events("refused#1")
+        .into_iter()
+        .map(|(_, at)| at)
+        .max()
+        .unwrap();
+    stall.rollback().await.unwrap();
+    common::wait_until("the job to run again", Duration::from_secs(15), || async {
+        !starts("refused#2").is_empty()
+    })
+    .await;
+    eprintln!(
+        "refused: the worker gave up {gave_up_after:?} into a stall that refused every \
+         heartbeat, its run stopped {:?} before the new lifeline was seen",
+        replaced.saturating_duration_since(stopped)
+    );
+    assert!(
+        (REFUSAL_LIMIT - Duration::from_secs(2)..=REFUSAL_LIMIT + Duration::from_secs(3))
+            .contains(&gave_up_after),
+        "{gave_up_after:?}"
+    );
+    assert!(
+        stopped <= replaced,
+        "the old run kept going after the worker gave up"
+    );
     assert_eq!(
         jalari::cancel(jalari::JobId(id)).await.unwrap(),
         jalari::CancelOutcome::Requested

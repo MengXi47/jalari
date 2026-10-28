@@ -27,6 +27,7 @@ const LIFELINE_IDLE_TIMEOUT: Duration = Duration::from_secs(11);
 pub(super) const CLAIM_FENCE: Duration = SELF_FENCE;
 pub(super) const TAKEOVER_GRACE: Duration = Duration::from_secs(7);
 const REGISTER_BACKOFF: Duration = Duration::from_secs(1);
+const REFUSAL_LIMIT: Duration = Duration::from_secs(30);
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(6);
 const APPLICATION_NAME: &str = "jalari lifeline";
 
@@ -345,14 +346,19 @@ impl Lifeline {
                     continue;
                 }
                 Ok(Err(e)) if Instant::now() < deadline && session_survives(&e) => {
-                    self.answered = sent_at;
-                    warn!(
-                        worker_id = %worker_id,
-                        error = %e,
-                        unacknowledged = ?Instant::now().duration_since(self.acked),
-                        "the database refused a heartbeat, keeping the jobs running"
-                    );
-                    continue;
+                    let unacknowledged = Instant::now().duration_since(self.acked);
+                    if unacknowledged >= REFUSAL_LIMIT {
+                        format!("the database refused every heartbeat for {unacknowledged:?}: {e}")
+                    } else {
+                        self.answered = sent_at;
+                        warn!(
+                            worker_id = %worker_id,
+                            error = %e,
+                            ?unacknowledged,
+                            "the database refused a heartbeat, keeping the jobs running"
+                        );
+                        continue;
+                    }
                 }
                 Ok(Ok(Some(_))) | Err(_) => format!(
                     "the database did not answer a heartbeat for {:?}",

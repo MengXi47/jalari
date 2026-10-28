@@ -838,10 +838,12 @@ next heartbeat. Its claims are refused once its last successful heartbeat is 3 s
 it starts nothing new until a heartbeat succeeds again. In jalari's tests a job ran once, with
 attempt 1, through a 12 second stall, and a job enqueued during the stall started about 0.1
 seconds after it ended. An error that ends the session, such as `pg_terminate_backend`, still
-aborts the jobs at once. The heartbeat grows old during a stall, so when the lifeline breaks in
-one, another worker can take the jobs over within about a second instead of 7; a refused
-heartbeat is followed by the next one right away, so the worker learns of the break at once, and
-in jalari's tests the old run stopped within milliseconds and the job ran again a second later.
+aborts the jobs at once. After 30 seconds without a successful heartbeat the worker gives up as
+well: it aborts its jobs and registers again, 30.2 seconds into such a stall in jalari's tests.
+The heartbeat grows old during a stall, so when the lifeline breaks in one, another worker can
+take the jobs over within about a second instead of 7; a refused heartbeat is followed by the
+next one right away, so the worker learns of the break at once, and in jalari's tests the old
+run stopped within milliseconds, before the job ran again.
 
 The worker also keeps its own count on its monotonic clock: it trusts its lifeline for 11
 seconds after it sent the last heartbeat the database answered, the same 11 seconds after which
