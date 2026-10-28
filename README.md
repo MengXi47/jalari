@@ -50,6 +50,10 @@ jalari = "0.7"
 - **Code fingerprints** — opt in per job to stamp it with a hash of the code it reaches, so a
   worker runs it only when the worker was built from the same code.
 - **Renaming** — `aliases` keep the jobs and schedules stored under a job's old name running.
+- **Through your own crate** — a crate that re-exports jalari lets the crates that depend on it
+  define jobs without depending on jalari themselves, through `crate = "..."` in
+  `#[jalari::job(..)]`; see
+  [Using jalari through another crate](docs/guide.md#using-jalari-through-another-crate).
 - **Monitoring and management** — a live list of workers, counts and throughput per queue,
   job listing by state, priority, queue, key, time, tenant context or parent job, each job's
   history, retrying failed jobs, running scheduled ones now and moving waiting ones to another

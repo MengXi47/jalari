@@ -191,6 +191,7 @@ impl Job for SendEmail {
 | `checkpoints = true` | Declares that the job reaches [checkpoints](#checkpoints) regularly, so an abort at `stop_timeout` or `shutdown_timeout` is logged as an error | `false` |
 | `cron = "..."`, `timezone = "..."` | Makes the job [recurring](#declared-in-code); the time zone is only valid with `cron` | none, `UTC` |
 | `fingerprint = true` | Enqueue with a [code fingerprint](#code-fingerprints) and run only jobs of the same build | `false` |
+| `crate = "..."` | Path at which the generated code reaches jalari, for crates that use it through another crate; see [Using jalari through another crate](#using-jalari-through-another-crate) | `"::jalari"` |
 
 `name`, `max_attempts`, `timeout`, `priority` and `aliases` set the `Job` constants `NAME`,
 `MAX_ATTEMPTS`, `TIMEOUT`, `PRIORITY` and `ALIASES`. Declaring a constant in the impl instead,
@@ -283,8 +284,8 @@ The fingerprint covers:
 Formatting, comments and code that the job cannot reach leave it unchanged. The same sources
 and the same `Cargo.lock` give the same fingerprint on every machine and in every directory.
 
-The name, the aliases, the priority, `RETRY_POLICY` and the `checkpoints` flag are left out, in
-the attribute and in the impl, so renaming a job with an alias, changing its priority or
+The name, the aliases, the priority, `RETRY_POLICY`, the `checkpoints` flag and the `crate` path
+are left out, in the attribute and in the impl, so renaming a job with an alias, changing its priority or
 retry policy, or declaring checkpoints leaves waiting jobs runnable by the new build.
 `max_attempts` and `timeout` are covered in either form, and the two forms hash differently:
 moving `const MAX_ATTEMPTS: i32 = 4` into `max_attempts = 4` changes the fingerprint.
@@ -310,6 +311,47 @@ stamped by default. Leave it off for jobs whose arguments and behavior stay comp
 deploys. [Deployment](#deployment) describes rolling deploys, and
 [Jobs that wait for another build](#jobs-that-wait-for-another-build) shows how to find and
 release them.
+
+### Using jalari through another crate
+
+The code that `#[jalari::job]` generates names `::jalari`, so a crate that defines jobs must
+otherwise depend on jalari directly. When your crates reach jalari through one crate of your
+own, here called `platform`, that crate re-exports it:
+
+```rust
+#[doc(hidden)]
+pub use jalari as __jalari;
+```
+
+A crate that depends only on `platform` then defines jobs with the re-exported attribute and
+names the re-export in `crate`:
+
+```rust
+use platform::__jalari::{Job, JobResult};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct SendInvoice {
+    invoice_id: i64,
+}
+
+#[platform::__jalari::job(name = "send_invoice", crate = "::platform::__jalari")]
+impl Job for SendInvoice {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+```
+
+`crate` takes a path as a string literal, written as the defining crate would write it, and
+every path the attribute generates starts with it. A value that is not a path, or a second
+`crate`, is a compile error. An attribute macro of `platform`'s own can emit
+`#[::platform::__jalari::job(.., crate = "::platform::__jalari")]`, so that the crates that
+define jobs never write the path.
+
+The [code fingerprint](#code-fingerprints) leaves `crate` out. The attribute's own path and the
+`use` declarations that name jalari are code like any other, so moving a fingerprinted job from
+`jalari` to `platform` changes its fingerprint once, as any edit of its code does.
 
 ## Enqueueing
 

@@ -76,8 +76,9 @@ use syn::{
 ///
 /// `NAME`, `ALIASES`, `PRIORITY` and `RETRY_POLICY`, and the `name`, `aliases`, `priority`,
 /// `checkpoints`, `missed` and `crate` arguments, are left out, in either form. Renaming a job
-/// with its old name in `aliases`, changing its priority or retry policy, or reaching jalari
-/// through another path, therefore leaves waiting jobs runnable by the new build. `MAX_ATTEMPTS` and `TIMEOUT` are covered in either form.
+/// with its old name in `aliases`, or changing its priority or retry policy, therefore leaves
+/// waiting jobs runnable by the new build. `MAX_ATTEMPTS` and `TIMEOUT` are covered in either
+/// form.
 ///
 /// Every enqueue stores the fingerprint with the job, and a worker takes a job only when the
 /// stored fingerprint is empty or equals its own build's. A job enqueued by another build of
