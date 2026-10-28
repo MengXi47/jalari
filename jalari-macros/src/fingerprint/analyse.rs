@@ -20,7 +20,7 @@ pub(crate) fn fingerprint(
     if let Some(reexport) = &index.reexport {
         reexport.rewrite_item(&mut item);
     }
-    let item = hashed_job(&item);
+    let item = hashed_job(&item, index.reexport.as_ref());
     let site = &JobSite {
         item: &item,
         file: site.file,

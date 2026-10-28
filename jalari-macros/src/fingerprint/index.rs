@@ -500,7 +500,7 @@ impl Builder<'_> {
     fn implementation(&mut self, place: &Place<'_>, item_impl: &ItemImpl) {
         let hashed;
         let item_impl = if is_job_impl(item_impl) {
-            hashed = hashed_job(item_impl);
+            hashed = hashed_job(item_impl, self.index.reexport.as_ref());
             &hashed
         } else {
             item_impl
@@ -623,7 +623,7 @@ impl<'ast> Visit<'ast> for Scan {
     }
 }
 
-pub(crate) fn hashed_job(item_impl: &ItemImpl) -> ItemImpl {
+pub(crate) fn hashed_job(item_impl: &ItemImpl, reexport: Option<&Reexport>) -> ItemImpl {
     let mut hashed = item_impl.clone();
     hashed.items.retain(|item| {
         !matches!(item, ImplItem::Const(constant)
@@ -637,6 +637,16 @@ pub(crate) fn hashed_job(item_impl: &ItemImpl) -> ItemImpl {
             .is_some_and(|segment| segment.ident == "job");
         if !is_job {
             continue;
+        }
+        if reexport.is_some() {
+            let path = match &mut attribute.meta {
+                Meta::Path(path) => path,
+                Meta::List(list) => &mut list.path,
+                Meta::NameValue(pair) => &mut pair.path,
+            };
+            if path.segments.len() > 1 {
+                *path = parse_quote!(jalari::job);
+            }
         }
         let Ok(arguments) =
             attribute.parse_args_with(Punctuated::<MetaNameValue, Token![,]>::parse_terminated)

@@ -1734,3 +1734,34 @@ fn test_unparseable_file_is_read_through_the_reexport() {
     };
     assert_eq!(build("facade_a"), build("facade_b"));
 }
+
+#[test]
+fn test_job_attribute_through_a_reexport_hashes_as_jalari_job() {
+    let wrapped = |attribute: &str| {
+        let job = facade_source("platform", "")
+            .replace("#[platform::__jalari::job]", &format!("#[{attribute}]"));
+        through(&through_facade(&job, "platform"), "::platform::__jalari")
+    };
+    let direct = lib(&source("", ""));
+    assert_eq!(wrapped("platform::job(name = \"j\")"), direct);
+    assert_eq!(
+        wrapped("::platform::__jalari::job(crate = \"::platform::__jalari\")"),
+        direct
+    );
+    let bare_direct = source("", "")
+        .replace("#[jalari::job]", "#[job]")
+        .replace("{Job, JobResult}", "{Job, JobResult, job}");
+    let bare_facade = facade_source("facade", "")
+        .replace(
+            "#[facade::__jalari::job]",
+            "#[job(crate = \"::facade::__jalari\")]",
+        )
+        .replace("{Job, JobResult}", "{Job, JobResult, job}");
+    assert_eq!(
+        through(
+            &through_facade(&bare_facade, "facade"),
+            "::facade::__jalari"
+        ),
+        lib(&bare_direct)
+    );
+}
