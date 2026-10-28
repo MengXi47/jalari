@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use proc_macro::{Span, TokenStream};
-use proc_macro2::{Ident, Span as Span2, TokenStream as TokenStream2};
+use proc_macro2::{Group, Ident, Span as Span2, TokenStream as TokenStream2, TokenTree};
 use quote::{quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
@@ -235,9 +235,13 @@ fn expand(
             let missed = arguments
                 .missed
                 .unwrap_or_else(|| Ident::new("Once", Span2::call_site()));
+            let registration = located_at(
+                quote!(#jalari::__private::CronRegistration::new::<#job_type>),
+                expression.span(),
+            );
             quote! {
                 ::core::option::Option::Some(
-                    #jalari::__private::CronRegistration::new::<#job_type>(
+                    #registration(
                         #expression,
                         #timezone,
                         #jalari::Missed::#missed,
@@ -261,6 +265,23 @@ fn expand(
 
         #checks
     })
+}
+
+fn located_at(tokens: TokenStream2, span: Span2) -> TokenStream2 {
+    tokens
+        .into_iter()
+        .map(|tree| match tree {
+            TokenTree::Group(group) => {
+                let mut located = Group::new(group.delimiter(), located_at(group.stream(), span));
+                located.set_span(group.span().located_at(span));
+                TokenTree::Group(located)
+            }
+            mut other => {
+                other.set_span(other.span().located_at(span));
+                other
+            }
+        })
+        .collect()
 }
 
 fn declares(item_impl: &ItemImpl, name: &str) -> bool {

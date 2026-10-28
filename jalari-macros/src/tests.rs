@@ -701,3 +701,40 @@ fn test_queue_argument_rejects_an_empty_name_on_the_literal() {
         );
     }
 }
+
+fn source_texts(tokens: proc_macro2::TokenStream, texts: &mut Vec<(String, Option<String>)>) {
+    for tree in tokens {
+        if let proc_macro2::TokenTree::Group(group) = &tree {
+            source_texts(group.stream(), texts);
+        } else {
+            texts.push((tree.to_string(), tree.span().source_text()));
+        }
+    }
+}
+
+#[test]
+fn test_cron_registration_is_located_at_the_cron_literal() {
+    let item: ItemImpl = syn::parse_str(SHORT).unwrap();
+    let tokens = expand(arguments("cron = \"0 0 3 * * *\""), item, None).unwrap();
+    let mut texts = Vec::new();
+    source_texts(tokens, &mut texts);
+    let start = texts
+        .iter()
+        .position(|(text, _)| text == "CronRegistration")
+        .expect("a cron registration");
+    let end = start
+        + texts[start..]
+            .iter()
+            .position(|(text, _)| text == ">")
+            .unwrap();
+    let call = &texts[start - 8..=end];
+    assert_eq!(
+        call.iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>(),
+        "::jalari::__private::CronRegistration::new::<J>"
+    );
+    for (text, source) in call {
+        assert_eq!(source.as_deref(), Some("\"0 0 3 * * *\""), "{text}");
+    }
+}
