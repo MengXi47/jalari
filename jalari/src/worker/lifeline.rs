@@ -1,13 +1,15 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
+use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::ownership::{Target, interrupt, lock_prefix};
 use super::runner::{QueueConfig, Shared};
@@ -23,6 +25,7 @@ const LIFELINE_IDLE_TIMEOUT: Duration = Duration::from_secs(11);
 pub(super) const CLAIM_FENCE: Duration = SELF_FENCE;
 pub(super) const TAKEOVER_GRACE: Duration = Duration::from_secs(7);
 const REGISTER_BACKOFF: Duration = Duration::from_secs(1);
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(6);
 const APPLICATION_NAME: &str = "jalari lifeline";
 
 const _: () =
@@ -101,38 +104,128 @@ struct Lifeline {
     acked: Instant,
 }
 
-pub(super) async fn lifeline(
-    shared: Arc<Shared>,
-    registration: WorkerRegistration,
-    current: watch::Sender<Option<Arc<Incarnation>>>,
+pub(super) struct LifelineThread {
     retire: CancellationToken,
+    abort: CancellationToken,
+    ended: CancellationToken,
+}
+
+impl LifelineThread {
+    pub(super) fn start(
+        shared: Arc<Shared>,
+        registration: WorkerRegistration,
+        current: watch::Sender<Option<Arc<Incarnation>>>,
+    ) -> Self {
+        let thread = Self {
+            retire: CancellationToken::new(),
+            abort: CancellationToken::new(),
+            ended: CancellationToken::new(),
+        };
+        let retire = thread.retire.clone();
+        let abort = thread.abort.clone();
+        let ended = thread.ended.clone().drop_guard();
+        let jobs = Handle::current();
+        let spawned = std::thread::Builder::new()
+            .name("jalari-lifeline".to_owned())
+            .spawn(move || {
+                let _ended = ended;
+                run_thread(&shared, &registration, &current, &retire, &abort, &jobs);
+            });
+        if let Err(e) = spawned {
+            error!(error = %e, "failed to start the worker lifeline thread");
+        }
+        thread
+    }
+
+    pub(super) async fn retire(self) {
+        self.retire.cancel();
+        if tokio::time::timeout(RETIRE_TIMEOUT, self.ended.cancelled())
+            .await
+            .is_err()
+        {
+            warn!(timeout = ?RETIRE_TIMEOUT, "the worker lifeline did not retire in time, dropping it");
+        }
+    }
+}
+
+impl Drop for LifelineThread {
+    fn drop(&mut self) {
+        self.abort.cancel();
+    }
+}
+
+fn run_thread(
+    shared: &Arc<Shared>,
+    registration: &WorkerRegistration,
+    current: &watch::Sender<Option<Arc<Incarnation>>>,
+    retire: &CancellationToken,
+    abort: &CancellationToken,
+    jobs: &Handle,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            error!(error = %e, "failed to start the worker lifeline runtime");
+            return;
+        }
+    };
+    while !retire.is_cancelled() && !abort.is_cancelled() {
+        let kept = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                tokio::select! {
+                    () = abort.cancelled() => {}
+                    () = lifeline(shared, registration, current, retire, jobs) => {}
+                }
+            });
+        }));
+        if kept.is_ok() {
+            return;
+        }
+        error!("the worker lifeline panicked, aborting its jobs and registering again");
+        if let Some(incarnation) = current.send_replace(None) {
+            incarnation.dead.cancel();
+            shared.flush_now.notify_one();
+        }
+        runtime.block_on(pause(retire, REGISTER_BACKOFF));
+    }
+}
+
+async fn lifeline(
+    shared: &Arc<Shared>,
+    registration: &WorkerRegistration,
+    current: &watch::Sender<Option<Arc<Incarnation>>>,
+    retire: &CancellationToken,
+    jobs: &Handle,
 ) {
     let mut previous: Option<Arc<str>> = None;
     while !retire.is_cancelled() {
-        let mut lifeline = match Lifeline::open(&shared, &registration).await {
+        let mut lifeline = match Lifeline::open(shared, registration).await {
             Ok(Some(lifeline)) => lifeline,
             Ok(None) => {
-                pause(&retire, REGISTER_BACKOFF).await;
+                pause(retire, REGISTER_BACKOFF).await;
                 continue;
             }
             Err(e) => {
                 warn!(error = %e, "failed to open the worker lifeline");
-                pause(&retire, REGISTER_BACKOFF).await;
+                pause(retire, REGISTER_BACKOFF).await;
                 continue;
             }
         };
         if let Some(worker_id) = previous.take()
-            && let Err(e) = unregister(&mut lifeline.connection, &shared, &worker_id).await
+            && let Err(e) = unregister(&mut lifeline.connection, shared, &worker_id).await
         {
             warn!(error = %e, worker_id = %worker_id, "failed to remove the previous worker entry");
         }
         let incarnation = Arc::clone(&lifeline.incarnation);
         current.send_replace(Some(Arc::clone(&incarnation)));
-        let kept = lifeline.keep(&shared, &retire).await;
+        let kept = lifeline.keep(shared, retire, jobs).await;
         current.send_replace(None);
         match kept {
             Some(lifeline) => {
-                if let Err(e) = lifeline.retire(&shared).await {
+                if let Err(e) = lifeline.retire(shared).await {
                     warn!(error = %e, "failed to remove the worker from the worker list");
                 }
                 return;
@@ -156,7 +249,8 @@ async fn pause(retire: &CancellationToken, duration: Duration) {
 impl Lifeline {
     async fn open(shared: &Shared, registration: &WorkerRegistration) -> Result<Option<Self>> {
         let schema = &shared.config.schema;
-        let mut connection = shared.config.pool.pool().acquire().await?.detach();
+        let options = shared.config.pool.pool().connect_options();
+        let mut connection = PgConnection::connect_with(&options).await?;
         sqlx::query(
             "SELECT set_config('idle_session_timeout', $1, false),
                  set_config('tcp_user_timeout', $1, false),
@@ -218,7 +312,12 @@ impl Lifeline {
         }))
     }
 
-    async fn keep(mut self, shared: &Arc<Shared>, retire: &CancellationToken) -> Option<Self> {
+    async fn keep(
+        mut self,
+        shared: &Arc<Shared>,
+        retire: &CancellationToken,
+        jobs: &Handle,
+    ) -> Option<Self> {
         let worker_id = Arc::clone(&self.incarnation.worker_id);
         loop {
             tokio::select! {
@@ -233,7 +332,7 @@ impl Lifeline {
                     self.acked = sent_at;
                     let (orphans, abandoned) = shared.runs.deliver(&worker_id, &sent, &owned);
                     if !orphans.is_empty() || !abandoned.is_empty() {
-                        tokio::spawn(release(Arc::clone(shared), orphans, abandoned));
+                        jobs.spawn(release(Arc::clone(shared), orphans, abandoned));
                     }
                     continue;
                 }

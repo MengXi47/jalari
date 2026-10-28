@@ -60,6 +60,24 @@ impl Job for Outage {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Blocking {
+    label: String,
+    millis: u64,
+}
+
+#[jalari::job(queue = "lifeline")]
+impl Job for Blocking {
+    const NAME: &'static str = "lifeline_blocking";
+
+    async fn run(self) -> JobResult {
+        LEDGER.record(&self.label, "start");
+        std::thread::sleep(Duration::from_millis(self.millis));
+        LEDGER.record(&self.label, "done");
+        Ok(())
+    }
+}
+
 struct Finishes;
 
 impl JobMiddleware for Finishes {
@@ -69,8 +87,11 @@ impl JobMiddleware for Finishes {
         next.run().await
     }
 
-    async fn finished(&self, job: &JobMeta, _outcome: &Finished) {
+    async fn finished(&self, job: &JobMeta, outcome: &Finished) {
         LEDGER.record(&job.id().0.to_string(), "finished");
+        if *outcome == Finished::Succeeded {
+            LEDGER.record(&job.id().0.to_string(), "succeeded");
+        }
     }
 }
 
@@ -165,6 +186,7 @@ async fn test_lifeline() {
     check_orphaned_claim_is_released(&database, "orphan", 3).await;
     check_orphaned_claim_is_released(&database, "last_orphan", 1).await;
     check_abandoned_close_counts_the_attempt(&database).await;
+    check_blocked_runtime_keeps_the_lifeline(&database).await;
     check_close_outlasts_an_outage(&database).await;
     check_close_after_takeover_is_fenced(&database).await;
     database.finish().await;
@@ -363,6 +385,67 @@ async fn check_abandoned_close_counts_the_attempt(database: &Database) {
             ("scheduled".to_owned(), 1, Some(INTERRUPTED.to_owned())),
             ("failed".to_owned(), 2, Some("boom".to_owned()))
         ]
+    );
+    worker.stop().await;
+}
+
+async fn ran_once(database: &Database, id: i64, label: &str) {
+    assert_eq!(starts(label).len(), 1, "{label} started more than once");
+    assert_eq!(
+        job_shape(database, id).await,
+        (
+            "succeeded".to_owned(),
+            vec![("succeeded".to_owned(), 1, None)]
+        ),
+        "{label}"
+    );
+    assert_eq!(LEDGER.count(&id.to_string(), "finished"), 1, "{label}");
+    assert_eq!(LEDGER.count(&id.to_string(), "succeeded"), 1, "{label}");
+}
+
+async fn check_blocked_runtime_keeps_the_lifeline(database: &Database) {
+    const BLOCK: Duration = Duration::from_secs(12);
+    let worker = spawn_worker().await;
+    common::wait_until(
+        "the lifeline to register",
+        Duration::from_secs(10),
+        || async { database.lifelines().await.len() == 1 },
+    )
+    .await;
+    let registered = database.lifelines().await;
+    let labels = ["blocked_0", "blocked_1"];
+    let mut ids = Vec::new();
+    for label in labels {
+        let job = Blocking {
+            label: label.to_owned(),
+            millis: u64::try_from(BLOCK.as_millis()).unwrap(),
+        };
+        ids.push(jalari::enqueue(&job).await.unwrap().id().0);
+    }
+    let enqueued = Instant::now();
+    common::wait_until("the blocking jobs to succeed", BLOCK * 3, || async {
+        ids.iter()
+            .all(|id| LEDGER.count(&id.to_string(), "finished") == 1)
+    })
+    .await;
+    let finished_after = enqueued.elapsed();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started: Vec<Instant> = labels.iter().map(|label| starts(label)[0]).collect();
+    let apart = started[1]
+        .saturating_duration_since(started[0])
+        .max(started[0].saturating_duration_since(started[1]));
+    eprintln!(
+        "blocked: both runtime threads blocked for {BLOCK:?}, the bodies started {apart:?} apart, \
+         the jobs finished {finished_after:?} after they were enqueued"
+    );
+    assert!(apart < Duration::from_secs(1), "{apart:?}");
+    for (id, label) in ids.iter().zip(labels) {
+        ran_once(database, *id, label).await;
+    }
+    assert_eq!(database.lifelines().await, registered);
+    assert!(
+        finished_after < BLOCK + Duration::from_secs(3),
+        "{finished_after:?}"
     );
     worker.stop().await;
 }
