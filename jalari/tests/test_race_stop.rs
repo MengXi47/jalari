@@ -3,7 +3,7 @@ mod common;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -809,15 +809,31 @@ async fn check_stop_racing_a_snooze(database: &Database, seed: u64) -> Vec<Strin
         }
     }
     let targets = Arc::new(targets);
+    let met_waiting = Arc::new(AtomicBool::new(false));
+    let met_running = Arc::new(AtomicBool::new(false));
     let stoppers: Vec<_> = (0..4)
         .map(|stream| {
             let targets = Arc::clone(&targets);
+            let met_waiting = Arc::clone(&met_waiting);
+            let met_running = Arc::clone(&met_running);
             let mut rng = rng.fork(stream);
             tokio::spawn(async move {
                 let started = Instant::now();
-                while started.elapsed() < Duration::from_millis(1500) {
+                loop {
+                    let elapsed = started.elapsed();
+                    let met_both =
+                        met_waiting.load(Ordering::Relaxed) && met_running.load(Ordering::Relaxed);
+                    if elapsed >= Duration::from_millis(1500) && met_both
+                        || elapsed >= Duration::from_secs(8)
+                    {
+                        break;
+                    }
                     tokio::time::sleep(rng.millis(0, 15)).await;
-                    stop(*rng.pick(&targets)).await;
+                    match stop(*rng.pick(&targets)).await {
+                        Some(StopOutcome::Stopped) => met_waiting.store(true, Ordering::Relaxed),
+                        Some(StopOutcome::Requested) => met_running.store(true, Ordering::Relaxed),
+                        _ => {}
+                    }
                 }
             })
         })
