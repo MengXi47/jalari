@@ -1095,6 +1095,125 @@ effects an idempotency key.
   the call is the exception: it keeps the transaction alive without the progress, so do not
   wrap `save_in` in a savepoint.
 
+### Steps
+
+A cursor suits a loop over many items. A job that does a few named things with effects outside
+the database, such as charging a card and then emailing a receipt, wraps each one in a step:
+
+```rust
+async fn run(self) -> JobResult {
+    let charge_id = jalari::step("charge", |run| async move {
+        Ok(charge(self.order_id, self.amount, run.idempotency_key()).await?)
+    })
+    .await?;
+    jalari::step("receipt", |_| async move {
+        Ok(send_receipt(self.order_id, &charge_id).await?)
+    })
+    .await
+}
+```
+
+`jalari::step(key, f)` runs `f` and records its output under `key` for the job. Every later run
+of the job, after a retry, a crash and takeover, a restart or `admin::retry`, gets the recorded
+output back without running `f`. So when the receipt fails, the retry does not charge again.
+
+| Call | What a crash keeps | Use it for |
+|---|---|---|
+| `checkpoint.save` | the progress, up to about 6 seconds behind | a loop whose units may run again without harm |
+| `checkpoint.save_now` | the progress, stored before the call returns | a loop whose units have effects outside the database |
+| `checkpoint.save_in` | the progress, committed with your rows | a loop that writes to the database jalari uses |
+| `jalari::step` | each step's output, stored once `f` returns | a few named effects whose results later steps need |
+
+**A step runs at least once.** The output is stored after `f` returns. When the worker dies
+while `f` runs, or after the effect and before the output is stored, the next run of the job
+runs `f` again. A takeover can also start the step on another worker while the old worker is
+still inside `f`: the old worker cannot store anything once it lost the job, but an effect it
+already started goes on. In the race test the old run was dropped at its next `.await` as soon
+as its worker lost the lifeline, and the takeover came at least 6.0 seconds later, so the two
+never overlapped there. They overlap when the old worker cannot notice the loss in time, such
+as a frozen process, and an effect handed to another thread or already sent outlives the run in
+any case. `run.starts()` says how often the step started without being recorded, so a value
+above 1 means an earlier execution may have had its effect.
+
+**Keys.**
+
+- Build a key from the payload or from earlier steps' outputs, never from the time or a random
+  value: the next run must call the step with the same key to find its record.
+- A key succeeds once per run. Calling it again after it succeeded in the same run, or while it
+  is running in a `join!`, is a permanent error. After `f` returned an error, or after the step
+  future was dropped by a `timeout`, the same run may call it again.
+- Keys are 1 to 255 bytes. There is no limit on the number of steps, but each one costs two
+  short transactions, so do not use a step per item of a long loop; keep a cursor with
+  `checkpoint.save_now` instead.
+
+**Idempotency keys.** `run.idempotency_key()` is a UUID stored with the step's record. It stays
+the same across retries and takeovers, so an API that deduplicates requests by key turns a
+repeated `f` into one effect. Payment providers keep such keys only for a limited time, often
+about a day, so a job retried with `admin::retry` days later is not deduplicated by them. A
+`Replace` of the job or `admin::clear_steps` deletes the record, and the next start gets a new
+key.
+
+**At most once.** For an effect that must never happen twice and has no idempotency key, give up
+on a repeated start instead of running `f` again:
+
+```rust
+let sent = jalari::step("sms", |run| async move {
+    if run.starts() > 1 {
+        return Ok(false);
+    }
+    send_sms(&self.phone).await?;
+    Ok(true)
+})
+.await?;
+```
+
+Every earlier start counts, including one whose `f` returned an error, so such a step gives up
+after any failure, and a message may be lost instead of sent twice.
+
+**Outputs.** The output is stored as JSON, at most 1 MiB per step, and must read back as the
+step's type: a string with `\u0000`, a `NaN` float or a type whose `Deserialize` does not
+accept its own `Serialize` output fails the job permanently and leaves the step started, with
+the reason in its error. The run that executes `f` gets the output as it reads back, so every
+run sees the same value. When `f` returns an error, its text is kept with the record and the
+error is returned unchanged, so `JobError::discard`, `jalari::snooze` and interruptions work
+inside a step. A step is a stop point like `checkpoint`.
+
+**Effects must outlive the process.** `jalari::enqueue_on_success` is refused inside a step with
+`NotInJob`: the child would exist only in memory while the step is recorded as done, and a
+failed attempt would lose it for good. Call it after the step returns, or enqueue the child with
+`jalari::enqueue_in` in a transaction that `checkpoint.save_in` writes to, so both commit
+together.
+
+**Life cycle.**
+
+| When | The recorded steps |
+|---|---|
+| The job is retried, taken over after a crash, or restarted after a stop | kept: done steps return their output, started ones run again |
+| The job fails for good | kept, so `admin::retry` does not repeat the done ones |
+| The job succeeds | kept until housekeeping removes the job |
+| The job is replaced with `OnConflict::Replace` | deleted with its progress; do not replace a job whose recorded effects must not happen again |
+| `admin::clear_steps(id)` | deleted, unless the job is running |
+| Housekeeping removes the job | deleted with it |
+
+`jalari::admin::job(id)` lists the steps in `JobDetail::steps`, with their state, starts,
+attempt, times, error and output.
+
+`admin::clear_steps` is for an operator who knows the recorded effects did not happen, or wants
+them to happen again: the next run runs every step, with new idempotency keys. It answers
+`Cleared(n)`, `Running` for a running job, whose steps it keeps, or `NotFound`.
+
+The [`steps`](../jalari/examples/steps.rs) example charges an order with an idempotency key,
+sends a message with the at-most-once recipe, simulates a crash between an effect and its
+record, and prints and clears the steps.
+
+**Limits.**
+
+- A step works only in the job's own task. Called from a task the job spawned, it returns a
+  permanent error.
+- During a rolling upgrade from 0.7, a `Replace` from a 0.7 process keeps the job's steps, so the
+  replaced job gets the old payload's outputs. Upgrade those processes first, as
+  [Upgrading from 0.7](#upgrading-from-07) says.
+
 ### What each call does
 
 | Call | Waiting job | Running job | Stopped job | Finished job |
@@ -1526,7 +1645,9 @@ table, whose foreign key on the job table blocks writes to the job table until t
 commits, normally for a fraction of a second. 0.7 processes that are already running keep
 working after the upgrade. A 0.7 process started after it fails `init` with
 `SchemaVersionMismatch`, because each release checks for its own version, so start only 0.8
-processes from then on.
+processes from then on. Upgrade every process that enqueues with `OnConflict::Replace` before
+deploying code that calls `jalari::step`: a 0.7 `Replace` bumps the job's lease without deleting
+its [steps](#steps), so the replaced job would get the old payload's step outputs.
 
 From 0.8 on, a worker creates a job's control row when it claims the job, so
 `jalari::admin::job` shows a `control` entry for every job a worker has claimed, and
