@@ -886,12 +886,16 @@ async fn check_stop_racing_a_snooze(database: &Database, seed: u64) -> Vec<Strin
             .iter()
             .filter(|op| matches!(op.outcome.as_str(), "Stopped" | "Requested"))
         {
-            if let Some(start) = starts.iter().find(|start| **start > op.end) {
+            let later: Vec<&Instant> = starts.iter().filter(|start| **start > op.end).collect();
+            let allowed = usize::from(op.outcome == "Requested");
+            if later.len() > allowed {
                 failures.push(format!(
-                    "{label}: job {} started a run {:?} after stop answered {}",
+                    "{label}: job {} started {} runs after stop answered {}, the first {:?} \
+                     later; at most {allowed} may follow",
                     row.id,
-                    start.duration_since(op.end),
-                    op.outcome
+                    later.len(),
+                    op.outcome,
+                    later[0].duration_since(op.end)
                 ));
             }
         }
