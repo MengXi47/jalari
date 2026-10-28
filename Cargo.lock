@@ -476,6 +476,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "facade"
+version = "0.0.0"
+dependencies = [
+ "jalari",
+]
+
+[[package]]
+name = "facade-consumer"
+version = "0.0.0"
+dependencies = [
+ "facade",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

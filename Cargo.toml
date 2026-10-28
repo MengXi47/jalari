@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["jalari", "jalari-macros"]
+members = [
+    "jalari",
+    "jalari-macros",
+    "tests/facade/facade",
+    "tests/facade/consumer",
+]
 
 [workspace.package]
 version = "0.7.2"
