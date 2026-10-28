@@ -11,8 +11,8 @@ pub use actions::{
     RetryOutcome, RetrySummary, RunNowOutcome, clear_fingerprint, retry, retry_failed, run_now,
 };
 pub use jobs::{
-    ControlInfo, HistoryEntry, JobCount, JobDetail, JobFilter, JobInfo, Throughput, count, job,
-    jobs, stats, throughput,
+    ClearStepsOutcome, ControlInfo, HistoryEntry, JobCount, JobDetail, JobFilter, JobInfo,
+    StepInfo, Throughput, clear_steps, count, job, jobs, stats, throughput,
 };
 pub use priority::set_priority;
 pub use queues::{PausedQueue, pause_queue, paused_queues, resume_queue};

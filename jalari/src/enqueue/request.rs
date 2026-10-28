@@ -327,12 +327,16 @@ impl EnqueueRequest {
                  UPDATE {job_control}
                  SET progress = NULL, lease = lease + 1, updated_at = statement_timestamp()
                  WHERE job_id IN (SELECT id FROM replaced)
+             ),
+             forgotten AS (
+                 DELETE FROM {job_step} WHERE job_id IN (SELECT id FROM replaced)
              )
              SELECT target.id, target.kept, target.state = 'running' AS running,
                  EXISTS (SELECT 1 FROM replaced) AS replaced
              FROM target",
             job = schema.table("job"),
             job_control = schema.table("job_control"),
+            job_step = schema.table("job_step"),
         );
         let polling_since = Instant::now();
         loop {

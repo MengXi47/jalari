@@ -23,8 +23,12 @@ pub enum OnConflict {
     ///
     /// A [stopped](crate::stop) job, or one with a pending [`stop`](crate::stop) or
     /// [`cancel`](crate::cancel), is never replaced; the enqueue returns
-    /// [`EnqueueOutcome::Kept`] and the pending request still applies. Replacing a job discards
-    /// the progress its earlier attempts saved.
+    /// [`EnqueueOutcome::Kept`] and the pending request still applies.
+    ///
+    /// Replacing a job discards the progress its earlier attempts saved and the outputs its
+    /// [`step`](crate::step)s recorded, so the replaced job runs every step again, with new
+    /// [idempotency keys](crate::StepRun::idempotency_key). Do not replace a job whose recorded
+    /// steps had effects that must not happen twice.
     Replace,
 }
 

@@ -372,6 +372,41 @@ struct ControlRow {
     updated_at: DateTime<Utc>,
 }
 
+/// One [`step`](crate::step) a job recorded, as listed in [`JobDetail::steps`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepInfo {
+    /// The key the step was started with.
+    pub key: String,
+    /// `started` while the step has not succeeded, `done` once its output is recorded.
+    pub state: String,
+    /// How often the step started without being recorded as done; see
+    /// [`StepRun::starts`](crate::StepRun::starts).
+    pub starts: i32,
+    /// The job attempt that last started the step.
+    pub attempt: i32,
+    /// When the step first started.
+    pub started_at: DateTime<Utc>,
+    /// When the step's output was recorded; `None` while it is started.
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Error of the last execution that failed, cut to 1 KiB; cleared when the step succeeds.
+    pub error: Option<String>,
+    /// The recorded output as JSON; `None` while the step is started.
+    pub output: Option<Value>,
+}
+
+#[derive(sqlx::FromRow)]
+struct StepRow {
+    key: String,
+    state: String,
+    starts: i32,
+    attempt: i32,
+    started_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+    error: Option<String>,
+    output: Option<Value>,
+}
+
 /// One job with its history and control state, as returned by [`job`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,6 +417,20 @@ pub struct JobDetail {
     pub history: Vec<HistoryEntry>,
     /// Saved progress and lease; `None` until a worker first claims the job.
     pub control: Option<ControlInfo>,
+    /// The [`step`](crate::step)s the job recorded, in the order they first started.
+    pub steps: Vec<StepInfo>,
+}
+
+/// Result of [`clear_steps`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearStepsOutcome {
+    /// The job's recorded steps were deleted; the number is how many.
+    Cleared(u64),
+    /// The job is running, so its steps were kept.
+    Running,
+    /// No job has this id, or housekeeping already removed it.
+    NotFound,
 }
 
 /// Number of jobs in one queue and state, as returned by [`stats`].
@@ -593,6 +642,14 @@ pub async fn job(id: JobId) -> Result<Option<JobDetail>> {
     .bind(id.0)
     .fetch_optional(&mut *connection)
     .await?;
+    let steps: Vec<StepRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT key, state, starts, attempt, started_at, finished_at, error, output
+         FROM {job_step} WHERE job_id = $1 ORDER BY started_at, key",
+        job_step = schema.table("job_step"),
+    )))
+    .bind(id.0)
+    .fetch_all(&mut *connection)
+    .await?;
     let history = history
         .into_iter()
         .map(|row| {
@@ -615,7 +672,75 @@ pub async fn job(id: JobId) -> Result<Option<JobDetail>> {
             lease: row.lease,
             updated_at: row.updated_at,
         }),
+        steps: steps
+            .into_iter()
+            .map(|row| StepInfo {
+                key: row.key,
+                state: row.state,
+                starts: row.starts,
+                attempt: row.attempt,
+                started_at: row.started_at,
+                finished_at: row.finished_at,
+                error: row.error,
+                output: row.output,
+            })
+            .collect(),
     }))
+}
+
+/// Deletes the [`step`](crate::step)s a job recorded, so its next run executes every step again.
+///
+/// It is meant for an operator who knows that the effects of the recorded steps did not happen,
+/// or must happen again: the next run calls every step's closure, with new
+/// [idempotency keys](crate::StepRun::idempotency_key), so a provider that deduplicates by key
+/// does not recognise the repeat. A running job keeps its steps; stop it first, or wait until
+/// it has failed or is waiting for a retry. Progress saved with
+/// [`Checkpoint`](crate::Checkpoint) is kept.
+///
+/// # Errors
+///
+/// Returns an error if [`init`](crate::init) has not completed or the database query fails.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use jalari::admin::ClearStepsOutcome;
+///
+/// # async fn example(id: jalari::JobId) -> jalari::Result<()> {
+/// match jalari::admin::clear_steps(id).await? {
+///     ClearStepsOutcome::Cleared(steps) => {
+///         println!("{steps} steps cleared");
+///         jalari::admin::retry(id).await?;
+///     }
+///     ClearStepsOutcome::Running => println!("job {id} is running, stop it first"),
+///     _ => println!("job {id} does not exist"),
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn clear_steps(id: JobId) -> Result<ClearStepsOutcome> {
+    let config = config()?;
+    let (state, cleared): (Option<String>, i64) = sqlx::query_as(AssertSqlSafe(format!(
+        "WITH target AS (
+             SELECT id, state FROM {job} WHERE id = $1 FOR SHARE
+         ),
+         cleared AS (
+             DELETE FROM {job_step}
+             WHERE job_id IN (SELECT id FROM target WHERE state <> 'running')
+             RETURNING key
+         )
+         SELECT (SELECT state FROM target), (SELECT count(*) FROM cleared)",
+        job = config.schema.table("job"),
+        job_step = config.schema.table("job_step"),
+    )))
+    .bind(id.0)
+    .fetch_one(&config.pool.pool())
+    .await?;
+    Ok(match state.as_deref() {
+        None => ClearStepsOutcome::NotFound,
+        Some("running") => ClearStepsOutcome::Running,
+        Some(_) => ClearStepsOutcome::Cleared(u64::try_from(cleared).unwrap_or(0)),
+    })
 }
 
 /// Sums up what each queue's jobs did during the last `window`, from the job history.

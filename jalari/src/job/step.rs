@@ -74,7 +74,7 @@ impl StepRun {
     /// It is a hyphenated UUID created with the step's record, so it is unique per step and
     /// job. Pass it to an API that deduplicates requests by key. An
     /// [`OnConflict::Replace`](crate::OnConflict::Replace) of the job or
-    /// `admin::clear_steps` deletes the record, and the next start
+    /// [`admin::clear_steps`](crate::admin::clear_steps) deletes the record, and the next start
     /// gets a new key.
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key

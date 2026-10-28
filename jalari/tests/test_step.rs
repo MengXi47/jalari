@@ -541,6 +541,80 @@ impl Job for OnSuccess {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Replaceable {
+    label: String,
+    round: u32,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for Replaceable {
+    const NAME: &'static str = "step_replaceable";
+
+    async fn run(self) -> JobResult {
+        let label = self.label.clone();
+        let key = jalari::step("charge", |run| async move {
+            count(&label);
+            Ok(run.idempotency_key().to_owned())
+        })
+        .await?;
+        see(&self.label, format!("round {} key {key}", self.round));
+        if self.round == 1 {
+            return Err(JobError::new("parked".to_owned()).retry_after(Duration::from_secs(3600)));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct FailsLast {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 1)]
+impl Job for FailsLast {
+    const NAME: &'static str = "step_fails_last";
+
+    async fn run(self) -> JobResult {
+        let label = self.label.clone();
+        let output = jalari::step("effect", |_| async move {
+            count(&label);
+            Ok("happened once".to_owned())
+        })
+        .await?;
+        see(&self.label, output);
+        if count(&format!("{}:runs", self.label)) == 1 {
+            return Err(JobError::new("the last attempt fails".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Clearable {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for Clearable {
+    const NAME: &'static str = "step_clearable";
+
+    async fn run(self) -> JobResult {
+        let label = self.label.clone();
+        let key = jalari::step("sent", |run| async move {
+            count(&label);
+            Ok(run.idempotency_key().to_owned())
+        })
+        .await?;
+        see(&self.label, key);
+        if count(&format!("{}:runs", self.label)) == 1 {
+            pass(&self.label).await;
+            return Err(JobError::new("parked".to_owned()).retry_after(Duration::from_secs(3600)));
+        }
+        Ok(())
+    }
+}
+
 async fn spawn_worker() -> RunningWorker {
     let mut config = WorkerConfig::default();
     config.poll_interval = Duration::from_millis(100);
@@ -979,6 +1053,131 @@ async fn check_enqueue_on_success_is_refused_inside_a_step() {
     assert_eq!(children, [2]);
 }
 
+async fn check_replace_discards_the_steps() {
+    let label = "replaceable";
+    let options = || {
+        jalari::EnqueueOptions::new()
+            .job_key("step_replaceable")
+            .on_conflict(jalari::OnConflict::Replace)
+    };
+    let id = jalari::enqueue_with(
+        &Replaceable {
+            label: label.to_owned(),
+            round: 1,
+        },
+        options(),
+    )
+    .await
+    .unwrap()
+    .id();
+    wait_for_state(id, "scheduled").await;
+    let [first] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    let replaced = jalari::enqueue_with(
+        &Replaceable {
+            label: label.to_owned(),
+            round: 2,
+        },
+        options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced, jalari::EnqueueOutcome::Replaced(id));
+    assert_eq!(step_rows(id).await, []);
+    wait_for_state(id, "succeeded").await;
+    let [second] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_ne!(first.nonce, second.nonce);
+    assert_eq!(
+        seen(label),
+        [
+            format!("round 1 key {}", first.nonce),
+            format!("round 2 key {}", second.nonce)
+        ]
+    );
+    assert_eq!(counted(label), 2);
+    assert_eq!(second.starts, 1);
+}
+
+async fn check_a_retried_failure_keeps_its_steps() {
+    let label = "fails_last";
+    let id = enqueue(&FailsLast {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_state(id, "failed").await;
+    let [row] = &step_rows(id).await[..] else {
+        panic!("a failed job keeps its step");
+    };
+    assert_eq!(row.state, "done");
+    assert_eq!(
+        jalari::admin::retry(id).await.unwrap(),
+        jalari::admin::RetryOutcome::Retried
+    );
+    wait_for_state(id, "succeeded").await;
+    assert_eq!(seen(label), ["happened once", "happened once"]);
+    assert_eq!(counted(label), 1, "the retried job ran its done step again");
+}
+
+async fn check_steps_are_listed_and_cleared() {
+    let label = "clearable";
+    let id = enqueue(&Clearable {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_gate(label).await;
+    let detail = jalari::admin::job(id).await.unwrap().unwrap();
+    let [listed] = &detail.steps[..] else {
+        panic!("{:?}", detail.steps);
+    };
+    let [row] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_eq!(listed.key, "sent");
+    assert_eq!(listed.state, "done");
+    assert_eq!((listed.starts, listed.attempt), (1, 1));
+    assert_eq!(listed.output, Some(json!(row.nonce)));
+    assert_eq!(listed.error, None);
+    assert!(listed.finished_at.unwrap() >= listed.started_at);
+    assert_eq!(
+        jalari::admin::clear_steps(id).await.unwrap(),
+        jalari::admin::ClearStepsOutcome::Running
+    );
+    assert_eq!(step_rows(id).await.len(), 1);
+    open(label);
+    wait_for_state(id, "scheduled").await;
+    assert_eq!(
+        jalari::admin::clear_steps(id).await.unwrap(),
+        jalari::admin::ClearStepsOutcome::Cleared(1)
+    );
+    assert_eq!(step_rows(id).await, []);
+    assert!(
+        jalari::admin::job(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .steps
+            .is_empty()
+    );
+    assert_eq!(
+        jalari::admin::clear_steps(JobId(i64::MAX)).await.unwrap(),
+        jalari::admin::ClearStepsOutcome::NotFound
+    );
+    assert_eq!(
+        jalari::admin::run_now(id).await.unwrap(),
+        jalari::admin::RunNowOutcome::Enqueued
+    );
+    wait_for_state(id, "succeeded").await;
+    let [again] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_ne!(again.nonce, row.nonce);
+    assert_eq!(seen(label), [row.nonce.clone(), again.nonce.clone()]);
+    assert_eq!(counted(label), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_step() {
     let Some(database) = Database::start("step", 16).await else {
@@ -1004,6 +1203,9 @@ async fn test_step() {
     check_a_retry_clears_the_recorded_error().await;
     check_the_finish_survives_a_dropped_connection().await;
     check_enqueue_on_success_is_refused_inside_a_step().await;
+    check_replace_discards_the_steps().await;
+    check_a_retried_failure_keeps_its_steps().await;
+    check_steps_are_listed_and_cleared().await;
     worker.stop().await;
     database.finish().await;
 }
