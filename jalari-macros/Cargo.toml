@@ -17,5 +17,8 @@ quote.workspace = true
 syn = { workspace = true, features = ["visit"] }
 toml.workspace = true
 
+[dev-dependencies]
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+
 [lints]
 workspace = true

@@ -495,3 +495,140 @@ fn test_fingerprint_still_covers_max_attempts() {
         stamped(&expanded("fingerprint = true", &declared(4)))
     );
 }
+
+const ARGUMENT_SETS: [&str; 6] = [
+    "",
+    "priority = \"high\"",
+    "aliases = [\"old\"], max_attempts = 3, timeout = 30",
+    "cron = \"0 0 3 * * *\"",
+    "cron = \"0 0 3 * * *\", timezone = \"Asia/Taipei\", missed = \"skip\"",
+    "queue = \"q\", priority = \"urgent\", cron = \"0 0 3 * * *\", fingerprint = true, \
+     checkpoints = true",
+];
+
+fn with_crate(attribute: &str, path: &str) -> String {
+    if attribute.is_empty() {
+        format!("crate = \"{path}\"")
+    } else {
+        format!("{attribute}, crate = \"{path}\"")
+    }
+}
+
+#[test]
+fn test_crate_argument_reroutes_every_jalari_path() {
+    for item in [SHORT, UNNAMED] {
+        for attribute in ARGUMENT_SETS {
+            let default = expanded(attribute, item);
+            let rerouted = expanded(&with_crate(attribute, "::facade::__jalari"), item);
+            assert!(!rerouted.contains(":: jalari ::"), "{rerouted}");
+            assert_eq!(
+                rerouted,
+                default.replace(":: jalari ::", ":: facade :: __jalari ::"),
+                "{attribute}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_crate_argument_reaches_every_site() {
+    let expansion = expanded(&with_crate(ARGUMENT_SETS[5], "::facade::__jalari"), UNNAMED);
+    for site in [
+        ":: facade :: __jalari :: __private :: inventory :: submit !",
+        ":: facade :: __jalari :: __private :: JobRegistration :: new",
+        ":: facade :: __jalari :: __private :: CronRegistration :: new",
+        ":: facade :: __jalari :: Missed :: Once",
+        "const PRIORITY : :: facade :: __jalari :: Priority = :: facade :: __jalari :: Priority \
+         :: Urgent",
+        "< SendEmail as :: facade :: __jalari :: Job > :: MAX_ATTEMPTS",
+        ":: facade :: __jalari :: __private :: aliases_are_distinct",
+    ] {
+        assert!(expansion.contains(site), "{site} in {expansion}");
+    }
+}
+
+#[test]
+fn test_crate_argument_defaults_to_jalari() {
+    for item in [SHORT, FILLED, UNNAMED] {
+        for attribute in ARGUMENT_SETS {
+            assert_eq!(
+                expanded(attribute, item),
+                expanded(&with_crate(attribute, "::jalari"), item),
+                "{attribute}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_crate_argument_takes_any_path() {
+    for path in ["facade::__jalari", "crate::reexported", "::jalari"] {
+        let expansion = expanded(&with_crate("", path), SHORT);
+        let prefix = syn::parse_str::<syn::Path>(path).unwrap();
+        let prefix = quote::quote!(#prefix).to_string();
+        assert!(
+            expansion.contains(&format!("{prefix} :: __private :: inventory :: submit !")),
+            "{path} in {expansion}"
+        );
+    }
+}
+
+fn rejected_argument(attribute: &str) -> syn::Error {
+    parse_arguments(arguments(attribute))
+        .err()
+        .expect("the arguments are rejected")
+}
+
+#[test]
+fn test_crate_argument_rejects_a_non_path_on_the_literal() {
+    for (attribute, literal) in [
+        ("crate = \"not a path!\"", "\"not a path!\""),
+        ("queue = \"q\", crate = \"\"", "\"\""),
+        ("crate = \"::facade::\"", "\"::facade::\""),
+        ("crate = \"::facade::<T>\"", "\"::facade::<T>\""),
+        (
+            "crate = \"::facade<T>::__jalari\"",
+            "\"::facade<T>::__jalari\"",
+        ),
+    ] {
+        let e = rejected_argument(attribute);
+        assert_eq!(
+            e.to_string(),
+            "expected a path such as \"::my_facade::__jalari\"",
+            "{attribute}"
+        );
+        assert_eq!(
+            e.span().source_text().as_deref(),
+            Some(literal),
+            "{attribute}"
+        );
+    }
+    let e = rejected_argument("crate = facade");
+    assert_eq!(e.to_string(), "expected a string literal");
+    assert_eq!(e.span().source_text().as_deref(), Some("facade"));
+}
+
+#[test]
+fn test_crate_argument_rejects_duplicates_on_the_literal() {
+    for (attribute, literal) in [
+        ("crate = \"::a\", crate = \"::b\"", "\"::b\""),
+        (
+            "crate = \"::a\", queue = \"q\", crate = \"::a\", priority = \"low\"",
+            "\"::a\"",
+        ),
+    ] {
+        let e = rejected_argument(attribute);
+        assert_eq!(e.to_string(), "duplicate argument", "{attribute}");
+        assert_eq!(
+            e.span().source_text().as_deref(),
+            Some(literal),
+            "{attribute}"
+        );
+        let start = e.span().start().column;
+        assert_eq!(
+            start,
+            attribute.rfind(literal).unwrap(),
+            "{attribute} points at the second literal"
+        );
+    }
+}

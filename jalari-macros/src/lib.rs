@@ -15,8 +15,8 @@ use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitBool, LitInt, LitStr, MetaNameValue, Token, Type,
-    parse_macro_input, parse_quote, parse_quote_spanned,
+    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitBool, LitInt, LitStr, MetaNameValue, Path, Token,
+    Type, parse_macro_input, parse_quote, parse_quote_spanned,
 };
 
 /// Registers an `impl Job for T` so workers can run `T`, optionally on a cron schedule.
@@ -43,6 +43,9 @@ use syn::{
 /// * `fingerprint` - `true` turns the code fingerprint on for this job; `false` when omitted
 /// * `checkpoints` - `true` declares that the job reaches checkpoints regularly; an abort at
 ///   `stop_timeout` or `shutdown_timeout` is then logged as an error. `false` when omitted
+/// * `crate` - Path, as a string literal, at which the generated code reaches jalari, such as
+///   `"::my_facade::__jalari"` for a crate that re-exports jalari as `__jalari`; `"::jalari"`
+///   when omitted. Lets a crate that depends only on the re-exporting crate define jobs
 ///
 /// `name`, `max_attempts`, `timeout`, `priority` and `aliases` are an alternative to declaring
 /// the constant in the impl. Setting one both ways is a compile error.
@@ -72,9 +75,9 @@ use syn::{
 /// change it, and neither does the directory the sources are in.
 ///
 /// `NAME`, `ALIASES`, `PRIORITY` and `RETRY_POLICY`, and the `name`, `aliases`, `priority`,
-/// `checkpoints` and `missed` arguments, are left out, in either form. Renaming a job with its old name in
-/// `aliases`, or changing its priority or retry policy, therefore leaves waiting jobs runnable
-/// by the new build. `MAX_ATTEMPTS` and `TIMEOUT` are covered in either form.
+/// `checkpoints`, `missed` and `crate` arguments, are left out, in either form. Renaming a job
+/// with its old name in `aliases`, changing its priority or retry policy, or reaching jalari
+/// through another path, therefore leaves waiting jobs runnable by the new build. `MAX_ATTEMPTS` and `TIMEOUT` are covered in either form.
 ///
 /// Every enqueue stores the fingerprint with the job, and a worker takes a job only when the
 /// stored fingerprint is empty or equals its own build's. A job enqueued by another build of
@@ -141,6 +144,7 @@ struct JobArguments {
     queue: Option<LitStr>,
     fingerprint: Option<LitBool>,
     checkpoints: Option<LitBool>,
+    jalari: Path,
     constants: Vec<Constant>,
 }
 
@@ -151,7 +155,7 @@ struct Constant {
     item: ImplItem,
 }
 
-type ConstantItem = fn(&MetaNameValue, Span2) -> syn::Result<ImplItem>;
+type ConstantItem = fn(&MetaNameValue, Span2, &Path) -> syn::Result<ImplItem>;
 
 const CONSTANTS: [(&str, &str, ConstantItem); 5] = [
     ("name", "NAME", name_item),
@@ -176,6 +180,7 @@ fn expand(
     local_file: Option<PathBuf>,
 ) -> syn::Result<TokenStream2> {
     let arguments = parse_arguments(arguments)?;
+    let jalari = &arguments.jalari;
 
     let is_job_impl = item_impl
         .trait_
@@ -224,10 +229,10 @@ fn expand(
                 .unwrap_or_else(|| Ident::new("Once", Span2::call_site()));
             quote! {
                 ::core::option::Option::Some(
-                    ::jalari::__private::CronRegistration::new::<#job_type>(
+                    #jalari::__private::CronRegistration::new::<#job_type>(
                         #expression,
                         #timezone,
-                        ::jalari::Missed::#missed,
+                        #jalari::Missed::#missed,
                     )
                 )
             }
@@ -235,13 +240,13 @@ fn expand(
         None => quote!(::core::option::Option::None),
     };
 
-    let checks = constant_checks(&item_impl);
+    let checks = constant_checks(&item_impl, jalari);
 
     Ok(quote! {
         #item_impl
 
-        ::jalari::__private::inventory::submit! {
-            ::jalari::__private::JobRegistration::new::<#job_type>(
+        #jalari::__private::inventory::submit! {
+            #jalari::__private::JobRegistration::new::<#job_type>(
                 #queue, #cron, #fingerprint, #checkpoints
             )
         }
@@ -302,7 +307,7 @@ fn unnamed(self_ty: &Type) -> syn::Error {
     )
 }
 
-fn constant_checks(item_impl: &ItemImpl) -> TokenStream2 {
+fn constant_checks(item_impl: &ItemImpl, jalari: &Path) -> TokenStream2 {
     let job_type = &item_impl.self_ty;
     let label = quote!(#job_type).to_string();
     let span_of = |name: &str| {
@@ -315,7 +320,7 @@ fn constant_checks(item_impl: &ItemImpl) -> TokenStream2 {
             })
             .unwrap_or_else(|| job_type.span())
     };
-    let job = quote!(<#job_type as ::jalari::Job>);
+    let job = quote!(<#job_type as #jalari::Job>);
 
     let message = format!("{label}: Job::MAX_ATTEMPTS must be at least 1");
     let max_attempts = quote_spanned! {span_of("MAX_ATTEMPTS")=>
@@ -344,7 +349,7 @@ fn constant_checks(item_impl: &ItemImpl) -> TokenStream2 {
         format!("{label}: Job::ALIASES must not contain an empty name, NAME or a repeated name");
     let aliases = quote_spanned! {span_of("ALIASES")=>
         ::core::assert!(
-            ::jalari::__private::aliases_are_distinct(#job::NAME, #job::ALIASES),
+            #jalari::__private::aliases_are_distinct(#job::NAME, #job::ALIASES),
             #message
         );
     };
@@ -383,6 +388,7 @@ fn fill_in_context(item_impl: &mut ItemImpl) {
 }
 
 fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Result<JobArguments> {
+    let jalari = jalari_path(&arguments)?;
     let mut parsed = JobArguments {
         cron: None,
         timezone: None,
@@ -390,9 +396,13 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         queue: None,
         fingerprint: None,
         checkpoints: None,
+        jalari,
         constants: Vec::new(),
     };
     for argument in arguments {
+        if argument.path.is_ident("crate") {
+            continue;
+        }
         let span = argument.path.span();
         if let Some(&(key, name, item)) = CONSTANTS
             .iter()
@@ -409,7 +419,7 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
                 argument: key,
                 name,
                 span,
-                item: item(&argument, span)?,
+                item: item(&argument, span, &parsed.jalari)?,
             });
             continue;
         }
@@ -442,7 +452,7 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
             return Err(syn::Error::new_spanned(
                 &argument.path,
                 "expected `name`, `queue`, `max_attempts`, `timeout`, `priority`, `aliases`, \
-                 `cron`, `timezone`, `missed`, `fingerprint` or `checkpoints`",
+                 `cron`, `timezone`, `missed`, `fingerprint`, `checkpoints` or `crate`",
             ));
         };
         if slot.is_some() {
@@ -462,17 +472,46 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
     Ok(parsed)
 }
 
-fn name_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+fn jalari_path(arguments: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<Path> {
+    let mut jalari = None;
+    for argument in arguments
+        .iter()
+        .filter(|argument| argument.path.is_ident("crate"))
+    {
+        let literal = string_value(argument)?;
+        if jalari.is_some() {
+            return Err(syn::Error::new_spanned(&literal, "duplicate argument"));
+        }
+        jalari = Some(path_value(&literal)?);
+    }
+    Ok(jalari.unwrap_or_else(|| parse_quote!(::jalari)))
+}
+
+fn path_value(literal: &LitStr) -> syn::Result<Path> {
+    literal
+        .parse::<Path>()
+        .ok()
+        .filter(|path| {
+            path.segments
+                .iter()
+                .all(|segment| segment.arguments.is_none())
+        })
+        .ok_or_else(|| {
+            syn::Error::new_spanned(literal, "expected a path such as \"::my_facade::__jalari\"")
+        })
+}
+
+fn name_item(argument: &MetaNameValue, span: Span2, _: &Path) -> syn::Result<ImplItem> {
     let name = string_value(argument)?;
     Ok(parse_quote_spanned! {span=> const NAME: &'static str = #name; })
 }
 
-fn max_attempts_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+fn max_attempts_item(argument: &MetaNameValue, span: Span2, _: &Path) -> syn::Result<ImplItem> {
     let max_attempts = LitInt::new(&integer_value::<i32>(argument)?.to_string(), span);
     Ok(parse_quote_spanned! {span=> const MAX_ATTEMPTS: i32 = #max_attempts; })
 }
 
-fn timeout_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+fn timeout_item(argument: &MetaNameValue, span: Span2, _: &Path) -> syn::Result<ImplItem> {
     let seconds = LitInt::new(&integer_value::<u64>(argument)?.to_string(), span);
     Ok(parse_quote_spanned! {span=>
         const TIMEOUT: ::core::option::Option<::core::time::Duration> =
@@ -480,7 +519,7 @@ fn timeout_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> 
     })
 }
 
-fn priority_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+fn priority_item(argument: &MetaNameValue, span: Span2, jalari: &Path) -> syn::Result<ImplItem> {
     let level = string_value(argument)?;
     let variant = PRIORITIES
         .iter()
@@ -493,7 +532,7 @@ fn priority_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem>
             )
         })?;
     Ok(parse_quote_spanned! {span=>
-        const PRIORITY: ::jalari::Priority = ::jalari::Priority::#variant;
+        const PRIORITY: #jalari::Priority = #jalari::Priority::#variant;
     })
 }
 
@@ -506,7 +545,7 @@ fn missed_variant(argument: &MetaNameValue, span: Span2) -> syn::Result<Ident> {
         .ok_or_else(|| syn::Error::new_spanned(&policy, "expected \"once\" or \"skip\""))
 }
 
-fn aliases_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {
+fn aliases_item(argument: &MetaNameValue, span: Span2, _: &Path) -> syn::Result<ImplItem> {
     let Expr::Array(array) = &argument.value else {
         return Err(syn::Error::new_spanned(
             &argument.value,
