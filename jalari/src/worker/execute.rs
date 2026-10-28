@@ -120,7 +120,7 @@ impl Shared {
                         window: Some(self.settings.shutdown_timeout),
                     };
                     let ending = {
-                        let run = claimed.join(&mut attempt);
+                        let run = claimed.join(&mut attempt, &control);
                         tokio::pin!(run);
                         let mut deadline = None;
                         loop {
@@ -408,7 +408,7 @@ impl Claimed {
         AbortOnDrop(tokio::spawn(attempt))
     }
 
-    async fn join(&self, attempt: &mut AbortOnDrop) -> JobResult {
+    async fn join(&self, attempt: &mut AbortOnDrop, control: &RunControl) -> JobResult {
         let joined = match self.timeout_ms {
             Some(timeout_ms) => {
                 let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
@@ -416,6 +416,7 @@ impl Claimed {
                     Ok(joined) => joined,
                     Err(_) => {
                         attempt.abort_and_wait().await;
+                        control.shutdown().cancel();
                         return Err(JobError::new(format!("timed out after {timeout:?}")));
                     }
                 }

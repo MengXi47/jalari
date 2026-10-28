@@ -835,8 +835,9 @@ are ready at once, either may win, so the unit of work must be safe to run again
 `jalari::current_job()` returns the running attempt. Its id stays the same across retries, so
 it works as an idempotency key. `current_job()` and `interrupted()` only work in the job's own
 task. A task the job spawns gets the same signal from `run.interrupted()`, where `run` is the
-`current_job()` value taken before the spawn. `run.cancellation()` is the shutdown signal alone
-as a `CancellationToken`, for code that takes one.
+`current_job()` value taken before the spawn; it also completes once the attempt timed out.
+`run.cancellation()` is the shutdown signal as a `CancellationToken`, for code that takes one;
+it is also cancelled once the attempt timed out.
 
 ### Crashes and lost connections
 
@@ -1105,9 +1106,10 @@ A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snoo
   `jalari::current_job()` read a task-local that `spawn_blocking` does not carry, so they do
   not work there. Take the run handle in the job's own task, move it in, and poll
   `is_interrupted()` between pieces of work. It turns `true` when `interrupted()` would
-  complete. Then return the error of `run.interrupted()`, which is ready at once, so a stop, a
+  complete, and also once the attempt has timed out and been aborted. Then return the error of `run.interrupted()`, which is ready at once, so a stop, a
   cancel or a shutdown settles the job as it does for async code. In jalari's tests such a loop
-  saw a stop about 1 second after the request.
+  saw a stop about 1 second after the request, and a 1 second timeout 1.0 seconds after it
+  started.
 
   ```rust
   let run = jalari::current_job().expect("inside a job");

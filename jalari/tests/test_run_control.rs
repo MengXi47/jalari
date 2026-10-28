@@ -275,6 +275,20 @@ impl Job for BlockingPoller {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct TimedPoller {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control", timeout = 1, max_attempts = 1)]
+impl Job for TimedPoller {
+    const NAME: &'static str = "run_control_timed_poller";
+
+    async fn run(self) -> JobResult {
+        run_blocking_poller(self.label).await
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
 struct Shape {
     state: String,
@@ -362,6 +376,7 @@ async fn test_run_control() {
     check_close_waits_for_the_aborted_body(&database).await;
     check_close_waits_at_most_a_second_for_a_blocked_body(&database).await;
     check_blocking_code_sees_a_stop(&database).await;
+    check_blocking_code_sees_a_timeout(&database).await;
     database.finish().await;
 }
 
@@ -625,6 +640,46 @@ async fn check_blocking_code_sees_a_stop(database: &Database) {
     assert_eq!(
         history(database, id).await,
         [("stopped".to_owned(), Some(STOP.to_owned()))]
+    );
+    worker.stop().await;
+}
+
+async fn check_blocking_code_sees_a_timeout(database: &Database) {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+    let worker = spawn_worker(PATIENT, PATIENT).await;
+    let label = "blocking_timeout";
+    let id = start(
+        &TimedPoller {
+            label: label.to_owned(),
+        },
+        label,
+    )
+    .await;
+    wait_until(
+        "the blocking loop to see the timeout",
+        TIMEOUT + ABORT_WAIT + CONTROL_LATENCY,
+        || async { LEDGER.count(label, "noticed") == 1 },
+    )
+    .await;
+    let events = LEDGER.events(label);
+    let at = |name: &str| {
+        events
+            .iter()
+            .find(|(event, _)| *event == name)
+            .map(|(_, at)| *at)
+            .unwrap()
+    };
+    let noticed = at("noticed").saturating_duration_since(at("start"));
+    eprintln!("blocking_timeout: the blocking loop saw the timeout {noticed:?} after it started");
+    assert!(noticed >= TIMEOUT, "{noticed:?}");
+    wait_for_state(database, id, "failed", CONTROL_LATENCY).await;
+    assert_eq!(LEDGER.count(label, "interrupted at start"), 0);
+    assert_eq!(
+        history(database, id).await,
+        [(
+            "failed".to_owned(),
+            Some(format!("timed out after {TIMEOUT:?}"))
+        )]
     );
     worker.stop().await;
 }

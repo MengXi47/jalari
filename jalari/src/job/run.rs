@@ -134,15 +134,19 @@ impl JobRun {
         self.root_id
     }
 
-    /// Cancelled when the worker starts shutting down; see [`shutdown_requested`].
+    /// Cancelled when the worker starts shutting down, see [`shutdown_requested`], and after
+    /// this attempt timed out and was aborted.
     ///
-    /// It covers shutdown only. [`JobRun::interrupted`] also completes on a stop, a cancel or a
-    /// lost job, with the error to return.
+    /// It covers shutdown and timeouts only. [`JobRun::interrupted`] also completes on a stop, a
+    /// cancel or a lost job, with the error to return.
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
     }
 
     /// Same as [`interrupted`] for this attempt; usable from tasks the job spawns.
+    ///
+    /// It also completes after the attempt timed out and was aborted, so a spawned task learns
+    /// that the job it serves has gone.
     ///
     /// # Examples
     ///
@@ -169,8 +173,9 @@ impl JobRun {
     /// [`JobRun::interrupted`].
     ///
     /// It turns `true` at the same moment `interrupted` completes: on a [`stop`](crate::stop) or
-    /// a [`cancel`](crate::cancel), when the worker starts shutting down, and when the worker has
-    /// lost the job. It never turns back to `false`. Poll it from blocking code, which cannot
+    /// a [`cancel`](crate::cancel), when the worker starts shutting down, when the worker has
+    /// lost the job, and once the attempt has timed out and been aborted. It never turns back
+    /// to `false`. Poll it from blocking code, which cannot
     /// await a future. The free functions [`current_job`] and [`interrupted`] read a task-local
     /// that does not exist inside `spawn_blocking`, so take the handle in the job's own task and
     /// move it in. Once the loop has noticed, return the error from `interrupted`, which is
