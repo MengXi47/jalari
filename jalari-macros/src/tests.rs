@@ -679,3 +679,25 @@ fn test_crate_argument_rejects_duplicates_on_the_literal() {
         );
     }
 }
+
+#[test]
+fn test_queue_argument_rejects_an_empty_name_on_the_literal() {
+    for attribute in [
+        "queue = \"\"",
+        "name = \"j\", queue = \"\", max_attempts = 3",
+    ] {
+        let e = rejected_argument(attribute);
+        assert_eq!(e.to_string(), "queue must not be empty", "{attribute}");
+        assert_eq!(
+            e.span().source_text().as_deref(),
+            Some("\"\""),
+            "{attribute}"
+        );
+    }
+    for attribute in ["queue = \"default\"", "queue = \" \""] {
+        assert!(
+            parse_arguments(arguments(attribute)).is_ok(),
+            "{attribute} is accepted"
+        );
+    }
+}

@@ -450,12 +450,12 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
             parsed.missed = Some(missed_variant(&argument, span)?);
             continue;
         }
-        let slot = if argument.path.is_ident("cron") {
-            &mut parsed.cron
+        let (slot, check): (_, StringCheck) = if argument.path.is_ident("cron") {
+            (&mut parsed.cron, |_| Ok(()))
         } else if argument.path.is_ident("timezone") {
-            &mut parsed.timezone
+            (&mut parsed.timezone, |_| Ok(()))
         } else if argument.path.is_ident("queue") {
-            &mut parsed.queue
+            (&mut parsed.queue, check_queue)
         } else {
             return Err(syn::Error::new_spanned(
                 &argument.path,
@@ -466,7 +466,9 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         if slot.is_some() {
             return Err(syn::Error::new(span, "duplicate argument"));
         }
-        *slot = Some(string_value(&argument)?);
+        let value = string_value(&argument)?;
+        check(&value)?;
+        *slot = Some(value);
     }
     if let (None, Some(timezone)) = (&parsed.cron, &parsed.timezone) {
         return Err(syn::Error::new_spanned(
@@ -478,6 +480,15 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
         return Err(syn::Error::new(missed.span(), "`missed` requires `cron`"));
     }
     Ok(parsed)
+}
+
+type StringCheck = fn(&LitStr) -> syn::Result<()>;
+
+fn check_queue(queue: &LitStr) -> syn::Result<()> {
+    if queue.value().is_empty() {
+        return Err(syn::Error::new_spanned(queue, "queue must not be empty"));
+    }
+    Ok(())
 }
 
 fn jalari_path(arguments: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<Path> {
