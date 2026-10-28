@@ -554,6 +554,7 @@ async fn test_prefixed_schema_places_tables_in_existing_schema() {
             "jalari_job",
             "jalari_job_control",
             "jalari_job_history",
+            "jalari_job_step",
             "jalari_queue_pause",
             "jalari_recurring",
             "jalari_schema_version",
@@ -608,7 +609,6 @@ async fn test_version_9_adds_the_option_columns_and_the_pause_table() {
         "queue_pause.paused_at:timestamp with time zone:NO:now()",
     ];
 
-    assert_eq!(SCHEMA_VERSION, 9);
     jalari::migrate_to(&pool, &schema, 8).await.unwrap();
     let before = snapshot(&pool, &name).await;
     assert!(
@@ -616,7 +616,7 @@ async fn test_version_9_adds_the_option_columns_and_the_pause_table() {
             .iter()
             .all(|column| !before.iter().any(|row| row == column))
     );
-    jalari::migrate(&pool, &schema).await.unwrap();
+    jalari::migrate_to(&pool, &schema, 9).await.unwrap();
     let after = snapshot(&pool, &name).await;
     for column in columns {
         assert!(after.iter().any(|row| row == column), "{column}");
@@ -826,5 +826,59 @@ async fn test_slot_shape_is_enforced() {
             .unwrap_or_else(|e| panic!("{statement}: {e}"));
     }
 
+    drop_schema(&pool, &name).await;
+}
+
+#[tokio::test]
+async fn test_version_10_adds_the_step_table_the_copy_number_and_the_missed_policy() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let name = unique_schema_name();
+    let schema = Schema::named(&name).unwrap();
+    let columns = [
+        "job_step.job_id:bigint:NO:",
+        "job_step.key:text:NO:",
+        "job_step.state:text:NO:",
+        "job_step.nonce:uuid:NO:gen_random_uuid()",
+        "job_step.starts:integer:NO:1",
+        "job_step.attempt:integer:NO:",
+        "job_step.lease:bigint:NO:",
+        "job_step.output:jsonb:YES:",
+        "job_step.error:text:YES:",
+        "job_step.started_at:timestamp with time zone:NO:now()",
+        "job_step.finished_at:timestamp with time zone:YES:",
+        "job_control.progress_seq:bigint:NO:0",
+        "recurring.missed:text:NO:'once'::text",
+    ];
+
+    assert_eq!(SCHEMA_VERSION, 10);
+    jalari::migrate_to(&pool, &schema, 9).await.unwrap();
+    let before = snapshot(&pool, &name).await;
+    assert!(
+        columns
+            .iter()
+            .all(|column| !before.iter().any(|row| row == column))
+    );
+    jalari::migrate(&pool, &schema).await.unwrap();
+    let after = snapshot(&pool, &name).await;
+    for column in columns {
+        assert!(after.iter().any(|row| row == column), "{column}");
+    }
+    for constraint in [
+        "job_step.job_step_state_check",
+        "job_step.job_step_finished_check",
+        "job_step.job_step_key_check",
+        "recurring.recurring_missed_check",
+    ] {
+        assert!(
+            after
+                .iter()
+                .any(|row| row.starts_with(&format!("{constraint}:"))),
+            "{constraint}"
+        );
+    }
+    jalari::migrate(&pool, &schema).await.unwrap();
+    assert_eq!(snapshot(&pool, &name).await, after);
     drop_schema(&pool, &name).await;
 }

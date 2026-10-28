@@ -9,10 +9,11 @@ pub const SCHEMA_VERSION: i32 = TEMPLATES[TEMPLATES.len() - 1].0;
 
 const LOCK_MODEL_VERSION: i32 = 8;
 
-const TABLES: [&str; 8] = [
+const TABLES: [&str; 9] = [
     "job",
     "job_history",
     "job_control",
+    "job_step",
     "recurring",
     "worker",
     "config",
