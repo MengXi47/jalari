@@ -653,9 +653,49 @@ jalari::recurring::add_or_update("digest:sales:trial", schedule, &digest).await?
   (`15W`).
 - Evaluated in the given IANA time zone, `UTC` by default. A repeated local hour during a
   daylight saving change fires once; a skipped one fires at the first valid time after the gap.
-- After an outage, each schedule enqueues one catch-up run, not every missed one.
+- After an outage, each schedule enqueues one catch-up run, not every missed one, unless its
+  policy is to skip [missed runs](#missed-runs).
 - Each scheduled time is enqueued at most once, however many workers run the scheduler.
 - While a schedule's previous job is still waiting or running, no second one is added.
+
+### Missed runs
+
+A run is missed when the scheduler finds it more than a minute overdue, after an outage or
+while no worker ran the scheduler. The schedule's policy decides what happens to it:
+
+| Policy | The missed run | The next run |
+|---|---|---|
+| `Missed::Once`, the default | One catch-up run is enqueued for all the missed ones | The first one after now |
+| `Missed::Skip` | Nothing is enqueued; a warning names the schedule and how late the run was | The first one after now |
+
+```rust
+#[derive(Serialize, Deserialize, Default)]
+struct SampleMetrics;
+
+#[jalari::job(name = "sample_metrics", cron = "0 */5 * * * *", missed = "skip")]
+impl Job for SampleMetrics {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
+let every_five_minutes = jalari::Schedule::from(jalari::Cron::new("0 */5 * * * *")?)
+    .missed(jalari::recurring::Missed::Skip);
+jalari::recurring::add_or_update("metrics:eu", every_five_minutes, &sample).await?;
+```
+
+- A run less than 60 seconds late always fires under both policies, even on a 10-second
+  interval, so ordinary scheduler lateness never skips a run. The 60 seconds are fixed.
+- A skipped run does not count toward `max_runs` and leaves `last_run_at` as it was. A
+  schedule whose `until` has passed finishes, as it would after a fired run.
+- In the attribute, `missed` requires `cron`, and a value other than `"once"` or `"skip"` is a
+  compile error. It is left out of the [code fingerprint](#code-fingerprints).
+- A declared schedule takes its policy at every worker start, as it takes its priority. A
+  runtime schedule takes it from the `Schedule` given to `add_or_update` or
+  `update_schedule`, so a plain `Cron` or `Interval` sets it back to `Once`. Changing only the
+  policy keeps the run count and the next run. `RecurringInfo::missed` shows it.
+
+The `missed_runs` example stops the scheduler past the grace and shows both policies.
 
 ## Running workers
 
