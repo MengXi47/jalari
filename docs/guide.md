@@ -1244,7 +1244,11 @@ so every connection returns to the pool with the values it had.
   included, and none of them waits for long on its own. Jobs that share a `queue_key` are
   skipped while the key is taken, not waited for.
 - The lifeline is a connection the worker opens next to the pool with the pool's connect
-  options; the pool's `after_connect` does not run on it. On that session alone the worker sets
+  options; the pool's `after_connect` does not run on it, so a `SET ROLE`, `search_path` or
+  other setting made there does not apply. The lifeline only reads and writes jalari's tables,
+  always with the schema name, so the role in the connect options needs the privileges on them
+  itself; when it lacks them, heartbeats are refused and the worker claims nothing until it gives
+  up after 30 seconds. On that session alone the worker sets
   `idle_session_timeout` and `tcp_user_timeout` to 11 seconds (the latter only where the server
   supports it), `statement_timeout` to 1.5 seconds and, on PostgreSQL 17 and later,
   `transaction_timeout` to 0.

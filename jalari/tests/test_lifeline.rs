@@ -475,7 +475,7 @@ async fn check_blocked_runtime_keeps_the_lifeline(database: &Database) {
 }
 
 async fn check_refused_heartbeats_keep_the_jobs(database: &Database) {
-    const STALL: Duration = Duration::from_secs(12);
+    const STALL: Duration = Duration::from_secs(15);
     const PROBE_AFTER: Duration = Duration::from_millis(3500);
     let worker = spawn_worker().await;
     common::wait_until(
@@ -488,7 +488,7 @@ async fn check_refused_heartbeats_keep_the_jobs(database: &Database) {
     let worker_id = registered[0].1.clone();
     let id = jalari::enqueue(&Ticker {
         label: "stall".to_owned(),
-        millis: 15_000,
+        millis: 18_000,
     })
     .await
     .unwrap()
@@ -537,7 +537,7 @@ async fn check_refused_heartbeats_keep_the_jobs(database: &Database) {
         probe_started.saturating_duration_since(released)
     );
     assert!(
-        heartbeat_age.is_some_and(|age| age >= 11.0),
+        heartbeat_age.is_some_and(|age| age >= 14.0),
         "the worker row is gone or was beaten during the stall: {heartbeat_age:?}"
     );
     ran_once(database, id, "stall").await;

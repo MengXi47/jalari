@@ -42,6 +42,7 @@ const _: () = assert!(
     LIFELINE_IDLE_TIMEOUT.as_millis() >= FREEZE_TOLERANCE.as_millis() + PING_INTERVAL.as_millis()
 );
 const _: () = assert!(LIFELINE_IDLE_TIMEOUT.as_millis() > TAKEOVER_GRACE.as_millis());
+const _: () = assert!(REFUSAL_LIMIT.as_millis() > LIFELINE_IDLE_TIMEOUT.as_millis());
 
 pub(super) struct WorkerRegistration {
     hostname: String,
