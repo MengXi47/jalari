@@ -620,6 +620,23 @@ fn test_missed_keeps_fingerprint() {
 }
 
 #[test]
+fn test_crate_keeps_fingerprint() {
+    let base = source("", "");
+    for path in ["::jalari", "::facade::__jalari", "crate::reexported"] {
+        let declared = with_attribute(&base, &format!("crate = \"{path}\""));
+        assert_eq!(lib(&base), lib(&declared), "{path}");
+    }
+    let queued = with_attribute(&base, "queue = \"q\"");
+    assert_eq!(
+        lib(&queued),
+        lib(&with_attribute(
+            &base,
+            "crate = \"::facade::__jalari\", queue = \"q\""
+        ))
+    );
+}
+
+#[test]
 fn test_retry_policy_keeps_fingerprint() {
     let policy = |attempts: &str| {
         with_constant(
