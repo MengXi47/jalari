@@ -2,6 +2,7 @@ mod checkpoint;
 pub(crate) mod context;
 mod definition;
 mod error;
+mod fence;
 pub(crate) mod fingerprint;
 mod id;
 mod priority;

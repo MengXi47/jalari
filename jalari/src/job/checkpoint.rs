@@ -10,9 +10,11 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use super::fence::{Fenced, write_progress};
 use super::run::current_job;
 use crate::enqueue::EnqueueRequest;
-use crate::{JobError, JobResult};
+use crate::init::config;
+use crate::{Error, JobError, JobResult};
 
 const KEEP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -251,6 +253,27 @@ impl RunControl {
         slot.dirty = true;
     }
 
+    fn keep_now(&self, value: Value) -> i64 {
+        let mut slot = self.slot.lock().unwrap();
+        let seq = slot.next_seq();
+        slot.latest = Some(ProgressCopy { value, seq });
+        slot.kept_at = Some(Instant::now());
+        slot.dirty = true;
+        seq
+    }
+
+    fn mark_clean(&self, seq: i64) {
+        let mut slot = self.slot.lock().unwrap();
+        if slot.latest.as_ref().is_some_and(|latest| latest.seq == seq) {
+            slot.dirty = false;
+        }
+    }
+
+    pub(crate) fn lose(&self) -> JobError {
+        self.lost.cancel();
+        JobError::halted(Halt::Lost)
+    }
+
     pub(crate) fn latest(&self) -> Option<ProgressCopy> {
         self.slot.lock().unwrap().latest.clone()
     }
@@ -365,6 +388,82 @@ impl<P: Serialize> Checkpoint<P> {
             control.keep(serde_json::to_value(progress).map_err(JobError::permanent)?);
         }
         stop_point(halt).await
+    }
+
+    /// Writes `progress` to the database and returns once it is stored.
+    ///
+    /// Use it after work whose effects must not be repeated if the worker dies right after, such
+    /// as a page of rows sent to another system. [`save`](Self::save) keeps a copy in memory and
+    /// costs nothing; `save_now` costs one short transaction. The write is fenced by the run's
+    /// lease, so a run that another worker has taken over cannot store anything: the call then
+    /// returns the same error as [`checkpoint`](crate::checkpoint) for a lost job, and the job is
+    /// aborted at its next `.await` even when that error is ignored. A newer copy that is already
+    /// stored is kept. Like `save`, it is a stop
+    /// point: when the job was asked to stop, it returns that error and the copy is saved
+    /// together with the stopped state. Outside a job it does nothing and returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The job was asked to stop or to cancel, or its worker is shutting down
+    /// - Another worker has taken the job over (the job is aborted)
+    /// - The job's control row is missing, because the pool given to [`init`](crate::init)
+    ///   points at another database or schema than the worker's (a [`JobError::permanent`])
+    /// - `progress` cannot be serialized to JSON (a [`JobError::permanent`])
+    /// - The database could not be reached or refused the write; the progress may have been
+    ///   stored all the same, and the worker writes the copy again later
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize, Default)]
+    /// struct Cursor {
+    ///     next_page: u32,
+    /// }
+    ///
+    /// # async fn send_page(_page: u32) -> Result<bool, std::io::Error> { Ok(false) }
+    /// async fn export_pages() -> jalari::JobResult {
+    ///     let (saved, checkpoint) = jalari::resume::<Cursor>()?;
+    ///     let mut cursor = saved.unwrap_or_default();
+    ///     while send_page(cursor.next_page).await? {
+    ///         cursor.next_page += 1;
+    ///         checkpoint.save_now(&cursor).await?;
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn save_now(&self, progress: &P) -> JobResult {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        let value = serde_json::to_value(progress).map_err(JobError::permanent)?;
+        let halt = control.reach();
+        let seq = control.keep_now(value.clone());
+        if let Some(halt) = halt {
+            return Err(JobError::halted(halt));
+        }
+        let config = config().map_err(JobError::permanent)?;
+        let written =
+            write_progress(&config.pool.pool(), &config.schema, control, &value, seq).await;
+        match written {
+            Ok(Fenced::Written) => {
+                control.mark_clean(seq);
+                Ok(())
+            }
+            Ok(Fenced::Lost) => Err(control.lose()),
+            Ok(Fenced::Missing) => Err(JobError::permanent(std::io::Error::other(format!(
+                "job {} has no control row in schema {}; the pool given to jalari::init must \
+                 reach the database and schema the worker uses",
+                control.job_id(),
+                config.schema.name()
+            )))),
+            Err(e) => Err(JobError::new(format!(
+                "could not save the progress, it may have been saved: {}",
+                Error::from(e)
+            ))),
+        }
     }
 }
 
