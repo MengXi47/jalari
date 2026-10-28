@@ -11,6 +11,7 @@ facade = { path = "../facade" }
 serde.workspace = true
 
 [dev-dependencies]
+jalari = { path = "../../../jalari" }
 tokio.workspace = true
 
 [lints]

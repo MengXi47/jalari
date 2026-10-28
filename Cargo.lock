@@ -487,6 +487,7 @@ name = "facade-consumer"
 version = "0.0.0"
 dependencies = [
  "facade",
+ "jalari",
  "serde",
  "tokio",
 ]
