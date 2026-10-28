@@ -7,6 +7,7 @@ use chrono::{
 };
 use chrono_tz::Tz;
 
+use super::Missed;
 use crate::{Cron, Error, ErrorKind, Result};
 
 /// Unit of an [`Interval`].
@@ -284,6 +285,7 @@ pub struct Schedule {
     rule: Rule,
     until: Option<DateTime<Utc>>,
     max_runs: Option<u32>,
+    missed: Missed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +322,28 @@ impl Schedule {
         }
         self.max_runs = Some(max_runs);
         Ok(self)
+    }
+
+    /// Sets what the scheduler does with a run it finds more than a minute overdue;
+    /// [`Missed::Once`] unless called.
+    ///
+    /// Changing only this keeps the schedule's run count, next run and finished state.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let hourly = jalari::Schedule::from(jalari::Cron::new("0 0 * * * *")?)
+    ///     .missed(jalari::recurring::Missed::Skip);
+    /// assert_ne!(hourly, jalari::Schedule::from(jalari::Cron::new("0 0 * * * *")?));
+    /// # Ok::<(), jalari::Error>(())
+    /// ```
+    pub fn missed(mut self, missed: Missed) -> Self {
+        self.missed = missed;
+        self
+    }
+
+    pub(crate) fn missed_policy(&self) -> Missed {
+        self.missed
     }
 
     /// The cron expression, if the schedule is one.
@@ -398,6 +422,7 @@ impl From<Cron> for Schedule {
             rule: Rule::Cron(Box::new(cron)),
             until: None,
             max_runs: None,
+            missed: Missed::Once,
         }
     }
 }
@@ -408,6 +433,7 @@ impl From<Interval> for Schedule {
             rule: Rule::Interval(interval),
             until: None,
             max_runs: None,
+            missed: Missed::Once,
         }
     }
 }

@@ -36,9 +36,10 @@ struct InfoRow {
 /// never repeats a run that already fired. An unchanged schedule keeps its run count, its next
 /// run and its finished state, so calling this at every start of your application is safe. A
 /// schedule whose cron or interval changed starts counting again from zero; one where only
-/// `until` or `max_runs` changed keeps its count and is finished or revived accordingly. Runs
-/// are enqueued by workers with the scheduler enabled; they all wake up as soon as this
-/// commits.
+/// `until` or `max_runs` changed keeps its count and is finished or revived accordingly, and one
+/// where only [`missed`](Schedule::missed) changed keeps its count, next run and finished
+/// state. Runs are enqueued by workers with the scheduler enabled; they all wake up as soon as
+/// this commits.
 ///
 /// # Errors
 ///
@@ -105,13 +106,14 @@ pub async fn add_or_update<T: Job>(
         "INSERT INTO {recurring} AS existing (name, {SCHEDULE_COLUMNS}, task, payload, queue,
              max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at, context,
              priority)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, $14, $15, $16,
-             $17, $18)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, FALSE, $15, $16,
+             $17, $18, $19)
          ON CONFLICT (name) DO UPDATE SET
              cron = EXCLUDED.cron, timezone = EXCLUDED.timezone,
              interval_count = EXCLUDED.interval_count, interval_unit = EXCLUDED.interval_unit,
              anchor = EXCLUDED.anchor, until_at = EXCLUDED.until_at,
-             max_runs = EXCLUDED.max_runs, task = EXCLUDED.task, payload = EXCLUDED.payload,
+             max_runs = EXCLUDED.max_runs, missed = EXCLUDED.missed, task = EXCLUDED.task,
+             payload = EXCLUDED.payload,
              queue = EXCLUDED.queue, max_attempts = EXCLUDED.max_attempts,
              timeout_ms = EXCLUDED.timeout_ms, next_run_at = EXCLUDED.next_run_at,
              run_count = EXCLUDED.run_count, finished_at = EXCLUDED.finished_at,
@@ -128,6 +130,7 @@ pub async fn add_or_update<T: Job>(
     .bind(stored.anchor)
     .bind(stored.until_at)
     .bind(stored.max_runs)
+    .bind(&stored.missed)
     .bind(T::NAME)
     .bind(payload)
     .bind(default_queue(T::NAME))
@@ -153,7 +156,9 @@ pub async fn add_or_update<T: Job>(
 /// The next run is recomputed from the new schedule and is always later than the last run. A
 /// new cron or interval starts counting its runs again from zero; new end conditions alone
 /// keep the count and finish or revive the schedule accordingly; an unchanged schedule is
-/// left as it is.
+/// left as it is. The schedule's [`missed`](Schedule::missed) policy is stored too, so a plain
+/// cron or interval sets it back to [`Missed::Once`](crate::recurring::Missed::Once); changing
+/// only the policy keeps the count and the next run.
 ///
 /// # Errors
 ///
@@ -191,8 +196,8 @@ pub async fn update_schedule(name: &str, schedule: impl Into<Schedule>) -> Resul
     sqlx::query(AssertSqlSafe(format!(
         "UPDATE {recurring}
          SET cron = $2, timezone = $3, interval_count = $4, interval_unit = $5, anchor = $6,
-             until_at = $7, max_runs = $8, next_run_at = $9, run_count = $10,
-             finished_at = $11, updated_at = now()
+             until_at = $7, max_runs = $8, missed = $9, next_run_at = $10, run_count = $11,
+             finished_at = $12, updated_at = now()
          WHERE name = $1",
         recurring = schema.table("recurring"),
     )))
@@ -204,6 +209,7 @@ pub async fn update_schedule(name: &str, schedule: impl Into<Schedule>) -> Resul
     .bind(stored.anchor)
     .bind(stored.until_at)
     .bind(stored.max_runs)
+    .bind(&stored.missed)
     .bind(plan.next_run_at)
     .bind(plan.run_count)
     .bind(plan.finished_at)
@@ -385,6 +391,7 @@ pub async fn list() -> Result<Vec<RecurringInfo>> {
             task: row.task,
             queue: row.queue,
             priority: Priority::from_level(row.priority),
+            missed: row.stored.missed.parse().unwrap_or_default(),
             enabled: row.enabled,
             managed: row.managed,
             next_run_at: row.next_run_at,

@@ -74,7 +74,7 @@ impl Shared {
             let stored = schedule.stored();
             let existing = lock_schedule(&mut transaction, schema, registration.name).await?;
             let unchanged = existing.as_ref().filter(|existing| {
-                existing.managed && existing.enabled && existing.stored == stored
+                existing.managed && existing.enabled && existing.stored.same_timing(&stored)
             });
             let plan = match unchanged {
                 Some(existing) => Plan::kept(existing),
@@ -87,12 +87,12 @@ impl Shared {
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {recurring} (name, cron, timezone, task, payload, queue,
                      max_attempts, timeout_ms, managed, next_run_at, run_count, finished_at,
-                     priority)
-                 VALUES ($1, $2, $3, $1, $4, $5, $6, $7, TRUE, $8, $9, $10, $11)
+                     priority, missed)
+                 VALUES ($1, $2, $3, $1, $4, $5, $6, $7, TRUE, $8, $9, $10, $11, $12)
                  ON CONFLICT (name) DO UPDATE SET
                      task = EXCLUDED.task, payload = EXCLUDED.payload, queue = EXCLUDED.queue,
                      max_attempts = EXCLUDED.max_attempts, timeout_ms = EXCLUDED.timeout_ms,
-                     priority = EXCLUDED.priority,
+                     priority = EXCLUDED.priority, missed = EXCLUDED.missed,
                      cron = EXCLUDED.cron, timezone = EXCLUDED.timezone,
                      interval_count = NULL, interval_unit = NULL, anchor = NULL,
                      until_at = NULL, max_runs = NULL,
@@ -116,6 +116,7 @@ impl Shared {
             .bind(plan.run_count)
             .bind(plan.finished_at)
             .bind(registration.priority.level())
+            .bind(&stored.missed)
             .execute(&mut *transaction)
             .await?;
             declared_names.push(registration.name.to_owned());

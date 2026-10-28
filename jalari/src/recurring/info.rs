@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 
+use super::Missed;
 use crate::{Priority, Schedule};
 
 /// Snapshot of one recurring schedule, as returned by [`list`](crate::recurring::list).
@@ -24,6 +25,14 @@ pub struct RecurringInfo {
     /// A code-declared schedule follows the job type at every worker start; a runtime schedule
     /// keeps it until [`add_or_update`](crate::recurring::add_or_update) writes it again.
     pub priority: Priority,
+    /// What the scheduler does with a run it finds more than a minute overdue.
+    ///
+    /// A code-declared schedule follows the `missed` argument at every worker start; a runtime
+    /// schedule takes it from the [`Schedule`] given to
+    /// [`add_or_update`](crate::recurring::add_or_update) or
+    /// [`update_schedule`](crate::recurring::update_schedule). Schedules created before 0.8.0
+    /// use [`Missed::Once`].
+    pub missed: Missed,
     /// `false` while paused.
     pub enabled: bool,
     /// `true` when declared with `#[jalari::job(cron = ...)]`; such schedules follow the

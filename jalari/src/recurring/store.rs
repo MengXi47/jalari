@@ -7,7 +7,7 @@ use crate::storage::RECURRING_CHANNEL;
 use crate::{Cron, Error, ErrorKind, Interval, Result, Schedule, Schema};
 
 pub(crate) const SCHEDULE_COLUMNS: &str =
-    "cron, timezone, interval_count, interval_unit, anchor, until_at, max_runs";
+    "cron, timezone, interval_count, interval_unit, anchor, until_at, max_runs, missed";
 
 pub(crate) const JOB_COLUMNS: &str =
     "task, payload, queue, max_attempts, timeout_ms, priority, context";
@@ -32,6 +32,7 @@ pub(crate) struct StoredSchedule {
     pub(crate) anchor: Option<NaiveDateTime>,
     pub(crate) until_at: Option<DateTime<Utc>>,
     pub(crate) max_runs: Option<i32>,
+    pub(crate) missed: String,
 }
 
 impl StoredSchedule {
@@ -51,6 +52,12 @@ impl StoredSchedule {
             &self.interval_unit,
             self.anchor,
         )
+    }
+
+    pub(crate) fn same_timing(&self, other: &Self) -> bool {
+        self.rule() == other.rule()
+            && self.until_at == other.until_at
+            && self.max_runs == other.max_runs
     }
 
     pub(crate) fn parse(&self) -> Result<Schedule> {
@@ -89,7 +96,7 @@ impl StoredSchedule {
         if let Some(max_runs) = self.max_runs {
             schedule = schedule.max_runs(u32::try_from(max_runs).unwrap_or(0))?;
         }
-        Ok(schedule)
+        Ok(schedule.missed(self.missed.parse()?))
     }
 }
 
@@ -107,6 +114,7 @@ impl Schedule {
             max_runs: self
                 .run_limit()
                 .map(|max_runs| i32::try_from(max_runs).unwrap_or(i32::MAX)),
+            missed: self.missed_policy().as_str().to_owned(),
         }
     }
 }
@@ -162,7 +170,7 @@ pub(crate) async fn plan(
 ) -> Result<Plan> {
     let stored = schedule.stored();
     match existing {
-        Some(existing) if existing.stored == stored => Ok(Plan::kept(existing)),
+        Some(existing) if existing.stored.same_timing(&stored) => Ok(Plan::kept(existing)),
         Some(existing) if existing.stored.rule() == stored.rule() => {
             Plan::fresh(
                 connection,
