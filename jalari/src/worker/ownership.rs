@@ -349,6 +349,7 @@ pub(super) async fn interrupt(
 ) -> Result<Vec<Interrupted>> {
     let job = schema.table("job");
     let worker = schema.table("worker");
+    let job_control = schema.table("job_control");
     let departed = match target {
         Target::DeadOwners { .. } => format!(
             ",
@@ -382,12 +383,23 @@ pub(super) async fn interrupt(
                  SELECT suspects.id FROM suspects
                  WHERE pg_try_advisory_xact_lock(hashtextextended($4 || suspects.id::text, 0))
              ),
+             free AS MATERIALIZED (
+                 SELECT control.job_id FROM {job_control} AS control
+                 JOIN {job} AS job ON job.id = control.job_id
+                 WHERE job.state = 'running' AND job.locked_by IN (SELECT id FROM dead)
+                 ORDER BY control.job_id
+                 LIMIT $6
+                 FOR NO KEY UPDATE OF control SKIP LOCKED
+             ),
              doomed AS (
                  SELECT job.id, job.command, 0 AS refund FROM {job} AS job
                  WHERE job.state = 'running' AND job.locked_by IN (SELECT id FROM dead)
+                     AND (job.id IN (SELECT job_id FROM free) OR NOT EXISTS (
+                         SELECT 1 FROM {job_control} AS control WHERE control.job_id = job.id
+                     ))
                  ORDER BY job.id
                  LIMIT $6
-                 FOR NO KEY UPDATE SKIP LOCKED
+                 FOR NO KEY UPDATE OF job SKIP LOCKED
              )"
         ),
         Target::Orphans(_) | Target::Abandoned(_) | Target::Shutdown(_) => format!(
@@ -438,7 +450,6 @@ pub(super) async fn interrupt(
          ){departed}
          SELECT id, task, queue, state, attempts, commanded FROM marked",
         job_history = schema.table("job_history"),
-        job_control = schema.table("job_control"),
     );
     let delay = target.delay();
     let refund = target.refund();
