@@ -161,17 +161,18 @@ impl Shared {
                      claimed.parent_id, claimed.root_id
              ),
              control AS (
-                 SELECT control.job_id, control.lease, control.progress
-                 FROM {job_control} AS control
-                 WHERE control.job_id IN (SELECT id FROM claimed)
-                 FOR SHARE
+                 INSERT INTO {job_control} AS control (job_id, lease)
+                 SELECT id, 1 FROM claimed
+                 ON CONFLICT (job_id) DO UPDATE
+                 SET lease = control.lease + 1, updated_at = statement_timestamp()
+                 RETURNING control.job_id, control.lease, control.progress
              )
              SELECT claimed.id, claimed.task, claimed.payload, claimed.attempts,
                  claimed.max_attempts, claimed.timeout_ms, claimed.context, claimed.priority,
                  claimed.created_at, claimed.scheduled_at, claimed.last_error, claimed.parent_id,
-                 claimed.root_id, coalesce(control.lease, 0) AS lease, control.progress
+                 claimed.root_id, control.lease, control.progress
              FROM claimed
-             LEFT JOIN control ON control.job_id = claimed.id",
+             JOIN control ON control.job_id = claimed.id",
             job = schema.table("job"),
             worker = schema.table("worker"),
             queue_pause = schema.table("queue_pause"),
@@ -269,11 +270,12 @@ pub(super) async fn close(
                  updated_at = statement_timestamp()
          ),
          bumped AS (
-             UPDATE {job_control}
-             SET lease = lease + 1,
-                 progress = CASE WHEN $12 THEN NULL ELSE progress END,
+             INSERT INTO {job_control} AS control (job_id, lease)
+             SELECT id, 1 FROM closed WHERE NOT $14
+             ON CONFLICT (job_id) DO UPDATE
+             SET lease = control.lease + 1,
+                 progress = CASE WHEN $12 THEN NULL ELSE control.progress END,
                  updated_at = statement_timestamp()
-             WHERE job_id IN (SELECT id FROM closed) AND NOT $14
          ){insert}
          SELECT EXISTS (SELECT 1 FROM closed) AS closed, {returned}",
         job = schema.table("job"),

@@ -24,8 +24,9 @@ pub(super) async fn housekeep(
     waker: Arc<Notify>,
     shutdown: CancellationToken,
 ) {
+    let mut legacy_controls = true;
     while !shutdown.is_cancelled() {
-        let delay = match shared.sweep(&shutdown).await {
+        let delay = match shared.sweep(&shutdown, &mut legacy_controls).await {
             Ok(delay) => delay,
             Err(e) => {
                 warn!(error = %e, "housekeeping failed");
@@ -37,7 +38,11 @@ pub(super) async fn housekeep(
 }
 
 impl Shared {
-    async fn sweep(&self, shutdown: &CancellationToken) -> Result<Duration> {
+    async fn sweep(
+        &self,
+        shutdown: &CancellationToken,
+        legacy_controls: &mut bool,
+    ) -> Result<Duration> {
         let schema = &self.config.schema;
         let pool = self.config.pool.pool();
         let config = schema.table("config");
@@ -55,24 +60,32 @@ impl Shared {
         if claimed.is_some() {
             let mut deleted: u64 = 0;
             while !shutdown.is_cancelled() {
-                let removed = sqlx::query(AssertSqlSafe(format!(
-                    "DELETE FROM {job} WHERE id IN (
-                         SELECT job.id FROM {job} AS job CROSS JOIN {config} AS config
-                         WHERE job.state IN {finished}
-                             AND job.updated_at < now() - CASE job.state
-                                 WHEN 'succeeded' THEN config.succeeded_retention
-                                 WHEN 'failed' THEN config.failed_retention
-                                 ELSE config.deleted_retention END
-                         LIMIT $1
-                         FOR UPDATE OF job SKIP LOCKED
-                     )",
+                let removed: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "WITH removed AS (
+                         DELETE FROM {job} WHERE id IN (
+                             SELECT job.id FROM {job} AS job CROSS JOIN {config} AS config
+                             WHERE job.state IN {finished}
+                                 AND job.updated_at < now() - CASE job.state
+                                     WHEN 'succeeded' THEN config.succeeded_retention
+                                     WHEN 'failed' THEN config.failed_retention
+                                     ELSE config.deleted_retention END
+                             LIMIT $1
+                             FOR UPDATE OF job SKIP LOCKED
+                         )
+                         RETURNING id
+                     ),
+                     controls AS (
+                         DELETE FROM {job_control} WHERE job_id IN (SELECT id FROM removed)
+                     )
+                     SELECT count(*) FROM removed",
                     job = schema.table("job"),
+                    job_control = schema.table("job_control"),
                     finished = JobState::finished_sql(),
                 )))
                 .bind(BATCH_SIZE)
-                .execute(&pool)
-                .await?
-                .rows_affected();
+                .fetch_one(&pool)
+                .await?;
+                let removed = removed.unsigned_abs();
                 deleted = deleted.saturating_add(removed);
                 if removed < BATCH_SIZE.unsigned_abs() {
                     break;
@@ -81,7 +94,7 @@ impl Shared {
             if deleted > 0 {
                 info!(deleted, "housekeeping removed finished jobs");
             }
-            while !shutdown.is_cancelled() {
+            while *legacy_controls && !shutdown.is_cancelled() {
                 let removed = sqlx::query(AssertSqlSafe(format!(
                     "DELETE FROM {job_control} WHERE job_id IN (
                          SELECT control.job_id FROM {job_control} AS control
@@ -99,7 +112,7 @@ impl Shared {
                 .await?
                 .rows_affected();
                 if removed < BATCH_SIZE.unsigned_abs() {
-                    break;
+                    *legacy_controls = false;
                 }
             }
         }

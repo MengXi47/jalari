@@ -352,13 +352,14 @@ struct HistoryRow {
     created_at: DateTime<Utc>,
 }
 
-/// Progress that [`checkpoint`](crate::checkpoint)s saved for a job.
+/// Progress that [`checkpoint`](crate::checkpoint)s saved for a job, and its lease.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlInfo {
     /// Progress saved at the job's last checkpoint, kept while it waits or is stopped.
     pub progress: Option<Value>,
-    /// Incremented each time the job's lease changes hands.
+    /// Incremented when a worker claims the job, when a run ends, and each time the job changes
+    /// hands otherwise, so every run holds a lease of its own.
     pub lease: i64,
     /// When the control row last changed.
     pub updated_at: DateTime<Utc>,
@@ -379,7 +380,7 @@ pub struct JobDetail {
     pub job: JobInfo,
     /// Every state change, oldest first.
     pub history: Vec<HistoryEntry>,
-    /// Saved progress; `None` when nothing was ever recorded.
+    /// Saved progress and lease; `None` until a worker first claims the job.
     pub control: Option<ControlInfo>,
 }
 

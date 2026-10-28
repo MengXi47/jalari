@@ -403,7 +403,9 @@ async fn check_detail_follows_a_job(fixture: &Fixture) {
     assert_eq!(states, [(JobState::Scheduled, 1), (JobState::Succeeded, 2)]);
     assert_eq!(detail.history[0].error.as_deref(), Some("detail failed 1"));
     assert!(detail.history.iter().all(|entry| entry.duration.is_some()));
-    assert_eq!(detail.control, None);
+    let control = detail.control.unwrap();
+    assert_eq!(control.progress, None);
+    assert_eq!(control.lease, 4);
 
     GATE_OPEN.store(false, Ordering::SeqCst);
     let held = jalari::enqueue(&Gate).await.unwrap().id();
