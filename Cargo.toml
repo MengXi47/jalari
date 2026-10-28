@@ -4,6 +4,7 @@ members = [
     "jalari",
     "jalari-macros",
     "tests/facade/facade",
+    "tests/facade/facade-macros",
     "tests/facade/consumer",
 ]
 

@@ -63,3 +63,41 @@ impl Job for Nightly {
         Ok(())
     }
 }
+
+/// Appends its word to [`ECHOED`], declared through the `#[facade::job_attr]` attribute.
+#[derive(Serialize, Deserialize)]
+pub struct AttrEcho {
+    /// The word to append.
+    pub word: String,
+}
+
+#[facade::job_attr(name = "facade_attr_echo", fingerprint = true)]
+impl Job for AttrEcho {
+    async fn run(self) -> JobResult {
+        ECHOED.lock().unwrap().push(self.word);
+        Ok(())
+    }
+}
+
+/// A recurring job that sets every argument of the attribute, through `#[facade::job_attr]`.
+#[derive(Serialize, Deserialize, Default)]
+pub struct AttrNightly;
+
+#[facade::job_attr(
+    name = "facade_attr_nightly",
+    queue = "facade_attr_nightly",
+    max_attempts = 3,
+    timeout = 30,
+    priority = "high",
+    aliases = ["facade_attr_nightly_old"],
+    cron = "0 0 3 * * *",
+    timezone = "Asia/Taipei",
+    missed = "skip",
+    fingerprint = true,
+    checkpoints = true
+)]
+impl Job for AttrNightly {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}

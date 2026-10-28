@@ -82,3 +82,61 @@ fn test_wrapper_job_fingerprint_equals_the_same_job_written_against_jalari() {
     assert_eq!(through_wrapper.map(str::len), Some(32));
     assert_eq!(through_wrapper, fingerprint(<WrappedEcho as Job>::NAME));
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct AttrEcho {
+    pub word: String,
+}
+
+#[jalari::job(name = "direct_attr_echo", fingerprint = true)]
+impl Job for AttrEcho {
+    async fn run(self) -> JobResult {
+        ECHOED.lock().unwrap().push(self.word);
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct AttrNightly;
+
+#[jalari::job(
+    name = "direct_attr_nightly",
+    queue = "facade_attr_nightly",
+    max_attempts = 3,
+    timeout = 30,
+    priority = "high",
+    aliases = ["direct_attr_nightly_old"],
+    cron = "0 0 3 * * *",
+    timezone = "Asia/Taipei",
+    missed = "skip",
+    fingerprint = true,
+    checkpoints = true
+)]
+impl Job for AttrNightly {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_attribute_wrapper_job_fingerprint_equals_the_same_job_written_against_jalari() {
+    let fingerprint = |name: &str| {
+        jalari::__private::find(name)
+            .unwrap_or_else(|| panic!("{name} is registered"))
+            .fingerprint
+    };
+    for (through_attribute, direct) in [
+        (
+            <facade_consumer::AttrEcho as Job>::NAME,
+            <AttrEcho as Job>::NAME,
+        ),
+        (
+            <facade_consumer::AttrNightly as Job>::NAME,
+            <AttrNightly as Job>::NAME,
+        ),
+    ] {
+        let value = fingerprint(through_attribute);
+        assert_eq!(value.map(str::len), Some(32), "{through_attribute}");
+        assert_eq!(value, fingerprint(direct), "{through_attribute}");
+    }
+}

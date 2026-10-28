@@ -7,7 +7,7 @@ use facade::__jalari::sqlx::{self, AssertSqlSafe};
 use facade::__jalari::{
     CancellationToken, JobState, Priority, Schema, Worker, WorkerConfig, admin, enqueue, init,
 };
-use facade_consumer::{ECHOED, Echo, WrappedEcho};
+use facade_consumer::{AttrEcho, ECHOED, Echo, WrappedEcho};
 
 #[test]
 fn test_jobs_register_through_the_facade() {
@@ -35,6 +35,31 @@ fn test_jobs_register_through_the_facade() {
     assert!(nightly.checkpoints);
     assert_eq!(nightly.fingerprint.map(str::len), Some(32));
     let cron = nightly.cron.as_ref().expect("facade_nightly is recurring");
+    assert_eq!(cron.expression, "0 0 3 * * *");
+    assert_eq!(cron.timezone, "Asia/Taipei");
+    assert_eq!(cron.missed, Missed::Skip);
+
+    let attr_echo = registrations()
+        .find(|registration| registration.name == "facade_attr_echo")
+        .expect("facade_attr_echo is registered through the job_attr attribute");
+    assert_eq!(attr_echo.queue, "facade");
+    assert!(attr_echo.cron.is_none());
+    assert_eq!(attr_echo.fingerprint.map(str::len), Some(32));
+
+    let attr_nightly = registrations()
+        .find(|registration| registration.name == "facade_attr_nightly")
+        .expect("facade_attr_nightly is registered through the job_attr attribute");
+    assert_eq!(attr_nightly.queue, "facade_attr_nightly");
+    assert_eq!(attr_nightly.max_attempts, 3);
+    assert_eq!(attr_nightly.timeout, Some(Duration::from_secs(30)));
+    assert_eq!(attr_nightly.priority, Priority::High);
+    assert_eq!(attr_nightly.aliases, ["facade_attr_nightly_old"]);
+    assert!(attr_nightly.checkpoints);
+    assert_eq!(attr_nightly.fingerprint.map(str::len), Some(32));
+    let cron = attr_nightly
+        .cron
+        .as_ref()
+        .expect("facade_attr_nightly is recurring");
     assert_eq!(cron.expression, "0 0 3 * * *");
     assert_eq!(cron.timezone, "Asia/Taipei");
     assert_eq!(cron.missed, Missed::Skip);
@@ -67,6 +92,7 @@ async fn test_worker_runs_a_job_defined_through_the_facade() {
     config.shutdown_timeout = Duration::from_secs(10);
     let worker = Worker::builder()
         .queue("default", 1)
+        .queue("facade", 1)
         .config(config)
         .build()
         .await
@@ -87,6 +113,12 @@ async fn test_worker_runs_a_job_defined_through_the_facade() {
         .await
         .unwrap()
         .id(),
+        enqueue(&AttrEcho {
+            word: "through the attribute".to_owned(),
+        })
+        .await
+        .unwrap()
+        .id(),
     ];
     tokio::time::timeout(Duration::from_secs(30), async {
         for job_id in job_ids {
@@ -100,10 +132,17 @@ async fn test_worker_runs_a_job_defined_through_the_facade() {
         }
     })
     .await
-    .expect("both jobs succeed within 30 s");
+    .expect("every job succeeds within 30 s");
     let mut echoed = ECHOED.lock().unwrap().clone();
     echoed.sort();
-    assert_eq!(echoed, ["through the facade", "through the wrapper"]);
+    assert_eq!(
+        echoed,
+        [
+            "through the attribute",
+            "through the facade",
+            "through the wrapper"
+        ]
+    );
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(60), running)

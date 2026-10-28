@@ -3,6 +3,8 @@
 #[doc(hidden)]
 pub use jalari as __jalari;
 
+pub use facade_macros::job_attr;
+
 /// Declares a job through this crate, so the defining crate never names the path to jalari.
 #[macro_export]
 macro_rules! job {

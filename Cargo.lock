@@ -479,6 +479,7 @@ dependencies = [
 name = "facade"
 version = "0.0.0"
 dependencies = [
+ "facade-macros",
  "jalari",
 ]
 
@@ -490,6 +491,15 @@ dependencies = [
  "jalari",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "facade-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

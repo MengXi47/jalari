@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+facade-macros = { path = "../facade-macros" }
 jalari = { path = "../../../jalari" }
 
 [lints]
