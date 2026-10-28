@@ -90,6 +90,7 @@ impl Shared {
                 claimed.hold.job_id,
                 claimed.lease,
                 claimed.progress.clone(),
+                claimed.progress_seq,
                 self.job_shutdown.child_token(),
                 incarnation.dead().child_token(),
                 registration.is_some_and(|registration| registration.checkpoints),

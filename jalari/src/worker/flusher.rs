@@ -38,21 +38,26 @@ impl Shared {
         }
         let job_ids: Vec<i64> = dirty.iter().map(|(control, _)| control.job_id()).collect();
         let leases: Vec<i64> = dirty.iter().map(|(control, _)| control.lease()).collect();
-        let progress: Vec<Value> = dirty.iter().map(|(_, progress)| progress.clone()).collect();
+        let progress: Vec<&Value> = dirty.iter().map(|(_, copy)| &copy.value).collect();
+        let seqs: Vec<i64> = dirty.iter().map(|(_, copy)| copy.seq).collect();
         let job_control = self.config.schema.table("job_control");
         let flushed = sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {job_control} AS control (job_id, lease, progress)
-             SELECT batch.job_id, batch.lease, batch.progress
-             FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[])
-                 AS batch (job_id, lease, progress)
+            "INSERT INTO {job_control} AS control (job_id, lease, progress, progress_seq)
+             SELECT batch.job_id, batch.lease, batch.progress, batch.progress_seq
+             FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[], $4::bigint[])
+                 AS batch (job_id, lease, progress, progress_seq)
              ORDER BY batch.job_id
              ON CONFLICT (job_id) DO UPDATE
-             SET progress = EXCLUDED.progress, updated_at = statement_timestamp()
+             SET progress = CASE WHEN EXCLUDED.progress_seq > control.progress_seq
+                     THEN EXCLUDED.progress ELSE control.progress END,
+                 progress_seq = greatest(control.progress_seq, EXCLUDED.progress_seq),
+                 updated_at = statement_timestamp()
              WHERE control.lease = EXCLUDED.lease"
         )))
         .bind(&job_ids)
         .bind(&leases)
         .bind(&progress)
+        .bind(&seqs)
         .execute(&self.config.pool.pool())
         .await;
         if flushed.is_err() {

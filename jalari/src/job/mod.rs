@@ -10,7 +10,7 @@ pub(crate) mod run;
 mod state;
 
 pub use checkpoint::{Checkpoint, Command, checkpoint, resume};
-pub(crate) use checkpoint::{Halt, RunControl};
+pub(crate) use checkpoint::{Halt, ProgressCopy, RunControl};
 pub use context::scope;
 pub use definition::{Job, JobResult};
 pub(crate) use error::SNOOZED;

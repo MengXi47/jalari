@@ -1,12 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use super::middleware::Finished;
 use crate::enqueue::Columns;
-use crate::job::{Command, Halt, JobState, SNOOZED};
+use crate::job::{Command, Halt, JobState, ProgressCopy, SNOOZED};
 use crate::{Error, ErrorKind, JobError, JobResult, RetryPolicy};
 
 const LONGEST_DELAY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
@@ -187,7 +186,7 @@ pub(super) struct Closing {
     attempts: i32,
     run_at_delay: Option<Duration>,
     duration_ms: Option<i64>,
-    kept: Option<Value>,
+    kept: Option<ProgressCopy>,
     children: Option<Arc<Columns>>,
 }
 
@@ -197,7 +196,7 @@ impl Closing {
         outcome: Outcome,
         seen: Option<Command>,
         duration: Duration,
-        kept: Option<Value>,
+        kept: Option<ProgressCopy>,
         children: Option<Arc<Columns>>,
     ) -> Self {
         let (attempts, run_at_delay) = match &outcome {
@@ -241,7 +240,7 @@ impl Closing {
         self.run_at_delay
     }
 
-    pub(super) fn kept(&self) -> Option<&Value> {
+    pub(super) fn kept(&self) -> Option<&ProgressCopy> {
         self.kept.as_ref()
     }
 

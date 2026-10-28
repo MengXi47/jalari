@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -18,6 +18,41 @@ struct Tables {
 }
 
 static TABLES: OnceLock<Tables> = OnceLock::new();
+
+static OPEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+static RESUMED: LazyLock<Mutex<HashMap<String, Vec<Option<String>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static REACHED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn open(gate: &str) {
+    OPEN.lock().unwrap().insert(gate.to_owned());
+}
+
+fn reach(gate: &str) {
+    REACHED.lock().unwrap().insert(gate.to_owned());
+}
+
+fn reached(gate: &str) -> bool {
+    REACHED.lock().unwrap().contains(gate)
+}
+
+async fn pass(gate: &str) {
+    reach(gate);
+    while !OPEN.lock().unwrap().contains(gate) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn resumed(label: &str) -> Vec<Option<String>> {
+    RESUMED
+        .lock()
+        .unwrap()
+        .get(label)
+        .cloned()
+        .unwrap_or_default()
+}
 
 static LEASES: LazyLock<Mutex<HashMap<String, Vec<Option<i64>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -71,6 +106,32 @@ impl Job for Leases {
         if self.drop_control_row {
             delete_control_row(run.id()).await;
         }
+        Err(JobError::new("the first run fails".to_owned()))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Overtaken {
+    label: String,
+}
+
+#[jalari::job(queue = "progress_durable", max_attempts = 3)]
+impl Job for Overtaken {
+    const NAME: &'static str = "progress_overtaken";
+
+    async fn run(self) -> JobResult {
+        let (saved, checkpoint) = jalari::resume::<String>()?;
+        RESUMED
+            .lock()
+            .unwrap()
+            .entry(self.label.clone())
+            .or_default()
+            .push(saved);
+        if jalari::current_job().unwrap().attempt() > 1 {
+            return Ok(());
+        }
+        checkpoint.save(&"older".to_owned()).await?;
+        pass(&self.label).await;
         Err(JobError::new("the first run fails".to_owned()))
     }
 }
@@ -150,6 +211,36 @@ async fn check_close_without_a_row_still_fences() {
     );
 }
 
+async fn check_close_keeps_a_newer_stored_copy() {
+    let label = "overtaken";
+    let id = jalari::enqueue(&Overtaken {
+        label: label.to_owned(),
+    })
+    .await
+    .unwrap()
+    .id();
+    wait_until("the first run to save", SETTLED, || async {
+        reached(label)
+    })
+    .await;
+    let tables = TABLES.get().unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET progress = '\"newer\"', progress_seq = progress_seq + 100
+         WHERE job_id = $1",
+        tables.job_control
+    )))
+    .bind(id.0)
+    .execute(&tables.pool)
+    .await
+    .unwrap();
+    open(label);
+    wait_until("the second run to succeed", SETTLED, || async {
+        state(id).await == "succeeded"
+    })
+    .await;
+    assert_eq!(resumed(label), [None, Some("newer".to_owned())]);
+}
+
 async fn control_rows(job_ids: &[JobId]) -> i64 {
     let tables = TABLES.get().unwrap();
     let job_ids: Vec<i64> = job_ids.iter().map(|id| id.0).collect();
@@ -224,6 +315,7 @@ async fn test_progress_durable() {
     let worker = spawn_worker().await;
     check_each_run_has_its_own_lease().await;
     check_close_without_a_row_still_fences().await;
+    check_close_keeps_a_newer_stored_copy().await;
     check_housekeeping_removes_control_rows_with_their_jobs().await;
     worker.stop().await;
     database.finish().await;

@@ -39,6 +39,7 @@ struct ClaimedRow {
     root_id: Option<i64>,
     lease: i64,
     progress: Option<Value>,
+    progress_seq: i64,
 }
 
 pub(super) struct Claimed {
@@ -57,6 +58,7 @@ pub(super) struct Claimed {
     pub(super) root_id: Option<i64>,
     pub(super) lease: i64,
     pub(super) progress: Option<Value>,
+    pub(super) progress_seq: i64,
 }
 
 pub(super) enum Closed {
@@ -165,12 +167,12 @@ impl Shared {
                  SELECT id, 1 FROM claimed
                  ON CONFLICT (job_id) DO UPDATE
                  SET lease = control.lease + 1, updated_at = statement_timestamp()
-                 RETURNING control.job_id, control.lease, control.progress
+                 RETURNING control.job_id, control.lease, control.progress, control.progress_seq
              )
              SELECT claimed.id, claimed.task, claimed.payload, claimed.attempts,
                  claimed.max_attempts, claimed.timeout_ms, claimed.context, claimed.priority,
                  claimed.created_at, claimed.scheduled_at, claimed.last_error, claimed.parent_id,
-                 claimed.root_id, control.lease, control.progress
+                 claimed.root_id, control.lease, control.progress, control.progress_seq
              FROM claimed
              JOIN control ON control.job_id = claimed.id",
             job = schema.table("job"),
@@ -217,6 +219,7 @@ impl Shared {
                     root_id: row.root_id,
                     lease: row.lease,
                     progress: row.progress,
+                    progress_seq: row.progress_seq,
                 };
                 (claimed, pending)
             }));
@@ -262,19 +265,15 @@ pub(super) async fn close(
              INSERT INTO {job_history} (job_id, state, attempt, error, duration_ms, created_at)
              SELECT id, $4, $5, $10, $11, statement_timestamp() FROM closed
          ),
-         kept AS (
-             INSERT INTO {job_control} AS control (job_id, lease, progress)
-             SELECT id, 1, $13 FROM closed WHERE $14
-             ON CONFLICT (job_id) DO UPDATE
-             SET lease = control.lease + 1, progress = EXCLUDED.progress,
-                 updated_at = statement_timestamp()
-         ),
-         bumped AS (
-             INSERT INTO {job_control} AS control (job_id, lease)
-             SELECT id, 1 FROM closed WHERE NOT $14
+         fenced AS (
+             INSERT INTO {job_control} AS control (job_id, lease, progress, progress_seq)
+             SELECT id, 1, $13, $14 FROM closed
              ON CONFLICT (job_id) DO UPDATE
              SET lease = control.lease + 1,
-                 progress = CASE WHEN $12 THEN NULL ELSE control.progress END,
+                 progress = CASE WHEN $12 THEN NULL
+                     WHEN EXCLUDED.progress_seq > control.progress_seq THEN EXCLUDED.progress
+                     ELSE control.progress END,
+                 progress_seq = greatest(control.progress_seq, EXCLUDED.progress_seq),
                  updated_at = statement_timestamp()
          ){insert}
          SELECT EXISTS (SELECT 1 FROM closed) AS closed, {returned}",
@@ -295,8 +294,8 @@ pub(super) async fn close(
         .bind(outcome.note())
         .bind(closing.duration_ms())
         .bind(terminal)
-        .bind(kept.filter(|_| !terminal))
-        .bind(kept.is_some())
+        .bind(kept.map(|kept| &kept.value).filter(|_| !terminal))
+        .bind(kept.map_or(0, |kept| kept.seq))
         .bind((outcome.state() == JobState::Scheduled).then_some(INTERRUPTED));
     let row = match children {
         None => query.fetch_one(pool).await?,

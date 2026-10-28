@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde_json::Value;
-
-use crate::job::{Command, RunControl};
+use crate::job::{Command, ProgressCopy, RunControl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Hold {
@@ -142,9 +140,9 @@ impl RunBook {
         holds
     }
 
-    pub(super) fn dirty(&self) -> Vec<(Arc<RunControl>, Value)> {
+    pub(super) fn dirty(&self) -> Vec<(Arc<RunControl>, ProgressCopy)> {
         let book = self.book.lock().unwrap();
-        let mut dirty: Vec<(Arc<RunControl>, Value)> = book
+        let mut dirty: Vec<(Arc<RunControl>, ProgressCopy)> = book
             .runs
             .values()
             .filter_map(|entry| {

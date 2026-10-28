@@ -86,11 +86,34 @@ impl Halt {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProgressCopy {
+    pub(crate) value: Value,
+    pub(crate) seq: i64,
+}
+
+#[derive(Debug)]
 struct Slot {
-    latest: Option<Value>,
+    latest: Option<ProgressCopy>,
+    seq: i64,
     kept_at: Option<Instant>,
     dirty: bool,
+}
+
+impl Slot {
+    fn numbered_from(seq: i64) -> Self {
+        Self {
+            latest: None,
+            seq,
+            kept_at: None,
+            dirty: false,
+        }
+    }
+
+    fn next_seq(&mut self) -> i64 {
+        self.seq += 1;
+        self.seq
+    }
 }
 
 #[derive(Default)]
@@ -126,6 +149,7 @@ impl RunControl {
         job_id: i64,
         lease: i64,
         saved: Option<Value>,
+        saved_seq: i64,
         shutdown: CancellationToken,
         lost: CancellationToken,
         checkpoints: bool,
@@ -142,7 +166,7 @@ impl RunControl {
             started: Instant::now(),
             reached_millis: AtomicU64::new(0),
             checkpoints,
-            slot: Mutex::new(Slot::default()),
+            slot: Mutex::new(Slot::numbered_from(saved_seq)),
             children: Children::default(),
         }
     }
@@ -219,18 +243,19 @@ impl RunControl {
             .is_none_or(|kept_at| kept_at.elapsed() >= KEEP_INTERVAL)
     }
 
-    fn keep(&self, progress: Value) {
+    fn keep(&self, value: Value) {
         let mut slot = self.slot.lock().unwrap();
-        slot.latest = Some(progress);
+        let seq = slot.next_seq();
+        slot.latest = Some(ProgressCopy { value, seq });
         slot.kept_at = Some(Instant::now());
         slot.dirty = true;
     }
 
-    pub(crate) fn latest(&self) -> Option<Value> {
+    pub(crate) fn latest(&self) -> Option<ProgressCopy> {
         self.slot.lock().unwrap().latest.clone()
     }
 
-    pub(crate) fn take_dirty(&self) -> Option<Value> {
+    pub(crate) fn take_dirty(&self) -> Option<ProgressCopy> {
         let mut slot = self.slot.lock().unwrap();
         if !slot.dirty {
             return None;
@@ -453,6 +478,7 @@ mod tests {
                 7,
                 1,
                 None,
+                0,
                 shutdown.child_token(),
                 lost.child_token(),
                 false,
@@ -477,6 +503,43 @@ mod tests {
             })
             .await
         }
+    }
+
+    #[tokio::test]
+    async fn test_copies_are_numbered_after_the_stored_copy() {
+        let control = RunControl::new(
+            7,
+            1,
+            None,
+            41,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            false,
+        );
+        run::within(JobRun::for_test(7, Arc::new(control)), async {
+            let (_, checkpoint) = resume::<u32>().unwrap();
+            checkpoint.save(&1).await.unwrap();
+            let control = run::current_job().unwrap().control().clone();
+            let first = control.take_dirty().unwrap();
+            assert_eq!(
+                first,
+                ProgressCopy {
+                    value: 1.into(),
+                    seq: 42
+                }
+            );
+            assert_eq!(control.take_dirty(), None);
+            control.request(Command::Stop);
+            checkpoint.save(&2).await.unwrap_err();
+            assert_eq!(
+                control.latest(),
+                Some(ProgressCopy {
+                    value: 2.into(),
+                    seq: 43
+                })
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
