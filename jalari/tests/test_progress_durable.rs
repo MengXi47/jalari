@@ -21,6 +21,7 @@ struct Tables {
     schema: String,
     job_control: String,
     stall: String,
+    business: String,
 }
 
 static TABLES: OnceLock<Tables> = OnceLock::new();
@@ -78,6 +79,36 @@ fn record_resumed(label: &str, saved: Option<String>) {
         .entry(label.to_owned())
         .or_default()
         .push(saved);
+}
+
+static SHOWN: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn insert_business(transaction: &mut jalari::sqlx::PgTransaction<'_>, label: &str) {
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {} (label) VALUES ($1)",
+        TABLES.get().unwrap().business
+    )))
+    .bind(label)
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+}
+
+async fn business_rows(label: &str) -> i64 {
+    let tables = TABLES.get().unwrap();
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {} WHERE label = $1",
+        tables.business
+    )))
+    .bind(label)
+    .fetch_one(&tables.pool)
+    .await
+    .unwrap()
+}
+
+async fn begin() -> jalari::sqlx::PgTransaction<'static> {
+    TABLES.get().unwrap().pool.begin().await.unwrap()
 }
 
 static LEASES: LazyLock<Mutex<HashMap<String, Vec<Option<i64>>>>> =
@@ -326,6 +357,190 @@ impl Job for StopNow {
             }
             reach(&self.label);
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct InTransaction {
+    label: String,
+}
+
+#[jalari::job(queue = "progress_durable", max_attempts = 5)]
+impl Job for InTransaction {
+    const NAME: &'static str = "progress_in_transaction";
+
+    async fn run(self) -> JobResult {
+        let (saved, checkpoint) = jalari::resume::<String>()?;
+        record_resumed(&self.label, saved);
+        let runs = resumed(&self.label).len();
+        if runs > 2 {
+            return Ok(());
+        }
+        let unit = format!("{}:{runs}", self.label);
+        let mut transaction = begin().await;
+        insert_business(&mut transaction, &unit).await;
+        if runs == 1 {
+            checkpoint.save_in(&mut transaction, &unit).await?;
+            reach(&self.label);
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            return Ok(());
+        }
+        for write in 0..8 {
+            checkpoint
+                .save_in(&mut transaction, &format!("{unit}:{write}"))
+                .await?;
+        }
+        transaction.commit().await?;
+        Err(JobError::new(
+            "the second run fails after its commit".to_owned(),
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct FencedTransaction {
+    label: String,
+}
+
+#[jalari::job(queue = "progress_durable", max_attempts = 3)]
+impl Job for FencedTransaction {
+    const NAME: &'static str = "progress_fenced_transaction";
+
+    async fn run(self) -> JobResult {
+        let (saved, checkpoint) = jalari::resume::<String>()?;
+        record_resumed(&self.label, saved);
+        if resumed(&self.label).len() > 1 {
+            return Ok(());
+        }
+        let mut transaction = begin().await;
+        insert_business(&mut transaction, &self.label).await;
+        pass(&self.label).await;
+        if let Err(e) = checkpoint.save_in(&mut transaction, &self.label).await {
+            record_error(&self.label, e);
+        }
+        let label = self.label.clone();
+        tokio::spawn(async move {
+            if transaction.commit().await.is_ok() {
+                reach(&format!("{label}:committed"));
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        reach(&format!("{}:continued", self.label));
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct BehindSave {
+    label: String,
+    commit: bool,
+}
+
+#[jalari::job(queue = "progress_durable", max_attempts = 3)]
+impl Job for BehindSave {
+    const NAME: &'static str = "progress_behind_save";
+
+    async fn run(self) -> JobResult {
+        let (saved, checkpoint) = jalari::resume::<String>()?;
+        record_resumed(&self.label, saved);
+        if resumed(&self.label).len() > 1 {
+            return Ok(());
+        }
+        checkpoint.save(&"B".to_owned()).await?;
+        let mut transaction = begin().await;
+        checkpoint
+            .save_in(&mut transaction, &"C".to_owned())
+            .await?;
+        if self.commit {
+            transaction.commit().await?;
+        } else {
+            transaction.rollback().await?;
+        }
+        Err(JobError::new("the first run fails".to_owned()))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Serial {
+    label: String,
+}
+
+#[jalari::job(queue = "progress_durable")]
+impl Job for Serial {
+    const NAME: &'static str = "progress_serial";
+
+    async fn run(self) -> JobResult {
+        let (_, checkpoint) = jalari::resume::<String>()?;
+        let mut transaction = TABLES
+            .get()
+            .unwrap()
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await?;
+        insert_business(&mut transaction, &self.label).await;
+        pass(&self.label).await;
+        if let Err(e) = checkpoint.save_in(&mut transaction, &self.label).await {
+            record_error(&self.label, e);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Savepoint {
+    label: String,
+}
+
+#[jalari::job(queue = "progress_durable")]
+impl Job for Savepoint {
+    const NAME: &'static str = "progress_savepoint";
+
+    async fn run(self) -> JobResult {
+        let (_, checkpoint) = jalari::resume::<String>()?;
+        let mut transaction = begin().await;
+        insert_business(&mut transaction, &self.label).await;
+        let mut savepoint = sqlx::Connection::begin(&mut *transaction).await?;
+        delete_control_row(jalari::current_job().unwrap().id()).await;
+        if let Err(e) = checkpoint.save_in(&mut savepoint, &self.label).await {
+            record_error(&self.label, e);
+        }
+        savepoint.rollback().await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct IdleLimit {
+    label: String,
+}
+
+#[jalari::job(queue = "progress_durable")]
+impl Job for IdleLimit {
+    const NAME: &'static str = "progress_idle_limit";
+
+    async fn run(self) -> JobResult {
+        let (_, checkpoint) = jalari::resume::<String>()?;
+        for (name, preset) in [
+            ("unset", None),
+            ("stricter", Some("2s")),
+            ("looser", Some("30s")),
+        ] {
+            let mut transaction = begin().await;
+            if let Some(preset) = preset {
+                sqlx::query("SELECT set_config('idle_in_transaction_session_timeout', $1, true)")
+                    .bind(preset)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            checkpoint.save_in(&mut transaction, &self.label).await?;
+            let shown: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+                .fetch_one(&mut *transaction)
+                .await?;
+            SHOWN.lock().unwrap().insert(name.to_owned(), shown);
+            transaction.rollback().await?;
         }
         Ok(())
     }
@@ -676,6 +891,111 @@ async fn check_save_now_is_a_stop_point() {
     );
 }
 
+async fn check_save_in_rolls_back_with_a_crash(worker: RunningWorker) -> RunningWorker {
+    let label = "in_transaction";
+    let id = enqueue(&InTransaction {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_gate(label).await;
+    worker.crash().await;
+    let worker = spawn_worker().await;
+    wait_for_state(id, "succeeded").await;
+    assert_eq!(
+        resumed(label),
+        [None, None, Some("in_transaction:2:7".to_owned())]
+    );
+    assert_eq!(business_rows("in_transaction:1").await, 0);
+    assert_eq!(business_rows("in_transaction:2").await, 1);
+    worker
+}
+
+async fn check_fenced_out_save_in_aborts_the_transaction() {
+    let label = "fenced_transaction";
+    let id = enqueue(&FencedTransaction {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_gate(label).await;
+    bump_lease(id).await;
+    open(label);
+    wait_for_gate("fenced_transaction:committed").await;
+    let error = recorded_error(label).unwrap();
+    assert_eq!(error.msg(), LOST);
+    assert!(error.is_interruption());
+    assert_eq!(business_rows(label).await, 0);
+    assert_eq!(stored(id).await, None);
+    wait_for_state(id, "succeeded").await;
+    assert!(
+        !reached("fenced_transaction:continued"),
+        "a run that ignored the lost error kept running past its next await"
+    );
+    assert_eq!(resumed(label), [None, None]);
+}
+
+async fn check_save_in_and_the_close_keep_the_committed_copy() {
+    for (label, commit, expected) in [("rolled_back", false, "B"), ("committed_over", true, "C")] {
+        let id = enqueue(&BehindSave {
+            label: label.to_owned(),
+            commit,
+        })
+        .await;
+        wait_for_state(id, "succeeded").await;
+        assert_eq!(resumed(label), [None, Some(expected.to_owned())], "{label}");
+    }
+}
+
+async fn check_save_in_under_repeatable_read_is_retryable() {
+    let label = "serial";
+    let id = enqueue(&Serial {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_gate(label).await;
+    let tables = TABLES.get().unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET updated_at = now() WHERE job_id = $1",
+        tables.job_control
+    )))
+    .bind(id.0)
+    .execute(&tables.pool)
+    .await
+    .unwrap();
+    open(label);
+    wait_for_state(id, "succeeded").await;
+    let error = recorded_error(label).unwrap();
+    assert!(!error.is_permanent(), "{error:?}");
+    assert!(!error.is_interruption(), "{error:?}");
+    assert!(error.msg().contains("SerializationFailure"), "{error:?}");
+    let history = jalari::admin::job(id).await.unwrap().unwrap().history;
+    assert_eq!(history.len(), 1, "{history:?}");
+}
+
+async fn check_savepoint_rollback_escapes_save_in() {
+    let label = "savepoint";
+    let id = enqueue(&Savepoint {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_state(id, "succeeded").await;
+    let error = recorded_error(label).unwrap();
+    assert!(error.is_permanent(), "{error:?}");
+    assert!(error.msg().contains("has no control row"), "{error:?}");
+    assert_eq!(business_rows(label).await, 1);
+}
+
+async fn check_save_in_never_loosens_the_idle_limit() {
+    let id = enqueue(&IdleLimit {
+        label: "idle_limit".to_owned(),
+    })
+    .await;
+    wait_for_state(id, "succeeded").await;
+    let shown = SHOWN.lock().unwrap().clone();
+    assert_eq!(shown.get("unset").map(String::as_str), Some("10s"));
+    assert_eq!(shown.get("stricter").map(String::as_str), Some("2s"));
+    assert_eq!(shown.get("looser").map(String::as_str), Some("10s"));
+}
+
 async fn control_rows(job_ids: &[JobId]) -> i64 {
     let tables = TABLES.get().unwrap();
     let job_ids: Vec<i64> = job_ids.iter().map(|id| id.0).collect();
@@ -748,7 +1068,15 @@ async fn test_progress_durable() {
         schema: database.schema_name.clone(),
         job_control: database.table("job_control"),
         stall: database.table("stall"),
+        business: database.table("business"),
     });
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE TABLE {} (label text NOT NULL)",
+        database.table("business")
+    )))
+    .execute(&database.pool)
+    .await
+    .unwrap();
     install_stall().await;
     let worker = spawn_worker().await;
     check_each_run_has_its_own_lease().await;
@@ -761,6 +1089,12 @@ async fn test_progress_durable() {
     check_save_during_save_now_is_flushed().await;
     check_save_now_without_a_control_row_is_permanent().await;
     check_save_now_is_a_stop_point().await;
+    let worker = check_save_in_rolls_back_with_a_crash(worker).await;
+    check_fenced_out_save_in_aborts_the_transaction().await;
+    check_save_in_and_the_close_keep_the_committed_copy().await;
+    check_save_in_under_repeatable_read_is_retryable().await;
+    check_savepoint_rollback_escapes_save_in().await;
+    check_save_in_never_loosens_the_idle_limit().await;
     check_housekeeping_removes_control_rows_with_their_jobs().await;
     worker.stop().await;
     database.finish().await;

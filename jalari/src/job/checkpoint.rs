@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::fence::{Fenced, write_progress};
+use super::fence::{Fenced, raised, write_progress, write_progress_in};
 use super::run::current_job;
 use crate::enqueue::EnqueueRequest;
 use crate::init::config;
@@ -262,6 +262,10 @@ impl RunControl {
         seq
     }
 
+    fn next_seq(&self) -> i64 {
+        self.slot.lock().unwrap().next_seq()
+    }
+
     fn mark_clean(&self, seq: i64) {
         let mut slot = self.slot.lock().unwrap();
         if slot.latest.as_ref().is_some_and(|latest| latest.seq == seq) {
@@ -398,7 +402,7 @@ impl<P: Serialize> Checkpoint<P> {
     /// lease, so a run that another worker has taken over cannot store anything: the call then
     /// returns the same error as [`checkpoint`](crate::checkpoint) for a lost job, and the job is
     /// aborted at its next `.await` even when that error is ignored. A newer copy that is already
-    /// stored is kept. Like `save`, it is a stop
+    /// stored, for example from [`save_in`](Self::save_in), is kept. Like `save`, it is a stop
     /// point: when the job was asked to stop, it returns that error and the copy is saved
     /// together with the stopped state. Outside a job it does nothing and returns `Ok`.
     ///
@@ -453,18 +457,128 @@ impl<P: Serialize> Checkpoint<P> {
                 Ok(())
             }
             Ok(Fenced::Lost) => Err(control.lose()),
-            Ok(Fenced::Missing) => Err(JobError::permanent(std::io::Error::other(format!(
-                "job {} has no control row in schema {}; the pool given to jalari::init must \
-                 reach the database and schema the worker uses",
-                control.job_id(),
-                config.schema.name()
-            )))),
+            Ok(Fenced::Missing) => Err(missing_row(control, config.schema.name())),
             Err(e) => Err(JobError::new(format!(
                 "could not save the progress, it may have been saved: {}",
                 Error::from(e)
             ))),
         }
     }
+
+    /// Writes `progress` inside `transaction`, so it is stored if and only if the transaction
+    /// commits.
+    ///
+    /// Use it when each unit of work writes to tables in the database jalari uses: the rows and
+    /// the progress then commit together, and a retry, a takeover or a restart never applies a
+    /// unit twice. It does not commit `transaction`; call it as the last statement before
+    /// `commit`. It writes only to the database and never changes the copy that
+    /// [`save`](Self::save) keeps, so a transaction that rolls back leaves no trace.
+    ///
+    /// The write is fenced by the run's lease. When another worker has taken the job over, the
+    /// statement fails, which aborts `transaction`: its `commit` then returns `Ok` and stores
+    /// nothing, as PostgreSQL ends an aborted transaction with a rollback. The job is aborted at
+    /// its next `.await`, also when the error is ignored. The other rules:
+    ///
+    /// - The transaction must run on the database and schema of [`init`](crate::init), at the
+    ///   `READ COMMITTED` isolation level, PostgreSQL's default. Under `REPEATABLE READ` or
+    ///   `SERIALIZABLE`, a progress write of the same run that commits after the transaction's
+    ///   snapshot makes this call fail with a serialization error.
+    /// - Rolling back to a savepoint taken before the call keeps the transaction alive without
+    ///   the progress, so pass the outermost transaction or let a failure end it.
+    /// - The job's control row stays locked until the transaction ends. Commit within 10 seconds:
+    ///   the call sets `idle_in_transaction_session_timeout` to 10 seconds for the rest of the
+    ///   transaction, unless a shorter limit is set already, so that a frozen worker cannot keep
+    ///   the job from being taken over. Make no other jalari call for the same job on another
+    ///   connection before the commit, such as [`save_now`](Self::save_now), which waits for the
+    ///   lock and fails after 2 seconds.
+    ///
+    /// Like [`save`](Self::save), it is a stop point: when the job was asked to stop, it writes
+    /// the progress and then returns the stop error, so the transaction can roll back with the
+    /// unit it carried. Outside a job it does nothing and returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The job was asked to stop or to cancel, or its worker is shutting down
+    /// - Another worker has taken the job over (the job is aborted, and the transaction can no
+    ///   longer commit anything)
+    /// - The job's control row is missing, because the transaction runs on another database or
+    ///   schema than the worker's (a [`JobError::permanent`]; the transaction is aborted)
+    /// - `progress` cannot be serialized to JSON (a [`JobError::permanent`])
+    /// - The statement failed, for example with a serialization failure under `REPEATABLE READ`;
+    ///   retrying the unit in a new transaction can succeed
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize, Default)]
+    /// struct Cursor {
+    ///     last_id: i64,
+    /// }
+    ///
+    /// async fn archive(pool: jalari::sqlx::PgPool) -> jalari::JobResult {
+    ///     let (saved, checkpoint) = jalari::resume::<Cursor>()?;
+    ///     let mut cursor = saved.unwrap_or_default();
+    ///     loop {
+    ///         let mut transaction = pool.begin().await?;
+    ///         let moved: Option<i64> = jalari::sqlx::query_scalar(
+    ///             "WITH moved AS (
+    ///                  DELETE FROM orders WHERE id IN (
+    ///                      SELECT id FROM orders WHERE id > $1 ORDER BY id LIMIT 100
+    ///                  )
+    ///                  RETURNING *
+    ///              )
+    ///              INSERT INTO archived_orders SELECT * FROM moved RETURNING id",
+    ///         )
+    ///         .bind(cursor.last_id)
+    ///         .fetch_all(&mut *transaction)
+    ///         .await?
+    ///         .into_iter()
+    ///         .max();
+    ///         let Some(last_id) = moved else {
+    ///             return Ok(());
+    ///         };
+    ///         cursor.last_id = last_id;
+    ///         checkpoint.save_in(&mut transaction, &cursor).await?;
+    ///         transaction.commit().await?;
+    ///     }
+    /// }
+    /// ```
+    pub async fn save_in(
+        &self,
+        transaction: &mut sqlx::PgTransaction<'_>,
+        progress: &P,
+    ) -> JobResult {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        let value = serde_json::to_value(progress).map_err(JobError::permanent)?;
+        let halt = control.reach();
+        let seq = control.next_seq();
+        let config = config().map_err(JobError::permanent)?;
+        let written = write_progress_in(transaction, &config.schema, control, &value, seq).await;
+        match written {
+            Ok(()) => stop_point(halt).await,
+            Err(e) => Err(match raised(&e) {
+                Some(Fenced::Lost) => control.lose(),
+                Some(Fenced::Missing) => missing_row(control, config.schema.name()),
+                Some(Fenced::Written) | None => JobError::new(format!(
+                    "could not save the progress in the transaction: {}",
+                    Error::from(e)
+                )),
+            }),
+        }
+    }
+}
+
+fn missing_row(control: &RunControl, schema: &str) -> JobError {
+    JobError::permanent(std::io::Error::other(format!(
+        "job {} has no control row in schema {schema}; jalari must reach the database and \
+         schema the worker uses",
+        control.job_id()
+    )))
 }
 
 /// Loads the progress an earlier run of the current job saved, and the [`Checkpoint`] that
