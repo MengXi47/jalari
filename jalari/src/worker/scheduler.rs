@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::AssertSqlSafe;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -9,12 +9,15 @@ use tracing::{debug, warn};
 
 use super::runner::{ERROR_BACKOFF, Shared, wait};
 use crate::enqueue::{EnqueueOutcome, EnqueueRequest, timeout_ms};
+use crate::recurring::Missed;
 use crate::recurring::store::{
     JOB_COLUMNS, Plan, SCHEDULE_COLUMNS, StoredJob, StoredSchedule, lock_schedule,
 };
 use crate::{Error, ErrorKind, Result, Schedule};
 
 const HELD_FIRE_BACKOFF: Duration = Duration::from_millis(100);
+
+const MISSED_GRACE: TimeDelta = TimeDelta::seconds(60);
 
 #[derive(sqlx::FromRow)]
 struct DueRecurring {
@@ -164,11 +167,36 @@ impl Shared {
             let task = due.job.task.clone();
 
             let after = due.now.max(due.scheduled_at);
+            let late = due.now - due.scheduled_at;
             let planned = due
                 .stored
                 .parse()
                 .and_then(|schedule| schedule.next_after(after).map(|next| (schedule, next)));
             match planned {
+                Ok((schedule, next))
+                    if schedule.missed_policy() == Missed::Skip && late > MISSED_GRACE =>
+                {
+                    let next_run_at = schedule.unless_ended(next, due.run_count);
+                    sqlx::query(AssertSqlSafe(format!(
+                        "UPDATE {recurring}
+                         SET next_run_at = $2, task = $3,
+                             finished_at = CASE WHEN $2::timestamptz IS NULL THEN now() END
+                         WHERE name = $1",
+                        recurring = schema.table("recurring"),
+                    )))
+                    .bind(&due.name)
+                    .bind(next_run_at)
+                    .bind(&task)
+                    .execute(&mut *transaction)
+                    .await?;
+                    warn!(
+                        recurring = %due.name,
+                        scheduled_at = %due.scheduled_at,
+                        late_seconds = late.num_seconds(),
+                        ?next_run_at,
+                        "skipped a missed run of a recurring job"
+                    );
+                }
                 Ok((schedule, next)) => {
                     let outcome = EnqueueRequest::recurring(&due.name, due.job)
                         .insert(&mut transaction, schema)
