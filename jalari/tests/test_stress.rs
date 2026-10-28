@@ -415,9 +415,11 @@ async fn reset(database: &Database) {
     execute(
         &database.pool,
         format!(
-            "TRUNCATE {}, {} RESTART IDENTITY",
+            "TRUNCATE {}, {}, {}, {} RESTART IDENTITY",
             database.table("job"),
-            database.table("job_history")
+            database.table("job_history"),
+            database.table("job_control"),
+            database.table("job_step")
         ),
     )
     .await;
