@@ -77,6 +77,16 @@ pub(crate) fn declaring_crate(index: &Index, site: &JobSite<'_>) -> Option<Strin
     })
 }
 
+pub(crate) fn written_attributes<'i>(index: &'i Index, site: &JobSite<'_>) -> Option<&'i [String]> {
+    let job = site_job(site)?;
+    index
+        .units
+        .iter()
+        .filter(|unit| unit.krate == 0)
+        .find_map(|unit| unit.written.get(&job))
+        .map(Vec::as_slice)
+}
+
 fn site_job(site: &JobSite<'_>) -> Option<(String, String)> {
     Some((
         site.file?.to_owned(),

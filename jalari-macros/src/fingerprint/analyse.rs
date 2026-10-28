@@ -5,7 +5,7 @@ use quote::ToTokens;
 use super::hash::{Fnv, canonical};
 use super::index::{Index, ItemId, hashed_job};
 use super::lock::Lock;
-use super::reach::{MemberRule, reach};
+use super::reach::{MemberRule, reach, written_attributes};
 use super::reexport::{JALARI, Reexport};
 use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 
@@ -21,6 +21,9 @@ pub(crate) fn fingerprint(
     let mut item = site.item.clone();
     if let Some(reexport) = &index.reexport {
         reexport.rewrite_item(&mut item);
+    }
+    if let Some(written) = written_attributes(index, site) {
+        keep_written(&mut item.attrs, written);
     }
     let item = hashed_job(&item, index.reexport.as_ref());
     let site = &JobSite {
@@ -73,6 +76,20 @@ pub(crate) fn fingerprint(
         fnv.field(pin.as_bytes());
     }
     fnv.finish()
+}
+
+fn keep_written(attributes: &mut Vec<syn::Attribute>, written: &[String]) {
+    let mut unmatched: Vec<&str> = written.iter().map(String::as_str).collect();
+    attributes.retain(|attribute| {
+        let text = canonical(attribute.to_token_stream());
+        match unmatched.iter().position(|written| *written == text) {
+            Some(position) => {
+                unmatched.swap_remove(position);
+                true
+            }
+            None => false,
+        }
+    });
 }
 
 pub(crate) fn hex(fingerprint: u128) -> String {

@@ -2188,3 +2188,67 @@ fn test_wrapper_job_through_a_facade_hashes_like_a_direct_job() {
     assert_ne!(whole, direct);
     assert_eq!(unrelated, located);
 }
+
+#[test]
+fn test_cfg_attr_on_the_impl_keeps_fingerprint_in_every_configuration() {
+    let text = |predicate: &str| {
+        format!(
+            "use jalari::{{Job, JobResult}};
+
+#[derive(Serialize, Deserialize)]
+struct J;
+
+#[allow(dead_code)]
+#[cfg_attr({predicate}, allow(unused_variables))]
+#[jalari::job]
+#[cfg_attr(not(debug_assertions), allow(unused_mut), allow(unused_variables))]
+impl Job for J {{
+    async fn run(self) -> JobResult {{
+        Ok(())
+    }}
+}}
+"
+        )
+    };
+    let configured = |workspace: &Workspace, attributes: &str| {
+        let item: syn::ItemImpl = syn::parse_str(&format!(
+            "{attributes} impl Job for J {{ async fn run(self) -> JobResult {{ Ok(()) }} }}"
+        ))
+        .unwrap();
+        fingerprint(
+            &Index::build(workspace, None),
+            workspace,
+            &JobSite {
+                item: &item,
+                file: Some("src/lib.rs"),
+            },
+            VERSION,
+        )
+    };
+    let workspace = single(&[("src/lib.rs", &text("test"))]);
+    let dev = configured(&workspace, "#[allow(dead_code)]");
+    for (build, attributes) in [
+        ("test", "#[allow(dead_code)] #[allow(unused_variables)]"),
+        (
+            "release",
+            "#[allow(dead_code)] #[allow(unused_mut)] #[allow(unused_variables)]",
+        ),
+        (
+            "release test",
+            "#[allow(dead_code)] #[allow(unused_variables)] #[allow(unused_mut)] #[allow(unused_variables)]",
+        ),
+    ] {
+        assert_eq!(configured(&workspace, attributes), dev, "{build} build");
+    }
+    assert_ne!(
+        configured(&workspace, ""),
+        dev,
+        "an attribute written on the impl is hashed"
+    );
+    let edited = single(&[("src/lib.rs", &text("miri"))]);
+    assert_ne!(
+        configured(&edited, "#[allow(dead_code)]"),
+        dev,
+        "the cfg_attr text is hashed"
+    );
+}

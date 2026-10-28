@@ -108,6 +108,7 @@ pub(crate) struct Unit {
     pub(crate) globs: BTreeMap<String, BTreeSet<String>>,
     pub(crate) jobs: BTreeSet<(String, String)>,
     pub(crate) declared: BTreeMap<(String, String), Vec<String>>,
+    pub(crate) written: BTreeMap<(String, String), Vec<String>>,
     pub(crate) always: Vec<ItemId>,
     pub(crate) open: Vec<ImplId>,
 }
@@ -262,6 +263,13 @@ impl Builder<'_> {
                 .into_iter()
                 .map(|(job, call)| ((path.to_owned(), job), call)),
         );
+        for (job, attributes) in scan.written {
+            record
+                .written
+                .entry((path.to_owned(), job))
+                .or_default()
+                .extend(attributes);
+        }
         let place = Place {
             unit,
             file: path,
@@ -603,6 +611,7 @@ struct Scan {
     uses: BTreeSet<String>,
     globs: BTreeSet<String>,
     jobs: BTreeSet<String>,
+    written: BTreeMap<String, Vec<String>>,
 }
 
 impl<'ast> Visit<'ast> for Scan {
@@ -625,8 +634,20 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_item_impl(&mut self, item_impl: &'ast ItemImpl) {
         if is_job_impl(item_impl) {
-            self.jobs
-                .insert(canonical(item_impl.self_ty.to_token_stream()));
+            let job = canonical(item_impl.self_ty.to_token_stream());
+            if item_impl
+                .attrs
+                .iter()
+                .any(|attribute| attribute.path().is_ident("cfg_attr"))
+            {
+                self.written.entry(job.clone()).or_default().extend(
+                    item_impl
+                        .attrs
+                        .iter()
+                        .map(|attribute| canonical(attribute.to_token_stream())),
+                );
+            }
+            self.jobs.insert(job);
         }
         visit::visit_item_impl(self, item_impl);
     }
