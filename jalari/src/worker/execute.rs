@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info_span, warn};
 
-use super::close::{Closing, Ending, answered, decide, refused};
+use super::close::{Closing, Ending, Outcome, answered, decide, refused};
 use super::lifeline::Incarnation;
 use super::middleware::{Finished, JobMeta, Next, report_finished};
 use super::ownership::{Claimed, Closed, close};
@@ -16,7 +16,7 @@ use super::runs::{Hold, PendingClaim, Registration};
 use crate::enqueue::Columns;
 use crate::job::context::{self, Captured};
 use crate::job::registry::{ContextKey, JobRegistration};
-use crate::job::{RunControl, run};
+use crate::job::{RunControl, run, warn_unfinished};
 use crate::{JobError, JobId, JobResult, JobRun, Priority, Result, Schema};
 
 const MAX_CLOSE_TRIES: u32 = 5;
@@ -211,6 +211,9 @@ impl Shared {
                 Ok(Closed::Written { children_inserted }) => {
                     registration.close();
                     closing.log(claimed.hold.job_id);
+                    if matches!(closing.outcome(), Outcome::Succeeded) {
+                        warn_unfinished(&pool, &self.config.schema, control, claimed.attempt).await;
+                    }
                     if let Some(children) = closing.children() {
                         let buffered = i64::try_from(children.len()).unwrap_or(i64::MAX);
                         debug!(

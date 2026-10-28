@@ -1,6 +1,7 @@
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -9,10 +10,67 @@ use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{Job, JobError, JobId, JobResult, StopOutcome, Worker, WorkerConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 const QUEUE: &str = "step";
 const SETTLED: Duration = Duration::from_secs(15);
 const LOST: &str = "the worker no longer owns the job";
+const UNFINISHED: &str = "the job succeeded without finishing steps an earlier run started, so \
+                          their effects may or may not have happened";
+
+static WARNINGS: LazyLock<Mutex<Vec<BTreeMap<String, String>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[derive(Default)]
+struct Fields(BTreeMap<String, String>);
+
+impl Visit for Fields {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+}
+
+struct CaptureWarnings;
+
+impl Subscriber for CaptureWarnings {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() == Level::WARN
+    }
+
+    fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        WARNINGS.lock().unwrap().push(fields.0);
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+fn unfinished_warnings() -> Vec<String> {
+    WARNINGS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|fields| fields.get("message").map(String::as_str) == Some(UNFINISHED))
+        .filter_map(|fields| fields.get("steps").cloned())
+        .collect()
+}
 
 struct Tables {
     pool: PgPool,
@@ -615,6 +673,26 @@ impl Job for Clearable {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Abandoned {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for Abandoned {
+    const NAME: &'static str = "step_abandoned";
+
+    async fn run(self) -> JobResult {
+        if jalari::current_job().unwrap().attempt() == 1 {
+            jalari::step("left_behind", |_| async {
+                Err::<(), _>(JobError::new("the first run fails in the step".to_owned()))
+            })
+            .await?;
+        }
+        jalari::step("kept", |_| async { Ok(()) }).await
+    }
+}
+
 async fn spawn_worker() -> RunningWorker {
     let mut config = WorkerConfig::default();
     config.poll_interval = Duration::from_millis(100);
@@ -1178,11 +1256,41 @@ async fn check_steps_are_listed_and_cleared() {
     assert_eq!(counted(label), 2);
 }
 
+async fn check_success_warns_about_unfinished_steps() {
+    let before = unfinished_warnings();
+    let id = enqueue(&Abandoned {
+        label: "abandoned".to_owned(),
+    })
+    .await;
+    wait_for_state(id, "succeeded").await;
+    wait_until("the unfinished step to be logged", SETTLED, || async {
+        unfinished_warnings().len() > before.len()
+    })
+    .await;
+    assert_eq!(
+        unfinished_warnings()[before.len()..],
+        ["[\"left_behind\"]".to_owned()]
+    );
+    let states: Vec<(String, String)> = step_rows(id)
+        .await
+        .into_iter()
+        .map(|row| (row.key, row.state))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("kept".to_owned(), "done".to_owned()),
+            ("left_behind".to_owned(), "started".to_owned())
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_step() {
     let Some(database) = Database::start("step", 16).await else {
         return;
     };
+    tracing::subscriber::set_global_default(CaptureWarnings).unwrap();
     let _ = TABLES.set(Tables {
         pool: database.pool.clone(),
         schema: database.schema_name.clone(),
@@ -1206,6 +1314,7 @@ async fn test_step() {
     check_replace_discards_the_steps().await;
     check_a_retried_failure_keeps_its_steps().await;
     check_steps_are_listed_and_cleared().await;
+    check_success_warns_about_unfinished_steps().await;
     worker.stop().await;
     database.finish().await;
 }

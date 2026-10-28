@@ -114,6 +114,10 @@ impl StepKeys {
         }
     }
 
+    fn visited(&self) -> Vec<String> {
+        self.0.lock().unwrap().keys().cloned().collect()
+    }
+
     fn set(&self, key: &str, state: KeyState) {
         if let Some(current) = self.0.lock().unwrap().get_mut(key) {
             *current = state;
@@ -325,6 +329,37 @@ impl StepRecord<'_> {
 
     fn decode(&self, e: sqlx::Error) -> JobError {
         JobError::new(format!("step {:?}: {}", self.key, Error::from(e)))
+    }
+}
+
+pub(crate) async fn warn_unfinished(
+    pool: &PgPool,
+    schema: &Schema,
+    control: &RunControl,
+    attempt: i32,
+) {
+    let visited = control.steps().visited();
+    if visited.is_empty() && attempt <= 1 {
+        return;
+    }
+    let unfinished: sqlx::Result<Vec<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT key FROM {job_step}
+         WHERE job_id = $1 AND state = '{STARTED}' AND NOT (key = ANY($2))
+         ORDER BY key",
+        job_step = schema.table("job_step"),
+    )))
+    .bind(control.job_id())
+    .bind(&visited)
+    .fetch_all(pool)
+    .await;
+    match unfinished {
+        Ok(keys) if keys.is_empty() => {}
+        Ok(keys) => warn!(
+            steps = ?keys,
+            "the job succeeded without finishing steps an earlier run started, so their effects \
+             may or may not have happened"
+        ),
+        Err(e) => debug!(error = %Error::from(e), "could not look for unfinished steps"),
     }
 }
 

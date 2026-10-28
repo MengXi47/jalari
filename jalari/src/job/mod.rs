@@ -22,5 +22,5 @@ pub use priority::Priority;
 pub use run::{JobRun, current_job, interrupted, shutdown_requested};
 pub(crate) use state::JOB_KEY_STATES;
 pub use state::JobState;
-pub(crate) use step::in_step;
 pub use step::{StepRun, step};
+pub(crate) use step::{in_step, warn_unfinished};
