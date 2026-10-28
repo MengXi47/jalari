@@ -3,7 +3,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{Database, LEDGER, RunningWorker, fast_retry, worker_config};
-use jalari::sqlx::{self, AssertSqlSafe, Connection, PgConnection};
+use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{Finished, Job, JobError, JobMeta, JobMiddleware, JobResult, Next, Worker};
 use serde::{Deserialize, Serialize};
 
@@ -498,16 +498,7 @@ async fn check_refused_heartbeats_keep_the_jobs(database: &Database) {
         !starts("stall").is_empty()
     })
     .await;
-    let mut blocker = PgConnection::connect_with(&database.options).await.unwrap();
-    let mut stall = blocker.begin().await.unwrap();
-    sqlx::query(AssertSqlSafe(format!(
-        "SELECT 1 FROM {} WHERE id = $1::uuid FOR UPDATE",
-        database.table("worker")
-    )))
-    .bind(&worker_id)
-    .execute(&mut *stall)
-    .await
-    .unwrap();
+    stall_heartbeats(database).await;
     tokio::time::sleep(PROBE_AFTER).await;
     let probe = jalari::enqueue(&Ticker {
         label: "stall_probe".to_owned(),
@@ -518,15 +509,16 @@ async fn check_refused_heartbeats_keep_the_jobs(database: &Database) {
     .id()
     .0;
     tokio::time::sleep(STALL - PROBE_AFTER).await;
-    let heartbeat_age: f64 = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT EXTRACT(EPOCH FROM clock_timestamp() - heartbeat_at)::float8 FROM {} WHERE id = $1::uuid",
+    let heartbeat_age: Option<f64> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT EXTRACT(EPOCH FROM clock_timestamp() - heartbeat_at)::float8
+         FROM {} WHERE id = $1::uuid",
         database.table("worker")
     )))
     .bind(&worker_id)
-    .fetch_one(&database.pool)
+    .fetch_optional(&database.pool)
     .await
     .unwrap();
-    stall.rollback().await.unwrap();
+    end_stall(database).await;
     let released = Instant::now();
     common::wait_until(
         "the ticker and the probe to succeed",
@@ -540,11 +532,14 @@ async fn check_refused_heartbeats_keep_the_jobs(database: &Database) {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let probe_started = starts("stall_probe")[0];
     eprintln!(
-        "stall: heartbeats refused for {STALL:?} (last one {heartbeat_age:.1} s old at the end), \
+        "stall: heartbeats refused for {STALL:?} (last one {heartbeat_age:?} s old at the end), \
          the probe enqueued during it started {:?} after it ended",
         probe_started.saturating_duration_since(released)
     );
-    assert!(heartbeat_age >= 11.0, "{heartbeat_age}");
+    assert!(
+        heartbeat_age.is_some_and(|age| age >= 11.0),
+        "the worker row is gone or was beaten during the stall: {heartbeat_age:?}"
+    );
     ran_once(database, id, "stall").await;
     ran_once(database, probe, "stall_probe").await;
     assert!(
@@ -576,20 +571,29 @@ async fn check_lost_connection_during_a_stall_aborts_at_once(database: &Database
         !starts("cut#1").is_empty()
     })
     .await;
-    let mut blocker = PgConnection::connect_with(&database.options).await.unwrap();
-    let mut stall = blocker.begin().await.unwrap();
-    sqlx::query(AssertSqlSafe(format!(
-        "SELECT 1 FROM {} WHERE id = $1::uuid FOR UPDATE",
-        database.table("worker")
-    )))
-    .bind(&worker_id)
-    .execute(&mut *stall)
-    .await
-    .unwrap();
+    stall_heartbeats(database).await;
     tokio::time::sleep(STALL).await;
+    common::wait_until(
+        "a heartbeat that has just started waiting",
+        Duration::from_secs(5),
+        || async {
+            sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE application_name = 'jalari lifeline ' || $1 AND state = 'active'
+                         AND clock_timestamp() - query_start < interval '200 milliseconds'
+                 )",
+            )
+            .bind(&worker_id)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap()
+        },
+    )
+    .await;
     assert_eq!(database.terminate_lifelines(1).await, 1);
     let killed = Instant::now();
-    stall.rollback().await.unwrap();
+    end_stall(database).await;
     common::wait_until("the job to run again", Duration::from_secs(15), || async {
         !starts("cut#2").is_empty()
     })
@@ -645,62 +649,78 @@ async fn check_refusals_end_after_the_limit(database: &Database) {
         !starts("refused#1").is_empty()
     })
     .await;
-    let mut blocker = PgConnection::connect_with(&database.options).await.unwrap();
-    let mut stall = blocker.begin().await.unwrap();
-    sqlx::query(AssertSqlSafe(format!(
-        "SELECT 1 FROM {} WHERE id = $1::uuid FOR UPDATE",
-        database.table("worker")
-    )))
-    .bind(&worker_id)
-    .execute(&mut *stall)
-    .await
-    .unwrap();
+    stall_heartbeats(database).await;
     let stalled = Instant::now();
+    let last_event = || {
+        LEDGER
+            .events("refused#1")
+            .into_iter()
+            .map(|(_, at)| at)
+            .max()
+            .unwrap()
+    };
     common::wait_until(
         "the worker to give up on its refused heartbeats",
         REFUSAL_LIMIT + Duration::from_secs(5),
-        || async {
-            database
-                .lifelines()
-                .await
-                .iter()
-                .any(|(_, lifeline)| *lifeline != worker_id)
-        },
+        || async { last_event().elapsed() > Duration::from_millis(500) },
     )
     .await;
-    let replaced = Instant::now();
-    let gave_up_after = replaced.duration_since(stalled);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let stopped = LEDGER
-        .events("refused#1")
-        .into_iter()
-        .map(|(_, at)| at)
-        .max()
-        .unwrap();
-    stall.rollback().await.unwrap();
-    common::wait_until("the job to run again", Duration::from_secs(15), || async {
-        !starts("refused#2").is_empty()
-    })
+    let gave_up_after = last_event().duration_since(stalled);
+    end_stall(database).await;
+    common::wait_until(
+        "the job to run again under a new lifeline",
+        Duration::from_secs(15),
+        || async { !starts("refused#2").is_empty() },
+    )
     .await;
     eprintln!(
-        "refused: the worker gave up {gave_up_after:?} into a stall that refused every \
-         heartbeat, its run stopped {:?} before the new lifeline was seen",
-        replaced.saturating_duration_since(stopped)
+        "refused: the worker gave up and its run stopped {gave_up_after:?} into a stall that \
+         refused every heartbeat"
     );
     assert!(
         (REFUSAL_LIMIT - Duration::from_secs(2)..=REFUSAL_LIMIT + Duration::from_secs(3))
             .contains(&gave_up_after),
         "{gave_up_after:?}"
     );
-    assert!(
-        stopped <= replaced,
-        "the old run kept going after the worker gave up"
-    );
+    assert_ne!(database.lifelines().await[0].1, worker_id);
     assert_eq!(
         jalari::cancel(jalari::JobId(id)).await.unwrap(),
         jalari::CancelOutcome::Requested
     );
     worker.stop().await;
+}
+
+async fn stall_heartbeats(database: &Database) {
+    let schema = &database.schema_name;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS \"{schema}\".beat_stall (since timestamptz NOT NULL);
+         CREATE OR REPLACE FUNCTION \"{schema}\".stall_beat() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             WHILE EXISTS (SELECT 1 FROM \"{schema}\".beat_stall) LOOP
+                 PERFORM pg_sleep(0.05);
+             END LOOP;
+             RETURN NEW;
+         END $$;
+         DROP TRIGGER IF EXISTS stall_beat ON {worker};
+         CREATE TRIGGER stall_beat BEFORE UPDATE ON {worker} FOR EACH ROW
+         EXECUTE FUNCTION \"{schema}\".stall_beat();
+         INSERT INTO \"{schema}\".beat_stall VALUES (now());",
+        worker = database.table("worker"),
+    )))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+}
+
+async fn end_stall(database: &Database) {
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "DELETE FROM \"{}\".beat_stall",
+        database.schema_name
+    )))
+    .execute(&database.pool)
+    .await
+    .unwrap();
 }
 
 async fn cut_closes(database: &Database, outage: Duration) {
