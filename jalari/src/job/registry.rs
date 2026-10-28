@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use crate::recurring::Missed;
 use crate::worker::Provided;
 use crate::{Job, JobError, JobResult, Priority, RetryPolicy};
 
@@ -29,6 +30,7 @@ pub struct JobRegistration {
 pub struct CronRegistration {
     pub expression: &'static str,
     pub timezone: &'static str,
+    pub missed: Missed,
     pub payload: fn() -> serde_json::Result<Vec<u8>>,
 }
 
@@ -77,10 +79,15 @@ impl JobRegistration {
 }
 
 impl CronRegistration {
-    pub const fn new<T: Job + Default>(expression: &'static str, timezone: &'static str) -> Self {
+    pub const fn new<T: Job + Default>(
+        expression: &'static str,
+        timezone: &'static str,
+        missed: Missed,
+    ) -> Self {
         Self {
             expression,
             timezone,
+            missed,
             payload: default_payload::<T>,
         }
     }

@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use jalari::admin::{self, JobFilter};
+use jalari::recurring::Missed;
 use jalari::sqlx::postgres::PgPoolOptions;
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
@@ -56,6 +58,18 @@ impl Job for Daily {
     }
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct Hourly;
+
+#[jalari::job(cron = "0 0 * * * *", missed = "skip", queue = "daily")]
+impl Job for Hourly {
+    const NAME: &'static str = "r_hourly";
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Report {
     title: String,
@@ -97,6 +111,23 @@ impl Fixture {
         .execute(&self.pool)
         .await
         .unwrap();
+    }
+
+    async fn insert_counted_row(&self, name: &str, cron: &str, run_count: i32) -> DateTime<Utc> {
+        sqlx::query_scalar(AssertSqlSafe(format!(
+            "INSERT INTO {} (name, cron, timezone, task, payload, queue, max_attempts, managed,
+                 next_run_at, run_count)
+             VALUES ($1, $2, 'UTC', $1, 'null', 'daily', 1, TRUE,
+                 date_trunc('hour', now()) + interval '2 hours', $3)
+             RETURNING next_run_at",
+            self.recurring_table()
+        )))
+        .bind(name)
+        .bind(cron)
+        .bind(run_count)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
     }
 
     async fn disable_directly(&self, name: &str) {
@@ -200,6 +231,9 @@ async fn test_recurring() {
     fixture
         .insert_row("r_daily", "0 0 1 * * *", "r_daily", true)
         .await;
+    let hourly_next_run = fixture
+        .insert_counted_row("r_hourly", "0 0 * * * *", 7)
+        .await;
 
     let mut config = WorkerConfig::default();
     config.poll_interval = Duration::from_millis(200);
@@ -218,6 +252,7 @@ async fn test_recurring() {
 
     check_declared_jobs_are_synced().await;
     check_declared_schedule_follows_priority_on_sync().await;
+    check_declared_schedule_follows_missed_on_sync(hourly_next_run).await;
     check_code_declared_cron_fires().await;
     check_code_declared_cron_cannot_change_at_runtime(&fixture).await;
     check_runtime_schedule_is_independent().await;
@@ -295,6 +330,19 @@ async fn check_declared_schedule_follows_priority_on_sync() {
         info("other_binary").await.unwrap().priority,
         Priority::Normal
     );
+}
+
+async fn check_declared_schedule_follows_missed_on_sync(hourly_next_run: DateTime<Utc>) {
+    let hourly = info("r_hourly").await.unwrap();
+    assert_eq!(hourly.missed, Missed::Skip);
+    assert_eq!(hourly.run_count, 7);
+    assert_eq!(hourly.next_run_at, Some(hourly_next_run));
+    assert_eq!(
+        hourly.schedule,
+        Some(jalari::Schedule::from(Cron::new("0 0 * * * *").unwrap()).missed(Missed::Skip))
+    );
+    assert_eq!(info("r_tick").await.unwrap().missed, Missed::Once);
+    assert_eq!(info("r_daily").await.unwrap().missed, Missed::Once);
 }
 
 async fn check_code_declared_cron_fires() {

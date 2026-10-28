@@ -607,6 +607,19 @@ fn test_aliases_priority_and_checkpoints_keep_fingerprint() {
 }
 
 #[test]
+fn test_missed_keeps_fingerprint() {
+    let base = source("", "");
+    let nightly = with_attribute(&base, "cron = \"0 0 3 * * *\"");
+    for policy in ["once", "skip"] {
+        let declared = with_attribute(
+            &base,
+            &format!("cron = \"0 0 3 * * *\", missed = \"{policy}\""),
+        );
+        assert_eq!(lib(&nightly), lib(&declared), "{policy}");
+    }
+}
+
+#[test]
 fn test_retry_policy_keeps_fingerprint() {
     let policy = |attempts: &str| {
         with_constant(

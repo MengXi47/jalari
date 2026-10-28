@@ -73,7 +73,8 @@ impl Shared {
                 )
             })?;
 
-            let schedule = Schedule::from(declared.cron.clone());
+            let schedule =
+                Schedule::from(declared.cron.clone()).missed(declared.declaration.missed);
             let stored = schedule.stored();
             let existing = lock_schedule(&mut transaction, schema, registration.name).await?;
             let unchanged = existing.as_ref().filter(|existing| {

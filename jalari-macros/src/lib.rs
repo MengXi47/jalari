@@ -37,6 +37,9 @@ use syn::{
 /// * `cron` - Cron expression with five or six fields; makes the job recurring. `T` must
 ///   implement `Default`, which provides the arguments of every run
 /// * `timezone` - IANA time zone for `cron`; `UTC` when omitted. Only valid with `cron`
+/// * `missed` - What the scheduler does with a run more than a minute overdue: `"once"`
+///   enqueues one catch-up run, `"skip"` enqueues none and waits for the next run. `"once"`
+///   when omitted. Only valid with `cron`
 /// * `fingerprint` - `true` turns the code fingerprint on for this job; `false` when omitted
 /// * `checkpoints` - `true` declares that the job reaches checkpoints regularly; an abort at
 ///   `stop_timeout` or `shutdown_timeout` is then logged as an error. `false` when omitted
@@ -68,8 +71,8 @@ use syn::{
 /// reached code names, and the jalari version. Formatting, comments and unreachable code do not
 /// change it, and neither does the directory the sources are in.
 ///
-/// `NAME`, `ALIASES`, `PRIORITY` and `RETRY_POLICY`, and the `name`, `aliases`, `priority` and
-/// `checkpoints` arguments, are left out, in either form. Renaming a job with its old name in
+/// `NAME`, `ALIASES`, `PRIORITY` and `RETRY_POLICY`, and the `name`, `aliases`, `priority`,
+/// `checkpoints` and `missed` arguments, are left out, in either form. Renaming a job with its old name in
 /// `aliases`, or changing its priority or retry policy, therefore leaves waiting jobs runnable
 /// by the new build. `MAX_ATTEMPTS` and `TIMEOUT` are covered in either form.
 ///
@@ -134,6 +137,7 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct JobArguments {
     cron: Option<LitStr>,
     timezone: Option<LitStr>,
+    missed: Option<Ident>,
     queue: Option<LitStr>,
     fingerprint: Option<LitBool>,
     checkpoints: Option<LitBool>,
@@ -156,6 +160,8 @@ const CONSTANTS: [(&str, &str, ConstantItem); 5] = [
     ("priority", "PRIORITY", priority_item),
     ("aliases", "ALIASES", aliases_item),
 ];
+
+const MISSED: [(&str, &str); 2] = [("once", "Once"), ("skip", "Skip")];
 
 const PRIORITIES: [(&str, &str); 4] = [
     ("low", "Low"),
@@ -213,9 +219,16 @@ fn expand(
                 Some(timezone) => quote!(#timezone),
                 None => quote!("UTC"),
             };
+            let missed = arguments
+                .missed
+                .unwrap_or_else(|| Ident::new("Once", Span2::call_site()));
             quote! {
                 ::core::option::Option::Some(
-                    ::jalari::__private::CronRegistration::new::<#job_type>(#expression, #timezone)
+                    ::jalari::__private::CronRegistration::new::<#job_type>(
+                        #expression,
+                        #timezone,
+                        ::jalari::recurring::Missed::#missed,
+                    )
                 )
             }
         }
@@ -373,6 +386,7 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
     let mut parsed = JobArguments {
         cron: None,
         timezone: None,
+        missed: None,
         queue: None,
         fingerprint: None,
         checkpoints: None,
@@ -411,6 +425,13 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
             *slot = Some(bool_value(&argument)?);
             continue;
         }
+        if argument.path.is_ident("missed") {
+            if parsed.missed.is_some() {
+                return Err(syn::Error::new(span, "duplicate argument"));
+            }
+            parsed.missed = Some(missed_variant(&argument, span)?);
+            continue;
+        }
         let slot = if argument.path.is_ident("cron") {
             &mut parsed.cron
         } else if argument.path.is_ident("timezone") {
@@ -421,7 +442,7 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
             return Err(syn::Error::new_spanned(
                 &argument.path,
                 "expected `name`, `queue`, `max_attempts`, `timeout`, `priority`, `aliases`, \
-                 `cron`, `timezone`, `fingerprint` or `checkpoints`",
+                 `cron`, `timezone`, `missed`, `fingerprint` or `checkpoints`",
             ));
         };
         if slot.is_some() {
@@ -434,6 +455,9 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
             timezone,
             "`timezone` requires `cron`",
         ));
+    }
+    if let (None, Some(missed)) = (&parsed.cron, &parsed.missed) {
+        return Err(syn::Error::new(missed.span(), "`missed` requires `cron`"));
     }
     Ok(parsed)
 }
@@ -471,6 +495,15 @@ fn priority_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem>
     Ok(parse_quote_spanned! {span=>
         const PRIORITY: ::jalari::Priority = ::jalari::Priority::#variant;
     })
+}
+
+fn missed_variant(argument: &MetaNameValue, span: Span2) -> syn::Result<Ident> {
+    let policy = string_value(argument)?;
+    MISSED
+        .iter()
+        .find(|(text, _)| policy.value() == *text)
+        .map(|(_, variant)| Ident::new(variant, span))
+        .ok_or_else(|| syn::Error::new_spanned(&policy, "expected \"once\" or \"skip\""))
 }
 
 fn aliases_item(argument: &MetaNameValue, span: Span2) -> syn::Result<ImplItem> {

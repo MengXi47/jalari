@@ -153,6 +153,62 @@ fn test_checkpoints_flag_leaves_the_fingerprint_alone() {
     );
 }
 
+#[test]
+fn test_missed_argument_takes_once_or_skip() {
+    for text in [
+        "cron = \"0 0 3 * * *\", missed = \"once\"",
+        "missed = \"skip\", cron = \"0 0 3 * * *\", timezone = \"Asia/Taipei\"",
+    ] {
+        assert!(
+            parse_arguments(arguments(text)).is_ok(),
+            "{text} is accepted"
+        );
+    }
+    for text in [
+        "cron = \"0 0 3 * * *\", missed = \"all\"",
+        "cron = \"0 0 3 * * *\", missed = \"Skip\"",
+        "cron = \"0 0 3 * * *\", missed = true",
+        "cron = \"0 0 3 * * *\", missed = \"skip\", missed = \"once\"",
+    ] {
+        assert!(
+            parse_arguments(arguments(text)).is_err(),
+            "{text} is rejected"
+        );
+    }
+    let message = parse_arguments(arguments("cron = \"0 0 3 * * *\", missed = \"all\""))
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(message, "expected \"once\" or \"skip\"");
+}
+
+#[test]
+fn test_missed_argument_requires_cron() {
+    for text in ["missed = \"skip\"", "queue = \"q\", missed = \"once\""] {
+        let message = parse_arguments(arguments(text)).err().unwrap().to_string();
+        assert_eq!(message, "`missed` requires `cron`", "{text}");
+    }
+    let message = parse_arguments(arguments("misssed = \"skip\""))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("`missed`"), "{message}");
+}
+
+#[test]
+fn test_missed_policy_reaches_the_registration() {
+    let skip = expanded("cron = \"0 0 3 * * *\", missed = \"skip\"", SHORT);
+    assert!(
+        skip.contains(":: jalari :: recurring :: Missed :: Skip"),
+        "{skip}"
+    );
+    let default = expanded("cron = \"0 0 3 * * *\"", SHORT);
+    assert!(
+        default.contains(":: jalari :: recurring :: Missed :: Once"),
+        "{default}"
+    );
+}
+
 const UNNAMED: &str = "impl Job for SendEmail {
     async fn run(self) -> JobResult { Ok(()) }
 }";

@@ -17,7 +17,7 @@ pub(crate) type ImplId = usize;
 
 const UNHASHED_CONSTANTS: [&str; 4] = ["NAME", "ALIASES", "PRIORITY", "RETRY_POLICY"];
 
-const UNHASHED_ARGUMENTS: [&str; 4] = ["name", "aliases", "priority", "checkpoints"];
+const UNHASHED_ARGUMENTS: [&str; 5] = ["name", "aliases", "priority", "checkpoints", "missed"];
 
 const KEYWORDS: &[&str] = &[
     "_",
