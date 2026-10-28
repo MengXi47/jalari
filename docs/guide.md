@@ -397,19 +397,14 @@ same path through `jalari`, so moving a fingerprinted job behind `platform`, ren
 or bumping its version leaves waiting jobs runnable, as long as the job reaches `platform` only
 through `__jalari`.
 
-The fingerprint does not look inside a macro call, so a job declared through the wrapper with
-`fingerprint = true` is fingerprinted with every item of its crate and of its `path`
-dependencies, as when the compiler does not report the job's file. A fingerprinted job of the
-same crate that names an item the call mentions, such as `Job` or `JobResult`, also covers the
-whole call, so editing a job declared through the wrapper changes the fingerprints of such jobs
-too.
+A job declared through the wrapper is fingerprinted like a job written as a plain item.
 
 The repository's [`tests/facade`](../tests/facade) holds such a pair: `facade` re-exports jalari,
 and `facade-consumer` defines a plain and a recurring job through it without depending on
 jalari. `cargo test -p facade-consumer` builds them, checks every argument of the recurring
 job's attribute, checks that its fingerprint equals that of the same job written against jalari,
-declares a third job through `facade::job!`, and with `DATABASE_URL` set runs the plain job and
-the third one on a worker.
+declares a third job through `facade::job!` and checks its fingerprint the same way, and with
+`DATABASE_URL` set runs the plain job and the third one on a worker.
 
 ## Enqueueing
 
