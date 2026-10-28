@@ -227,7 +227,7 @@ fn expand(
                     ::jalari::__private::CronRegistration::new::<#job_type>(
                         #expression,
                         #timezone,
-                        ::jalari::recurring::Missed::#missed,
+                        ::jalari::Missed::#missed,
                     )
                 )
             }

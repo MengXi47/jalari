@@ -680,7 +680,7 @@ impl Job for SampleMetrics {
 }
 
 let every_five_minutes = jalari::Schedule::from(jalari::Cron::new("0 */5 * * * *")?)
-    .missed(jalari::recurring::Missed::Skip);
+    .missed(jalari::Missed::Skip);
 jalari::recurring::add_or_update("metrics:eu", every_five_minutes, &sample).await?;
 ```
 

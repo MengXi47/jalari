@@ -25,7 +25,7 @@ pub use job::{
     Checkpoint, Command, Job, JobError, JobId, JobResult, JobRun, JobState, Priority, checkpoint,
     current_job, interrupted, resume, scope, shutdown_requested, snooze,
 };
-pub use recurring::{Cron, Interval, IntervalUnit, RecurringInfo, Schedule};
+pub use recurring::{Cron, Interval, IntervalUnit, Missed, RecurringInfo, Schedule};
 pub use sqlx;
 pub use storage::{
     Migration, SCHEMA_VERSION, Schema, migrate, migrate_to, migrations, schema_version,

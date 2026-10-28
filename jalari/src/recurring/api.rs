@@ -157,7 +157,7 @@ pub async fn add_or_update<T: Job>(
 /// new cron or interval starts counting its runs again from zero; new end conditions alone
 /// keep the count and finish or revive the schedule accordingly; an unchanged schedule is
 /// left as it is. The schedule's [`missed`](Schedule::missed) policy is stored too, so a plain
-/// cron or interval sets it back to [`Missed::Once`](crate::recurring::Missed::Once); changing
+/// cron or interval sets it back to [`Missed::Once`](crate::Missed::Once); changing
 /// only the policy keeps the count and the next run.
 ///
 /// # Errors

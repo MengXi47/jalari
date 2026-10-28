@@ -1,12 +1,11 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
-use jalari::recurring::Missed;
 use jalari::sqlx::postgres::PgPoolOptions;
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
 use jalari::{
-    CancellationToken, Interval, IntervalUnit, Job, JobResult, RecurringInfo, Schedule, Schema,
-    Worker, WorkerConfig, recurring,
+    CancellationToken, Interval, IntervalUnit, Job, JobResult, Missed, RecurringInfo, Schedule,
+    Schema, Worker, WorkerConfig, recurring,
 };
 use serde::{Deserialize, Serialize};
 

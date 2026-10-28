@@ -333,7 +333,7 @@ impl Schedule {
     ///
     /// ```rust
     /// let hourly = jalari::Schedule::from(jalari::Cron::new("0 0 * * * *")?)
-    ///     .missed(jalari::recurring::Missed::Skip);
+    ///     .missed(jalari::Missed::Skip);
     /// assert_ne!(hourly, jalari::Schedule::from(jalari::Cron::new("0 0 * * * *")?));
     /// # Ok::<(), jalari::Error>(())
     /// ```

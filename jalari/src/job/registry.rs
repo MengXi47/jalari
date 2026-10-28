@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::recurring::Missed;
+use crate::Missed;
 use crate::worker::Provided;
 use crate::{Job, JobError, JobResult, Priority, RetryPolicy};
 

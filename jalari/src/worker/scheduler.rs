@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::runner::{ERROR_BACKOFF, Shared, wait};
+use crate::Missed;
 use crate::enqueue::{EnqueueOutcome, EnqueueRequest, timeout_ms};
-use crate::recurring::Missed;
 use crate::recurring::store::{
     JOB_COLUMNS, Plan, SCHEDULE_COLUMNS, StoredJob, StoredSchedule, lock_schedule,
 };

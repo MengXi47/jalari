@@ -12,10 +12,10 @@ use crate::{Error, ErrorKind};
 /// # Examples
 ///
 /// ```rust
-/// let missed: jalari::recurring::Missed = "skip".parse()?;
-/// assert_eq!(missed, jalari::recurring::Missed::Skip);
+/// let missed: jalari::Missed = "skip".parse()?;
+/// assert_eq!(missed, jalari::Missed::Skip);
 /// assert_eq!(missed.to_string(), "skip");
-/// assert_eq!(jalari::recurring::Missed::default(), jalari::recurring::Missed::Once);
+/// assert_eq!(jalari::Missed::default(), jalari::Missed::Once);
 /// # Ok::<(), jalari::Error>(())
 /// ```
 #[non_exhaustive]

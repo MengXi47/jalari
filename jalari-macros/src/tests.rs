@@ -198,15 +198,9 @@ fn test_missed_argument_requires_cron() {
 #[test]
 fn test_missed_policy_reaches_the_registration() {
     let skip = expanded("cron = \"0 0 3 * * *\", missed = \"skip\"", SHORT);
-    assert!(
-        skip.contains(":: jalari :: recurring :: Missed :: Skip"),
-        "{skip}"
-    );
+    assert!(skip.contains(":: jalari :: Missed :: Skip"), "{skip}");
     let default = expanded("cron = \"0 0 3 * * *\"", SHORT);
-    assert!(
-        default.contains(":: jalari :: recurring :: Missed :: Once"),
-        "{default}"
-    );
+    assert!(default.contains(":: jalari :: Missed :: Once"), "{default}");
 }
 
 const UNNAMED: &str = "impl Job for SendEmail {
