@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::fence::{Fenced, raised, write_progress, write_progress_in};
 use super::run::current_job;
+use super::step::StepKeys;
 use crate::enqueue::EnqueueRequest;
 use crate::init::config;
 use crate::{Error, JobError, JobResult};
@@ -144,6 +145,7 @@ pub(crate) struct RunControl {
     checkpoints: bool,
     slot: Mutex<Slot>,
     children: Children,
+    steps: StepKeys,
 }
 
 impl RunControl {
@@ -170,6 +172,7 @@ impl RunControl {
             checkpoints,
             slot: Mutex::new(Slot::numbered_from(saved_seq)),
             children: Children::default(),
+            steps: StepKeys::default(),
         }
     }
 
@@ -222,7 +225,7 @@ impl RunControl {
         }
     }
 
-    fn reach(&self) -> Option<Halt> {
+    pub(crate) fn reach(&self) -> Option<Halt> {
         let reached = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.reached_millis.store(reached, Ordering::Relaxed);
         self.halt()
@@ -306,6 +309,10 @@ impl RunControl {
 
     pub(crate) fn take_children(&self) -> Vec<EnqueueRequest> {
         std::mem::take(&mut *self.children.0.lock().unwrap())
+    }
+
+    pub(crate) fn steps(&self) -> &StepKeys {
+        &self.steps
     }
 }
 

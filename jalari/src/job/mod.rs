@@ -9,6 +9,7 @@ mod priority;
 pub(crate) mod registry;
 pub(crate) mod run;
 mod state;
+mod step;
 
 pub use checkpoint::{Checkpoint, Command, checkpoint, resume};
 pub(crate) use checkpoint::{Halt, ProgressCopy, RunControl};
@@ -21,3 +22,4 @@ pub use priority::Priority;
 pub use run::{JobRun, current_job, interrupted, shutdown_requested};
 pub(crate) use state::JOB_KEY_STATES;
 pub use state::JobState;
+pub use step::{StepRun, step};
