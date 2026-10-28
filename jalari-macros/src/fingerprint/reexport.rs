@@ -1,11 +1,16 @@
 use std::mem;
 
 use proc_macro2::{Group, Ident, Spacing, Span, TokenStream, TokenTree};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::visit_mut::{self, VisitMut};
 use syn::{
-    ExprPath, ExprStruct, File, ItemImpl, ItemUse, Macro, MetaList, PatStruct, PatTupleStruct,
-    Path, PathSegment, QSelf, TypePath, UseGroup, UseName, UsePath, UseRename, UseTree,
+    Attribute, ExprPath, ExprStruct, File, ItemImpl, ItemUse, Macro, Meta, MetaList, MetaNameValue,
+    PatStruct, PatTupleStruct, Path, PathSegment, QSelf, Token, TypePath, UseGroup, UseName,
+    UsePath, UseRename, UseTree,
 };
+
+use super::index::is_job_attribute;
 
 pub(crate) const JALARI: &str = "jalari";
 
@@ -14,11 +19,15 @@ const MACRO_CRATE: &str = "$crate";
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Reexport {
     segments: Vec<String>,
+    wrapper: Option<Vec<String>>,
 }
 
 impl Reexport {
     pub(crate) fn new(segments: Vec<String>) -> Option<Self> {
-        (!segments.is_empty() && segments != [JALARI]).then_some(Self { segments })
+        (!segments.is_empty() && segments != [JALARI]).then_some(Self {
+            segments,
+            wrapper: None,
+        })
     }
 
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
@@ -39,6 +48,24 @@ impl Reexport {
                 .chain(self.segments[1..].iter().cloned())
                 .collect(),
         )
+    }
+
+    pub(crate) fn with_wrapper(self, attribute: &str) -> Self {
+        Self {
+            wrapper: wrapper_path(attribute),
+            ..self
+        }
+    }
+
+    pub(crate) fn is_wrapper(&self, path: &Path) -> bool {
+        self.wrapper.as_ref().is_some_and(|wrapper| {
+            path.segments.len() == wrapper.len()
+                && path
+                    .segments
+                    .iter()
+                    .zip(wrapper)
+                    .all(|(segment, name)| segment.ident == name)
+        })
     }
 
     pub(crate) fn root(&self) -> &str {
@@ -283,6 +310,31 @@ impl VisitMut for Rewrite<'_> {
         visit_mut::visit_meta_list_mut(self, node);
         node.tokens = self.reexport.rewrite_tokens(mem::take(&mut node.tokens));
     }
+}
+
+fn wrapper_path(attribute: &str) -> Option<Vec<String>> {
+    let [attribute] =
+        <[Attribute; 1]>::try_from(Attribute::parse_outer.parse_str(attribute).ok()?).ok()?;
+    if is_job_attribute(&attribute) {
+        return None;
+    }
+    match &attribute.meta {
+        Meta::Path(_) => {}
+        Meta::List(_) => {
+            attribute
+                .parse_args_with(Punctuated::<MetaNameValue, Token![,]>::parse_terminated)
+                .ok()?;
+        }
+        Meta::NameValue(_) => return None,
+    }
+    Some(
+        attribute
+            .path()
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect(),
+    )
 }
 
 fn is_separator(first: &TokenTree, second: &TokenTree) -> bool {

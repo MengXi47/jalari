@@ -18,18 +18,24 @@ const MAX_DIRECTORY_DEPTH: usize = 32;
 
 static INDEXES: Mutex<BTreeMap<u64, Arc<Index>>> = Mutex::new(BTreeMap::new());
 
-pub(crate) fn of_call_site(
-    item: &syn::ItemImpl,
-    local_files: &[PathBuf],
-    jalari: &syn::Path,
-) -> u128 {
+#[derive(Default)]
+pub(crate) struct CallSite {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) attribute: Option<String>,
+}
+
+pub(crate) fn of_call_site(item: &syn::ItemImpl, call_site: &CallSite, jalari: &syn::Path) -> u128 {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
-    let local_files: Vec<&Path> = local_files.iter().map(PathBuf::as_path).collect();
+    let local_files: Vec<&Path> = call_site.files.iter().map(PathBuf::as_path).collect();
+    let reexport = Reexport::from_path(jalari).map(|reexport| match &call_site.attribute {
+        Some(attribute) => reexport.with_wrapper(attribute),
+        None => reexport,
+    });
     fingerprint_at(
         manifest_dir.as_deref(),
         &local_files,
         item,
-        Reexport::from_path(jalari).as_ref(),
+        reexport.as_ref(),
     )
 }
 

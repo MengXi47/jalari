@@ -639,7 +639,8 @@ pub(crate) fn hashed_job(item_impl: &ItemImpl, reexport: Option<&Reexport>) -> I
             if UNHASHED_CONSTANTS.iter().any(|name| constant.ident == name))
     });
     for attribute in &mut hashed.attrs {
-        if !is_job_attribute(attribute) {
+        let wrapper = reexport.is_some_and(|reexport| reexport.is_wrapper(attribute.path()));
+        if !wrapper && !is_job_attribute(attribute) {
             continue;
         }
         if reexport.is_some() {
@@ -648,7 +649,7 @@ pub(crate) fn hashed_job(item_impl: &ItemImpl, reexport: Option<&Reexport>) -> I
                 Meta::List(list) => &mut list.path,
                 Meta::NameValue(pair) => &mut pair.path,
             };
-            if path.segments.len() > 1 {
+            if wrapper || path.segments.len() > 1 {
                 *path = parse_quote!(jalari::job);
             }
         }
@@ -675,7 +676,7 @@ pub(crate) fn hashed_job(item_impl: &ItemImpl, reexport: Option<&Reexport>) -> I
     hashed
 }
 
-fn is_job_attribute(attribute: &Attribute) -> bool {
+pub(crate) fn is_job_attribute(attribute: &Attribute) -> bool {
     attribute
         .path()
         .segments

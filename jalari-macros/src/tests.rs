@@ -2,6 +2,7 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::{ItemImpl, MetaNameValue, Token};
 
+use super::fingerprint::CallSite;
 use super::{expand, parse_arguments};
 
 fn arguments(text: &str) -> Punctuated<MetaNameValue, Token![,]> {
@@ -12,7 +13,9 @@ fn arguments(text: &str) -> Punctuated<MetaNameValue, Token![,]> {
 
 fn expanded(attribute: &str, item: &str) -> String {
     let item: ItemImpl = syn::parse_str(item).unwrap();
-    expand(arguments(attribute), item, &[]).unwrap().to_string()
+    expand(arguments(attribute), item, &CallSite::default())
+        .unwrap()
+        .to_string()
 }
 
 fn stamped(expansion: &str) -> Option<String> {
@@ -207,7 +210,7 @@ const UNNAMED: &str = "impl Job for SendEmail {
 
 fn rejected(attribute: &str, item: &str) -> String {
     let item: ItemImpl = syn::parse_str(item).unwrap();
-    expand(arguments(attribute), item, &[])
+    expand(arguments(attribute), item, &CallSite::default())
         .expect_err("the expansion is rejected")
         .to_string()
 }
@@ -419,7 +422,7 @@ fn test_non_path_type_requires_a_name() {
             expand(
                 arguments("name = \"wrapped\""),
                 syn::parse_str(item).unwrap(),
-                &[]
+                &CallSite::default()
             )
             .is_ok()
         );
@@ -713,7 +716,12 @@ fn source_texts(tokens: proc_macro2::TokenStream, texts: &mut Vec<(String, Optio
 #[test]
 fn test_cron_registration_is_located_at_the_cron_literal() {
     let item: ItemImpl = syn::parse_str(SHORT).unwrap();
-    let tokens = expand(arguments("cron = \"0 0 3 * * *\""), item, &[]).unwrap();
+    let tokens = expand(
+        arguments("cron = \"0 0 3 * * *\""),
+        item,
+        &CallSite::default(),
+    )
+    .unwrap();
     let mut texts = Vec::new();
     source_texts(tokens, &mut texts);
     let start = texts

@@ -10,4 +10,4 @@ mod tests;
 mod workspace;
 
 pub(crate) use analyse::hex;
-pub(crate) use load::of_call_site;
+pub(crate) use load::{CallSite, of_call_site};

@@ -5,11 +5,11 @@ mod fingerprint;
 mod tests;
 
 use std::fmt::Display;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 use chrono_tz::Tz;
 use croner::parser::{CronParser, Seconds, Year};
+use fingerprint::CallSite;
 use proc_macro::{Span, TokenStream};
 use proc_macro2::{Group, Ident, Span as Span2, TokenStream as TokenStream2, TokenTree};
 use quote::{quote, quote_spanned};
@@ -148,15 +148,19 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     let arguments =
         parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
     let item_impl = parse_macro_input!(item as ItemImpl);
-    let mut local_files: Vec<PathBuf> = [
+    let mut files: Vec<_> = [
         Span::call_site().local_file(),
         item_impl.impl_token.span.unwrap().local_file(),
     ]
     .into_iter()
     .flatten()
     .collect();
-    local_files.dedup();
-    match expand(arguments, item_impl, &local_files) {
+    files.dedup();
+    let call_site = CallSite {
+        files,
+        attribute: Span::call_site().source_text(),
+    };
+    match expand(arguments, item_impl, &call_site) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -202,7 +206,7 @@ const PRIORITIES: [(&str, &str); 4] = [
 fn expand(
     arguments: Punctuated<MetaNameValue, Token![,]>,
     mut item_impl: ItemImpl,
-    local_files: &[PathBuf],
+    call_site: &CallSite,
 ) -> syn::Result<TokenStream2> {
     let arguments = parse_arguments(arguments)?;
     let jalari = &arguments.jalari;
@@ -228,7 +232,7 @@ fn expand(
     inject_constants(&mut item_impl, arguments.constants)?;
 
     let fingerprint = if arguments.fingerprint.as_ref().is_some_and(LitBool::value) {
-        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_files, jalari));
+        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, call_site, jalari));
         quote!(::core::option::Option::Some(#hex))
     } else {
         quote!(::core::option::Option::None)

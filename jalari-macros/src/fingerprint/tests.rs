@@ -1766,6 +1766,103 @@ fn test_job_attribute_through_a_reexport_hashes_as_jalari_job() {
     );
 }
 
+fn wrapper_job(attribute: &str) -> String {
+    facade_source("platform", "").replace("#[platform::__jalari::job]", &format!("#[{attribute}]"))
+}
+
+fn through_wrapper(app: &str, call_site: Option<&str>) -> u128 {
+    let workspace = through_facade(app, "platform");
+    let reexport = reexport("::platform::__jalari").map(|reexport| match call_site {
+        Some(text) => reexport.with_wrapper(text),
+        None => reexport,
+    });
+    let item = find_job(&source("", ""), "J");
+    fingerprint(
+        &Index::build(&workspace, reexport),
+        &workspace,
+        &JobSite {
+            item: &item,
+            file: Some("src/lib.rs"),
+        },
+        VERSION,
+    )
+}
+
+#[test]
+fn test_wrapper_attribute_hashes_as_jalari_job() {
+    let direct = lib(&source("", ""));
+    let task = "platform::task(name = \"j\")";
+    let app = wrapper_job(task);
+    assert_eq!(through_wrapper(&app, Some(&format!("#[{task}]"))), direct);
+    assert_ne!(through_wrapper(&app, None), direct);
+    assert_eq!(
+        through_wrapper(&wrapper_job("platform::task"), Some("#[platform::task]")),
+        direct
+    );
+    let imported = wrapper_job("task(name = \"j\")").replace(
+        "use platform::__jalari::{Job, JobResult};",
+        "use platform::__jalari::{Job, JobResult};\nuse platform::task;",
+    );
+    assert_eq!(
+        through_wrapper(&imported, Some("#[task(name = \"j\")]")),
+        direct
+    );
+    assert_ne!(through_wrapper(&imported, None), direct);
+    let queued = "platform::task(name = \"j\", queue = \"q\")";
+    let direct_queued = lib(&with_attribute(&source("", ""), "queue = \"q\""));
+    assert_eq!(
+        through_wrapper(&wrapper_job(queued), Some(&format!("#[{queued}]"))),
+        direct_queued
+    );
+    assert_ne!(direct_queued, direct);
+}
+
+#[test]
+fn test_call_site_that_is_not_a_wrapper_attribute_keeps_fingerprint() {
+    let task = "platform::task(name = \"j\")";
+    let cfg_attr = "cfg_attr(all(), platform::task(name = \"j\"))";
+    for (attribute, call_site) in [
+        (
+            task,
+            "#[$crate::__jalari::job(crate = $crate::__jalari, name = \"j\")]",
+        ),
+        (cfg_attr, &format!("#[{cfg_attr}]")),
+        ("platform::task = \"j\"", "#[platform::task = \"j\"]"),
+        (task, &format!("#[{task}] #[other]")),
+        (task, "platform::job! { (name = \"j\") }"),
+        (task, ""),
+    ] {
+        let app = wrapper_job(attribute);
+        assert_eq!(
+            through_wrapper(&app, Some(call_site)),
+            through_wrapper(&app, None),
+            "{call_site}"
+        );
+    }
+    let bare = facade_source("facade", "")
+        .replace(
+            "#[facade::__jalari::job]",
+            "#[job(crate = \"::facade::__jalari\")]",
+        )
+        .replace("{Job, JobResult}", "{Job, JobResult, job}");
+    let workspace = through_facade(&bare, "facade");
+    let item = macro_input(&workspace, "src/lib.rs", "J");
+    let bare_at = |reexport: Option<Reexport>| {
+        fingerprint(
+            &Index::build(&workspace, reexport),
+            &workspace,
+            &JobSite {
+                item: &item,
+                file: Some("src/lib.rs"),
+            },
+            VERSION,
+        )
+    };
+    let read = reexport("::facade::__jalari")
+        .map(|reexport| reexport.with_wrapper("#[job(crate = \"::facade::__jalari\")]"));
+    assert_eq!(bare_at(read), bare_at(reexport("::facade::__jalari")));
+}
+
 const JALARI_LOCK: &str = r#"version = 4
 
 [[package]]
