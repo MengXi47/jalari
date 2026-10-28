@@ -197,7 +197,7 @@ impl Job for SendEmail {
 | `priority = "high"` | Which due jobs of the queue run first: `"low"`, `"normal"`, `"high"` or `"urgent"`; see [Priority](#priority) | `"normal"` |
 | `aliases = ["old_name"]` | Earlier names whose waiting jobs and schedules this type still runs; see [Renaming a job](#renaming-a-job) | none |
 | `checkpoints = true` | Declares that the job reaches [checkpoints](#checkpoints) regularly, so an abort at `stop_timeout` or `shutdown_timeout` is logged as an error | `false` |
-| `cron = "..."`, `timezone = "..."` | Makes the job [recurring](#declared-in-code); the time zone is only valid with `cron` | none, `UTC` |
+| `cron = "..."`, `timezone = "..."` | Makes the job [recurring](#declared-in-code); both are parsed at compile time by the parsers the workers use, and the time zone is only valid with `cron` | none, `UTC` |
 | `missed = "skip"` | What the scheduler does with a run it finds more than a minute overdue: `"once"` enqueues one catch-up run, `"skip"` none; only valid with `cron`; see [Missed runs](#missed-runs) | `"once"` |
 | `fingerprint = true` | Enqueue with a [code fingerprint](#code-fingerprints) and run only jobs of the same build | `false` |
 | `crate = ::path` | Path at which the generated code reaches jalari, written as a path or as a string literal, for crates that use it through another crate; see [Using jalari through another crate](#using-jalari-through-another-crate) | `::jalari` |
@@ -207,9 +207,10 @@ impl Job for SendEmail {
 as 0.6 did, still works; setting one both ways is a compile error, and a timeout below one
 second needs `const TIMEOUT` in the impl. `#[jalari::job]` rejects an empty name, a
 `max_attempts` below 1, a zero timeout or one above `i32::MAX` milliseconds, and an alias that
-is empty, equals the name or repeats, at compile time. It also rejects an empty `queue` and a
-`cron` job whose struct does not implement `Default`, each with the error on that argument. A
-struct that is not a plain path, such as a generic one, needs `name`.
+is empty, equals the name or repeats, at compile time. It also rejects an empty `queue`, a
+`cron` expression or `timezone` that a worker would refuse at startup, and a `cron` job whose
+struct does not implement `Default`, each with the error on that argument. A struct that is not
+a plain path, such as a generic one, needs `name`.
 
 Two items stay in the impl. `type Context` is the value `run` receives from the worker's
 middleware, `()` by default; see [Context and middleware](#context-and-middleware).

@@ -8,6 +8,8 @@ use std::fmt::Display;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use chrono_tz::Tz;
+use croner::parser::{CronParser, Seconds, Year};
 use proc_macro::{Span, TokenStream};
 use proc_macro2::{Group, Ident, Span as Span2, TokenStream as TokenStream2, TokenTree};
 use quote::{quote, quote_spanned};
@@ -34,9 +36,11 @@ use syn::{
 ///   second needs `const TIMEOUT` in the impl
 /// * `priority` - Sets `Job::PRIORITY` from `"low"`, `"normal"`, `"high"` or `"urgent"`
 /// * `aliases` - Sets `Job::ALIASES` from an array of string literals
-/// * `cron` - Cron expression with five or six fields; makes the job recurring. `T` must
-///   implement `Default`, which provides the arguments of every run
-/// * `timezone` - IANA time zone for `cron`; `UTC` when omitted. Only valid with `cron`
+/// * `cron` - Cron expression with five or six fields; makes the job recurring. Parsed at
+///   compile time by the parser the workers use. `T` must implement `Default`, which provides
+///   the arguments of every run
+/// * `timezone` - IANA time zone for `cron`, checked at compile time; `UTC` when omitted. Only
+///   valid with `cron`
 /// * `missed` - What the scheduler does with a run more than a minute overdue: `"once"`
 ///   enqueues one catch-up run, `"skip"` enqueues none and waits for the next run. `"once"`
 ///   when omitted. Only valid with `cron`
@@ -67,8 +71,9 @@ use syn::{
 /// or repeat another. A violation is a compile error that names the job and points at the
 /// constant, or at the argument that set it.
 ///
-/// An empty `queue`, and a `cron` job whose type does not implement `Default`, are compile
-/// errors at the argument.
+/// The `cron` expression and the `timezone` are parsed with the parsers the workers use, so a
+/// schedule that compiles is one a worker accepts. An invalid one, an empty `queue`, and a `cron`
+/// job whose type does not implement `Default` are compile errors at the argument.
 ///
 /// # Code fingerprint
 ///
@@ -476,9 +481,9 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
             continue;
         }
         let (slot, check): (_, StringCheck) = if argument.path.is_ident("cron") {
-            (&mut parsed.cron, |_| Ok(()))
+            (&mut parsed.cron, check_cron)
         } else if argument.path.is_ident("timezone") {
-            (&mut parsed.timezone, |_| Ok(()))
+            (&mut parsed.timezone, check_timezone)
         } else if argument.path.is_ident("queue") {
             (&mut parsed.queue, check_queue)
         } else {
@@ -508,6 +513,24 @@ fn parse_arguments(arguments: Punctuated<MetaNameValue, Token![,]>) -> syn::Resu
 }
 
 type StringCheck = fn(&LitStr) -> syn::Result<()>;
+
+fn check_cron(expression: &LitStr) -> syn::Result<()> {
+    let text = expression.value();
+    CronParser::builder()
+        .seconds(Seconds::Optional)
+        .year(Year::Disallowed)
+        .build()
+        .parse(&text)
+        .map(|_| ())
+        .map_err(|e| syn::Error::new_spanned(expression, format!("{text:?}: {e}")))
+}
+
+fn check_timezone(timezone: &LitStr) -> syn::Result<()> {
+    let name = timezone.value();
+    Tz::from_str(&name)
+        .map(|_| ())
+        .map_err(|_| syn::Error::new_spanned(timezone, format!("{name:?} is not an IANA timezone")))
+}
 
 fn check_queue(queue: &LitStr) -> syn::Result<()> {
     if queue.value().is_empty() {

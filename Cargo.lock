@@ -897,6 +897,9 @@ dependencies = [
 name = "jalari-macros"
 version = "0.8.1"
 dependencies = [
+ "chrono-tz",
+ "croner",
+ "jalari",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

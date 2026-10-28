@@ -738,3 +738,111 @@ fn test_cron_registration_is_located_at_the_cron_literal() {
         assert_eq!(source.as_deref(), Some("\"0 0 3 * * *\""), "{text}");
     }
 }
+
+const ACCEPTED_CRONS: [&str; 12] = [
+    "0 3 * * *",
+    "0 0 3 * * *",
+    "*/5 * * * *",
+    "*/10 * * * * *",
+    "0 0 0 L * *",
+    "0 0 0 * * 5L",
+    "0 0 0 * * 1#2",
+    "0 0 0 15W * *",
+    "0 0 L * *",
+    "0 9-17 * * MON-FRI",
+    "30 2 1,15 JAN,JUL *",
+    "@daily",
+];
+
+const REJECTED_CRONS: [&str; 10] = [
+    "",
+    "* * *",
+    "61 * * * *",
+    "0 0 3 * * * 2026",
+    "0 0 0 1 1 * *",
+    "not cron",
+    "0 25 * * *",
+    "0 0 32 * *",
+    "* * * * 8",
+    "0 0 0 1 13 *",
+];
+
+#[test]
+fn test_cron_argument_rejects_an_invalid_expression_on_the_literal() {
+    for expression in REJECTED_CRONS {
+        let literal = format!("{expression:?}");
+        let attribute = format!("name = \"j\", cron = {literal}, timezone = \"Asia/Taipei\"");
+        let e = rejected_argument(&attribute);
+        let parser = jalari::Cron::new(expression).unwrap_err();
+        assert_eq!(e.to_string(), parser.msg, "{expression:?}");
+        assert!(
+            e.to_string().len() > literal.len() + 2,
+            "{expression:?} carries the parser's message: {e}"
+        );
+        assert_eq!(
+            e.span().source_text().as_deref(),
+            Some(literal.as_str()),
+            "{expression:?}"
+        );
+    }
+}
+
+#[test]
+fn test_cron_argument_accepts_every_valid_expression() {
+    for expression in ACCEPTED_CRONS {
+        let expansion = expanded(&format!("cron = {expression:?}"), SHORT);
+        assert!(
+            expansion.contains(&format!(
+                "CronRegistration :: new :: < J > ({expression:?} ,"
+            )),
+            "{expression:?} in {expansion}"
+        );
+    }
+}
+
+#[test]
+fn test_cron_verdict_matches_the_runtime_parser() {
+    let mut verdicts = Vec::new();
+    for expression in ACCEPTED_CRONS.iter().chain(&REJECTED_CRONS) {
+        let attribute = format!("cron = {expression:?}");
+        let compile_time = parse_arguments(arguments(&attribute)).is_ok();
+        let runtime = jalari::Cron::new(expression).is_ok();
+        assert_eq!(compile_time, runtime, "{expression:?}");
+        verdicts.push(runtime);
+    }
+    assert_eq!(
+        verdicts.iter().filter(|accepted| **accepted).count(),
+        ACCEPTED_CRONS.len()
+    );
+}
+
+#[test]
+fn test_timezone_argument_checks_the_iana_name_on_the_literal() {
+    for timezone in ["UTC", "Asia/Taipei", "America/New_York", "Etc/GMT+8"] {
+        let attribute = format!("cron = \"0 3 * * *\", timezone = {timezone:?}");
+        assert!(
+            parse_arguments(arguments(&attribute)).is_ok(),
+            "{timezone} is accepted"
+        );
+        let runtime = jalari::Cron::new("0 3 * * *").unwrap().timezone(timezone);
+        assert!(runtime.is_ok(), "{timezone} is accepted at runtime");
+    }
+    for timezone in ["Mars/Olympus", "", "asia/taipei", "Asia/Taipei ", "UTC+8"] {
+        let literal = format!("{timezone:?}");
+        let e = rejected_argument(&format!("cron = \"0 3 * * *\", timezone = {literal}"));
+        let runtime = jalari::Cron::new("0 3 * * *")
+            .unwrap()
+            .timezone(timezone)
+            .unwrap_err();
+        assert_eq!(e.to_string(), runtime.msg, "{timezone:?}");
+        assert_eq!(
+            e.span().source_text().as_deref(),
+            Some(literal.as_str()),
+            "{timezone:?}"
+        );
+    }
+    assert_eq!(
+        rejected_argument("cron = \"0 3 * * *\", timezone = \"Mars/Olympus\"").to_string(),
+        "\"Mars/Olympus\" is not an IANA timezone"
+    );
+}

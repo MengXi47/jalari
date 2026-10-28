@@ -12,12 +12,15 @@ license.workspace = true
 proc-macro = true
 
 [dependencies]
+chrono-tz.workspace = true
+croner.workspace = true
 proc-macro2.workspace = true
 quote.workspace = true
 syn = { workspace = true, features = ["visit", "visit-mut"] }
 toml.workspace = true
 
 [dev-dependencies]
+jalari = { path = "../jalari" }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 
 [lints]
