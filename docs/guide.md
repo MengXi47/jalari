@@ -357,9 +357,10 @@ impl Job for SendInvoice {
 
 `crate` takes a path as a string literal, written as the defining crate would write it, and
 every path the attribute generates starts with it. A value that is not a path, or a second
-`crate`, is a compile error. An attribute macro of `platform`'s own can emit
-`#[::platform::__jalari::job(.., crate = "::platform::__jalari")]`, so that the crates that
-define jobs never write the path.
+`crate`, is a compile error. Being a string, it cannot hold `$crate`, so a `macro_rules!`
+wrapper names the re-export by its absolute path. An attribute macro of `platform`'s own can
+emit `#[::platform::__jalari::job(.., crate = "::platform::__jalari")]`, so that the crates
+that define jobs never write the path.
 
 The [code fingerprint](#code-fingerprints) leaves `crate` out. The attribute's own path and the
 `use` declarations that name jalari are code like any other, so moving a fingerprinted job from
@@ -1088,10 +1089,11 @@ if !finished {
 `is_interrupted()` turns `true` when `interrupted()` would complete: on a stop, a cancel, a
 shutdown or a lost job, and once the attempt has timed out and been aborted. It never turns
 back. Once the loop has returned, return the error of `run.interrupted()`, which is ready at
-once, so a stop, a cancel or a shutdown settles the job as it does for async code. In jalari's tests such a loop, polling
-every 10 milliseconds, saw a stop about 1.0 second after the request and a 1 second timeout 1.0
-seconds after the attempt started. The [`blocking_work`](../jalari/examples/blocking_work.rs)
-example stops such a loop and times one out.
+once, so a stop, a cancel or a shutdown settles the job as it does for async code. In jalari's
+tests such a loop, polling every 10 milliseconds, saw a stop about 1.0 second after the request
+and a 1 second timeout 1.0 seconds after the attempt started. The
+[`blocking_work`](../jalari/examples/blocking_work.rs) example stops such a loop and times one
+out.
 
 ### What each call does
 
@@ -1917,6 +1919,10 @@ worker, since no job became due.
   heartbeat ages past the 7 second takeover grace. If its lifeline session then ends, another
   worker can take the jobs over within milliseconds, while this worker notices at its next
   beat, up to a second later. The outcome stays fenced; side effects in that second can overlap.
+- `admin::workers()` and `admin::stranded()` judge a worker by the age of its heartbeat against
+  the cluster's `worker_timeout`. While the database refuses heartbeats, a live worker's
+  heartbeat ages by up to 30 seconds, so with a `worker_timeout` below that the worker drops out
+  of `workers()` and its running jobs are listed by `stranded()` until a heartbeat succeeds.
 
 ## Errors
 
