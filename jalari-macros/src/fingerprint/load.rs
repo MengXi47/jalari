@@ -6,7 +6,7 @@ use std::{env, fs};
 
 use toml::de::{DeTable, DeValue};
 
-use super::analyse::fingerprint;
+use super::analyse::{Stamp, stamp};
 use super::index::Index;
 use super::lock::Lock;
 use super::reach::{declaring_crate, locates};
@@ -18,33 +18,54 @@ const MAX_DIRECTORY_DEPTH: usize = 32;
 
 static INDEXES: Mutex<BTreeMap<u64, Arc<Index>>> = Mutex::new(BTreeMap::new());
 
+static TRACKED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
 #[derive(Default)]
 pub(crate) struct CallSite {
     pub(crate) files: Vec<PathBuf>,
     pub(crate) attribute: Option<String>,
 }
 
-pub(crate) fn of_call_site(item: &syn::ItemImpl, call_site: &CallSite, jalari: &syn::Path) -> u128 {
+pub(crate) fn of_call_site(
+    item: &syn::ItemImpl,
+    call_site: &CallSite,
+    jalari: &syn::Path,
+) -> Stamp {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
     let local_files: Vec<&Path> = call_site.files.iter().map(PathBuf::as_path).collect();
     let reexport = Reexport::from_path(jalari).map(|reexport| match &call_site.attribute {
         Some(attribute) => reexport.with_wrapper(attribute),
         None => reexport,
     });
-    fingerprint_at(
+    let stamp = stamp_at(
         manifest_dir.as_deref(),
         &local_files,
         item,
         reexport.as_ref(),
-    )
+    );
+    Stamp {
+        value: stamp.value,
+        inputs: untracked(stamp.inputs),
+    }
 }
 
-pub(crate) fn fingerprint_at(
+fn untracked(inputs: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut tracked = TRACKED.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut fresh = BTreeSet::new();
+    for input in inputs {
+        if tracked.insert(input.clone()) {
+            fresh.insert(input);
+        }
+    }
+    fresh
+}
+
+pub(crate) fn stamp_at(
     manifest_dir: Option<&Path>,
     local_files: &[&Path],
     item: &syn::ItemImpl,
     reexport: Option<&Reexport>,
-) -> u128 {
+) -> Stamp {
     let mut workspace = manifest_dir.map(load).unwrap_or_default();
     let all = workspace
         .crates
@@ -64,7 +85,7 @@ pub(crate) fn fingerprint_at(
     set_roots(&mut workspace, all);
     let index = cached(&workspace, reexport);
     let site = JobSite { item, file: None };
-    fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
+    stamp(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
 }
 
 fn located(
@@ -73,7 +94,7 @@ fn located(
     file: &str,
     item: &syn::ItemImpl,
     reexport: Option<&Reexport>,
-) -> Option<u128> {
+) -> Option<Stamp> {
     let primary = workspace.crates.first()?;
     let likely: Vec<String> = all
         .iter()
@@ -94,12 +115,7 @@ fn located(
             };
             set_roots(workspace, roots_containing(&index, file));
             let index = cached(workspace, reexport.as_ref());
-            return Some(fingerprint(
-                &index,
-                workspace,
-                &site,
-                env!("CARGO_PKG_VERSION"),
-            ));
+            return Some(stamp(&index, workspace, &site, env!("CARGO_PKG_VERSION")));
         }
     }
     None
@@ -208,6 +224,7 @@ impl Loader {
         let roots = candidate_roots(&manifest, &files);
         self.crates.push(CrateSource {
             package: manifest.package.clone(),
+            dir: canonical(dir),
             roots,
             files: files.clone(),
             deps: BTreeMap::new(),
@@ -216,6 +233,7 @@ impl Loader {
             let index = self.crates.len();
             self.crates.push(CrateSource {
                 package: manifest.package.clone(),
+                dir: canonical(dir),
                 roots: vec![lib],
                 files,
                 deps: BTreeMap::new(),
@@ -244,6 +262,7 @@ impl Loader {
         let index = self.crates.len();
         self.crates.push(CrateSource {
             package: manifest.package.clone(),
+            dir: canonical(dir),
             roots: vec![lib],
             files: read_files(dir),
             deps: BTreeMap::new(),

@@ -233,11 +233,21 @@ fn expand(
 
     inject_constants(&mut item_impl, arguments.constants)?;
 
-    let fingerprint = if arguments.fingerprint.as_ref().is_some_and(LitBool::value) {
-        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, call_site, jalari));
-        quote!(::core::option::Option::Some(#hex))
+    let (fingerprint, inputs) = if arguments.fingerprint.as_ref().is_some_and(LitBool::value) {
+        let stamp = fingerprint::of_call_site(&item_impl, call_site, jalari);
+        let hex = fingerprint::hex(stamp.value);
+        let inputs: Vec<LitStr> = stamp
+            .inputs
+            .iter()
+            .filter_map(|input| input.to_str())
+            .map(|input| LitStr::new(input, Span2::call_site()))
+            .collect();
+        (
+            quote!(::core::option::Option::Some(#hex)),
+            quote!(#(const _: &[u8] = ::core::include_bytes!(#inputs);)*),
+        )
     } else {
-        quote!(::core::option::Option::None)
+        (quote!(::core::option::Option::None), quote!())
     };
 
     let checkpoints = arguments.checkpoints.as_ref().is_some_and(LitBool::value);
@@ -287,6 +297,8 @@ fn expand(
         }
 
         #checks
+
+        #inputs
     })
 }
 

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use super::lock::Lock;
 
@@ -11,6 +12,7 @@ pub(crate) struct Workspace {
 #[derive(Debug, Clone, Default, Hash)]
 pub(crate) struct CrateSource {
     pub(crate) package: String,
+    pub(crate) dir: PathBuf,
     pub(crate) roots: Vec<String>,
     pub(crate) files: BTreeMap<String, String>,
     pub(crate) deps: BTreeMap<String, Dependency>,

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use quote::ToTokens;
 
@@ -12,12 +13,17 @@ use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 const TAG: &str = "jalari-fingerprint/1";
 const WHOLE_TAG: &str = "jalari-fingerprint/1/whole";
 
-pub(crate) fn fingerprint(
+pub(crate) struct Stamp {
+    pub(crate) value: u128,
+    pub(crate) inputs: BTreeSet<PathBuf>,
+}
+
+pub(crate) fn stamp(
     index: &Index,
     workspace: &Workspace,
     site: &JobSite<'_>,
     jalari_version: &str,
-) -> u128 {
+) -> Stamp {
     let mut item = site.item.clone();
     if let Some(reexport) = &index.reexport {
         reexport.rewrite_item(&mut item);
@@ -30,7 +36,7 @@ pub(crate) fn fingerprint(
         item: &item,
         file: site.file,
     };
-    let (tag, items, pins) = match reach(index, site, MemberRule::Gated) {
+    let (tag, items, pins, units) = match reach(index, site, MemberRule::Gated) {
         Some(reached) => {
             let mut roots = reached.roots.clone();
             for &item in &reached.items {
@@ -45,7 +51,12 @@ pub(crate) fn fingerprint(
                 index.reexport.as_ref(),
                 roots.iter().map(|(krate, name)| (*krate, name.as_str())),
             );
-            (TAG, reached.items.into_iter().collect::<Vec<_>>(), pins)
+            (
+                TAG,
+                reached.items.into_iter().collect::<Vec<_>>(),
+                pins,
+                reached.units,
+            )
         }
         None => {
             let roots = workspace
@@ -59,6 +70,7 @@ pub(crate) fn fingerprint(
                 WHOLE_TAG,
                 (0..index.items.len()).collect(),
                 pins(workspace, index.reexport.as_ref(), roots),
+                (0..index.units.len()).collect(),
             )
         }
     };
@@ -75,7 +87,26 @@ pub(crate) fn fingerprint(
     for pin in &pins {
         fnv.field(pin.as_bytes());
     }
-    fnv.finish()
+    Stamp {
+        value: fnv.finish(),
+        inputs: inputs(index, workspace, &units),
+    }
+}
+
+fn inputs(index: &Index, workspace: &Workspace, units: &BTreeSet<usize>) -> BTreeSet<PathBuf> {
+    let mut inputs = BTreeSet::new();
+    for &unit in units {
+        let record = &index.units[unit];
+        let Some(source) = workspace.crates.get(record.krate) else {
+            continue;
+        };
+        for file in &record.files {
+            let mut path = source.dir.clone();
+            path.extend(file.split('/'));
+            inputs.insert(path);
+        }
+    }
+    inputs
 }
 
 fn keep_written(attributes: &mut Vec<syn::Attribute>, written: &[String]) {

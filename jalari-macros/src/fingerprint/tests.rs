@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{env, fs, process};
 
 use quote::ToTokens;
 use syn::visit::Visit;
 
-use super::analyse::{fingerprint, hex};
+use super::analyse::{hex, stamp};
 use super::hash::{Fnv, canonical};
 use super::index::{Index, ItemKind, is_job_impl};
 use super::load;
@@ -74,9 +74,28 @@ impl Job for J {{
     )
 }
 
+fn fingerprint(
+    index: &Index,
+    workspace: &Workspace,
+    site: &JobSite<'_>,
+    jalari_version: &str,
+) -> u128 {
+    stamp(index, workspace, site, jalari_version).value
+}
+
+fn fingerprint_at(
+    manifest_dir: Option<&Path>,
+    local_files: &[&Path],
+    item: &syn::ItemImpl,
+    reexport: Option<&Reexport>,
+) -> u128 {
+    load::stamp_at(manifest_dir, local_files, item, reexport).value
+}
+
 fn crate_source(package: &str, roots: &[&str], files: &[(&str, &str)]) -> CrateSource {
     CrateSource {
         package: package.to_owned(),
+        dir: PathBuf::new(),
         roots: roots.iter().map(|root| (*root).to_owned()).collect(),
         files: files
             .iter()
@@ -891,7 +910,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn checkout(root: &Path, self_ty: &str) -> u128 {
     let file = root.join("app/src/lib.rs");
     let item = find_job(&fs::read_to_string(&file).unwrap(), self_ty);
-    load::fingerprint_at(Some(&root.join("app")), &[file.as_path()], &item, None)
+    fingerprint_at(Some(&root.join("app")), &[file.as_path()], &item, None)
 }
 
 fn rewrite(path: &Path, from: &str, to: &str) {
@@ -945,7 +964,7 @@ fn test_loader_fingerprint_ignores_checkout_path() {
     let file = first.join("app/src/lib.rs");
     let item = find_job(&fs::read_to_string(&file).unwrap(), "Standalone");
     assert_ne!(
-        load::fingerprint_at(Some(&first.join("app")), &[], &item, None),
+        fingerprint_at(Some(&first.join("app")), &[], &item, None),
         standalone
     );
     fs::remove_dir_all(&base).unwrap();
@@ -970,9 +989,9 @@ fn test_loader_ignores_target_roots_that_do_not_contain_the_job() {
     .unwrap();
     let file = base.join("tests/alpha.rs");
     let item = find_job(&job, "J");
-    let before = load::fingerprint_at(Some(&base), &[file.as_path()], &item, None);
+    let before = fingerprint_at(Some(&base), &[file.as_path()], &item, None);
     fs::write(&other, "mod alpha_helpers {}\n").unwrap();
-    let after = load::fingerprint_at(Some(&base), &[file.as_path()], &item, None);
+    let after = fingerprint_at(Some(&base), &[file.as_path()], &item, None);
     fs::remove_dir_all(&base).unwrap();
     assert_eq!(before, after);
 }
@@ -1269,8 +1288,8 @@ fn test_loader_resolves_a_relative_local_file() {
     );
     let item = find_job(&fs::read_to_string(&absolute).unwrap(), "UsesHelper");
     assert_eq!(
-        load::fingerprint_at(Some(&manifest), &[relative], &item, None),
-        load::fingerprint_at(Some(&manifest), &[absolute.as_path()], &item, None)
+        fingerprint_at(Some(&manifest), &[relative], &item, None),
+        fingerprint_at(Some(&manifest), &[absolute.as_path()], &item, None)
     );
 }
 
@@ -1285,7 +1304,7 @@ fn test_loader_fingerprint_uses_the_jalari_version() {
         item: &item,
         file: Some("src/lib.rs"),
     };
-    let loaded = load::fingerprint_at(Some(&manifest), &[file.as_path()], &item, None);
+    let loaded = fingerprint_at(Some(&manifest), &[file.as_path()], &item, None);
     assert_eq!(
         loaded,
         fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
@@ -2171,9 +2190,9 @@ fn test_wrapper_job_through_a_facade_hashes_like_a_direct_job() {
     let facade_file = base.join("facade/src/lib.rs");
     let app_file = base.join("app/src/lib.rs");
     let app = |files: &[&Path]| {
-        load::fingerprint_at(Some(&base.join("app")), files, &item, macro_crate.as_ref())
+        fingerprint_at(Some(&base.join("app")), files, &item, macro_crate.as_ref())
     };
-    let direct = load::fingerprint_at(
+    let direct = fingerprint_at(
         Some(&base.join("direct")),
         &[base.join("direct/src/lib.rs").as_path()],
         &item,
@@ -2251,4 +2270,94 @@ impl Job for J {{
         dev,
         "the cfg_attr text is hashed"
     );
+}
+
+#[test]
+fn test_stamp_inputs_are_the_files_of_the_analysed_units() {
+    let base = env::temp_dir().join(format!("jalari-fingerprint-inputs-{}", process::id()));
+    let app = base.join("app");
+    write(
+        &app.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nother = { path = \"../other\" }\n\n[dev-dependencies]\ntestkit = { path = \"../testkit\" }\n",
+    );
+    write(
+        &app.join("src/lib.rs"),
+        "use jalari::{Job, JobResult};
+
+#[cfg(windows)]
+#[path = \"win.rs\"]
+mod platform;
+
+#[cfg(unix)]
+mod platform {
+    pub fn platform_name() -> &'static str {
+        \"unix\"
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct J;
+
+#[jalari::job]
+impl Job for J {
+    async fn run(self) -> JobResult {
+        println!(\"{}{}\", platform::platform_name(), scale(1));
+        Ok(())
+    }
+}
+
+fn scale(value: u32) -> u32 {
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use testkit::scale as kit_scale;
+}
+",
+    );
+    write(
+        &app.join("src/win.rs"),
+        "pub fn platform_name() -> &'static str {\n    \"windows\"\n}\n",
+    );
+    write(&app.join("src/unused.rs"), "pub fn unused() {}\n");
+    write(&app.join("tests/it.rs"), "#[test]\nfn test_it() {}\n");
+    for (package, text) in [
+        (
+            "testkit",
+            "pub fn scale(value: u32) -> u32 {\n    value * 3\n}\n",
+        ),
+        ("other", "pub fn other() {}\n"),
+    ] {
+        write(
+            &base.join(package).join("Cargo.toml"),
+            &format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        );
+        write(&base.join(package).join("src/lib.rs"), text);
+    }
+    let file = app.join("src/lib.rs");
+    let item = find_job(&fs::read_to_string(&file).unwrap(), "J");
+    let real = fs::canonicalize(&base).unwrap();
+    let paths = |files: &[&str]| -> BTreeSet<PathBuf> {
+        files.iter().map(|file| real.join(file)).collect()
+    };
+
+    let located = load::stamp_at(Some(&app), &[file.as_path()], &item, None);
+    assert_eq!(
+        located.inputs,
+        paths(&["app/src/lib.rs", "app/src/win.rs", "testkit/src/lib.rs"])
+    );
+
+    let whole = load::stamp_at(Some(&app), &[], &item, None);
+    assert_eq!(
+        whole.inputs,
+        paths(&[
+            "app/src/lib.rs",
+            "app/src/win.rs",
+            "app/tests/it.rs",
+            "other/src/lib.rs",
+            "testkit/src/lib.rs",
+        ])
+    );
+    fs::remove_dir_all(&base).unwrap();
 }
