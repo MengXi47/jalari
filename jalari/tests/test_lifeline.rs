@@ -3,7 +3,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{Database, LEDGER, RunningWorker, fast_retry, worker_config};
-use jalari::sqlx::{self, AssertSqlSafe};
+use jalari::sqlx::{self, AssertSqlSafe, Connection, PgConnection};
 use jalari::{Finished, Job, JobError, JobMeta, JobMiddleware, JobResult, Next, Worker};
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,27 @@ impl Job for Blocking {
         std::thread::sleep(Duration::from_millis(self.millis));
         LEDGER.record(&self.label, "done");
         Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Attempts {
+    label: String,
+}
+
+#[jalari::job(queue = "lifeline")]
+impl Job for Attempts {
+    const NAME: &'static str = "lifeline_attempts";
+
+    async fn run(self) -> JobResult {
+        let attempt = jalari::current_job().unwrap().attempt();
+        let label = format!("{}#{attempt}", self.label);
+        LEDGER.record(&label, "start");
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            LEDGER.record(&label, "tick");
+            jalari::checkpoint().await?;
+        }
     }
 }
 
@@ -187,6 +208,8 @@ async fn test_lifeline() {
     check_orphaned_claim_is_released(&database, "last_orphan", 1).await;
     check_abandoned_close_counts_the_attempt(&database).await;
     check_blocked_runtime_keeps_the_lifeline(&database).await;
+    check_refused_heartbeats_keep_the_jobs(&database).await;
+    check_lost_connection_during_a_stall_aborts_at_once(&database).await;
     check_close_outlasts_an_outage(&database).await;
     check_close_after_takeover_is_fenced(&database).await;
     database.finish().await;
@@ -446,6 +469,156 @@ async fn check_blocked_runtime_keeps_the_lifeline(database: &Database) {
     assert!(
         finished_after < BLOCK + Duration::from_secs(3),
         "{finished_after:?}"
+    );
+    worker.stop().await;
+}
+
+async fn check_refused_heartbeats_keep_the_jobs(database: &Database) {
+    const STALL: Duration = Duration::from_secs(12);
+    const PROBE_AFTER: Duration = Duration::from_millis(3500);
+    let worker = spawn_worker().await;
+    common::wait_until(
+        "the lifeline to register",
+        Duration::from_secs(10),
+        || async { database.lifelines().await.len() == 1 },
+    )
+    .await;
+    let registered = database.lifelines().await;
+    let worker_id = registered[0].1.clone();
+    let id = jalari::enqueue(&Ticker {
+        label: "stall".to_owned(),
+        millis: 15_000,
+    })
+    .await
+    .unwrap()
+    .id()
+    .0;
+    common::wait_until("the ticker to start", Duration::from_secs(10), || async {
+        !starts("stall").is_empty()
+    })
+    .await;
+    let mut blocker = PgConnection::connect_with(&database.options).await.unwrap();
+    let mut stall = blocker.begin().await.unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "SELECT 1 FROM {} WHERE id = $1::uuid FOR UPDATE",
+        database.table("worker")
+    )))
+    .bind(&worker_id)
+    .execute(&mut *stall)
+    .await
+    .unwrap();
+    tokio::time::sleep(PROBE_AFTER).await;
+    let probe = jalari::enqueue(&Ticker {
+        label: "stall_probe".to_owned(),
+        millis: 0,
+    })
+    .await
+    .unwrap()
+    .id()
+    .0;
+    tokio::time::sleep(STALL - PROBE_AFTER).await;
+    let heartbeat_age: f64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT EXTRACT(EPOCH FROM clock_timestamp() - heartbeat_at)::float8 FROM {} WHERE id = $1::uuid",
+        database.table("worker")
+    )))
+    .bind(&worker_id)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    stall.rollback().await.unwrap();
+    let released = Instant::now();
+    common::wait_until(
+        "the ticker and the probe to succeed",
+        Duration::from_secs(20),
+        || async {
+            LEDGER.count(&id.to_string(), "finished") == 1
+                && LEDGER.count(&probe.to_string(), "finished") == 1
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let probe_started = starts("stall_probe")[0];
+    eprintln!(
+        "stall: heartbeats refused for {STALL:?} (last one {heartbeat_age:.1} s old at the end), \
+         the probe enqueued during it started {:?} after it ended",
+        probe_started.saturating_duration_since(released)
+    );
+    assert!(heartbeat_age >= 11.0, "{heartbeat_age}");
+    ran_once(database, id, "stall").await;
+    ran_once(database, probe, "stall_probe").await;
+    assert!(
+        probe_started >= released,
+        "the probe was claimed during the stall"
+    );
+    assert_eq!(database.lifelines().await, registered);
+    worker.stop().await;
+}
+
+async fn check_lost_connection_during_a_stall_aborts_at_once(database: &Database) {
+    const STALL: Duration = Duration::from_secs(8);
+    let worker = spawn_worker().await;
+    common::wait_until(
+        "the lifeline to register",
+        Duration::from_secs(10),
+        || async { database.lifelines().await.len() == 1 },
+    )
+    .await;
+    let worker_id = database.lifelines().await.remove(0).1;
+    let id = jalari::enqueue(&Attempts {
+        label: "cut".to_owned(),
+    })
+    .await
+    .unwrap()
+    .id()
+    .0;
+    common::wait_until("the job to start", Duration::from_secs(10), || async {
+        !starts("cut#1").is_empty()
+    })
+    .await;
+    let mut blocker = PgConnection::connect_with(&database.options).await.unwrap();
+    let mut stall = blocker.begin().await.unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "SELECT 1 FROM {} WHERE id = $1::uuid FOR UPDATE",
+        database.table("worker")
+    )))
+    .bind(&worker_id)
+    .execute(&mut *stall)
+    .await
+    .unwrap();
+    tokio::time::sleep(STALL).await;
+    assert_eq!(database.terminate_lifelines(1).await, 1);
+    let killed = Instant::now();
+    stall.rollback().await.unwrap();
+    common::wait_until("the job to run again", Duration::from_secs(15), || async {
+        !starts("cut#2").is_empty()
+    })
+    .await;
+    let rerun = starts("cut#2")[0];
+    let stopped = LEDGER
+        .events("cut#1")
+        .into_iter()
+        .map(|(_, at)| at)
+        .max()
+        .unwrap();
+    eprintln!(
+        "stall_cut: the old run stopped {:?} and the job ran again {:?} after the lifeline was \
+         killed during a stall",
+        stopped.saturating_duration_since(killed),
+        rerun.saturating_duration_since(killed)
+    );
+    assert!(
+        stopped < rerun,
+        "the old run kept going after the job ran again"
+    );
+    assert!(
+        stopped.saturating_duration_since(killed) <= Duration::from_millis(300),
+        "{:?}",
+        stopped.saturating_duration_since(killed)
+    );
+    assert_ne!(database.lifelines().await[0].1, worker_id);
+    assert_eq!(
+        jalari::cancel(jalari::JobId(id)).await.unwrap(),
+        jalari::CancelOutcome::Requested
     );
     worker.stop().await;
 }

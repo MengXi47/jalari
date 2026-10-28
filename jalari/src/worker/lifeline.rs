@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use tokio::runtime::Handle;
@@ -19,6 +20,7 @@ use crate::job::Command;
 
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
+const STATEMENT_TIMEOUT: Duration = Duration::from_millis(1500);
 const SELF_FENCE: Duration = Duration::from_secs(3);
 const FREEZE_TOLERANCE: Duration = Duration::from_secs(10);
 const LIFELINE_IDLE_TIMEOUT: Duration = Duration::from_secs(11);
@@ -31,6 +33,7 @@ const APPLICATION_NAME: &str = "jalari lifeline";
 const _: () =
     assert!(SELF_FENCE.as_millis() >= PING_INTERVAL.as_millis() + PING_TIMEOUT.as_millis());
 const _: () = assert!(TAKEOVER_GRACE.as_millis() >= 2 * SELF_FENCE.as_millis());
+const _: () = assert!(PING_TIMEOUT.as_millis() > STATEMENT_TIMEOUT.as_millis());
 const _: () = assert!(
     LIFELINE_IDLE_TIMEOUT.as_millis() >= PING_INTERVAL.as_millis() + 2 * PING_TIMEOUT.as_millis()
 );
@@ -102,6 +105,7 @@ struct Lifeline {
     connection: PgConnection,
     incarnation: Arc<Incarnation>,
     acked: Instant,
+    answered: Instant,
 }
 
 pub(super) struct LifelineThread {
@@ -259,7 +263,7 @@ impl Lifeline {
                   WHERE current_setting('transaction_timeout', true) IS NOT NULL)",
         )
         .bind(LIFELINE_IDLE_TIMEOUT.as_millis().to_string())
-        .bind(PING_TIMEOUT.as_millis().to_string())
+        .bind(STATEMENT_TIMEOUT.as_millis().to_string())
         .execute(&mut connection)
         .await?;
         let prefix = lock_prefix(schema);
@@ -309,6 +313,7 @@ impl Lifeline {
                 dead: CancellationToken::new(),
             }),
             acked,
+            answered: acked,
         }))
     }
 
@@ -319,26 +324,39 @@ impl Lifeline {
         jobs: &Handle,
     ) -> Option<Self> {
         let worker_id = Arc::clone(&self.incarnation.worker_id);
+        let mut due = Instant::now() + PING_INTERVAL;
         loop {
             tokio::select! {
                 () = retire.cancelled() => return Some(self),
-                () = tokio::time::sleep(PING_INTERVAL) => {}
+                () = tokio::time::sleep_until(due) => {}
             }
             let sent_at = Instant::now();
-            let deadline = (self.acked + LIFELINE_IDLE_TIMEOUT).min(sent_at + PING_TIMEOUT);
+            due = sent_at + PING_INTERVAL;
+            let deadline = (self.answered + LIFELINE_IDLE_TIMEOUT).min(sent_at + PING_TIMEOUT);
             let sent = shared.runs.running(&worker_id);
             let failure = match tokio::time::timeout_at(deadline, self.beat(shared)).await {
                 Ok(Ok(Some(owned))) if Instant::now() < deadline => {
                     self.acked = sent_at;
+                    self.answered = sent_at;
                     let (orphans, abandoned) = shared.runs.deliver(&worker_id, &sent, &owned);
                     if !orphans.is_empty() || !abandoned.is_empty() {
                         jobs.spawn(release(Arc::clone(shared), orphans, abandoned));
                     }
                     continue;
                 }
+                Ok(Err(e)) if Instant::now() < deadline && session_survives(&e) => {
+                    self.answered = sent_at;
+                    warn!(
+                        worker_id = %worker_id,
+                        error = %e,
+                        unacknowledged = ?Instant::now().duration_since(self.acked),
+                        "the database refused a heartbeat, keeping the jobs running"
+                    );
+                    continue;
+                }
                 Ok(Ok(Some(_))) | Err(_) => format!(
-                    "no heartbeat was acknowledged for {:?}",
-                    Instant::now().duration_since(self.acked)
+                    "the database did not answer a heartbeat for {:?}",
+                    Instant::now().duration_since(self.answered)
                 ),
                 Ok(Ok(None)) => "the worker row was removed".to_owned(),
                 Ok(Err(e)) => e.to_string(),
@@ -352,7 +370,7 @@ impl Lifeline {
         }
     }
 
-    async fn beat(&mut self, shared: &Shared) -> Result<Option<Vec<Owned>>> {
+    async fn beat(&mut self, shared: &Shared) -> sqlx::Result<Option<Vec<Owned>>> {
         let schema = &shared.config.schema;
         let rows: Vec<OwnedRow> = sqlx::query_as(AssertSqlSafe(format!(
             "WITH beat AS (
@@ -390,6 +408,13 @@ impl Lifeline {
         self.connection.close().await?;
         Ok(())
     }
+}
+
+fn session_survives(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.try_downcast_ref::<PgDatabaseError>())
+        .is_some_and(|error| matches!(error.severity(), PgSeverity::Error))
 }
 
 async fn release(shared: Arc<Shared>, orphans: Vec<Hold>, abandoned: Vec<Hold>) {
