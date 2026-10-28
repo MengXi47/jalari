@@ -10,6 +10,7 @@ use syn::{
 };
 
 use super::hash::canonical;
+use super::reexport::Reexport;
 use super::workspace::{Dependency, Workspace};
 
 pub(crate) type ItemId = usize;
@@ -94,6 +95,7 @@ pub(crate) struct Index {
     pub(crate) opaque: BTreeMap<String, Vec<ItemId>>,
     pub(crate) crates: BTreeMap<String, BTreeSet<usize>>,
     pub(crate) crate_units: Vec<Vec<usize>>,
+    pub(crate) reexport: Option<Reexport>,
 }
 
 #[derive(Default)]
@@ -143,7 +145,7 @@ pub(crate) struct Impl {
 }
 
 impl Index {
-    pub(crate) fn build(workspace: &Workspace) -> Self {
+    pub(crate) fn build(workspace: &Workspace, reexport: Option<Reexport>) -> Self {
         let mut builder = Builder {
             workspace,
             index: Index {
@@ -158,6 +160,7 @@ impl Index {
                 opaque: BTreeMap::new(),
                 crates: BTreeMap::new(),
                 crate_units: vec![Vec::new(); workspace.crates.len()],
+                reexport,
             },
             local: BTreeSet::new(),
             gates: Vec::new(),
@@ -226,13 +229,16 @@ impl Builder<'_> {
         } else {
             join(&file_dir, stem(path)).unwrap_or_default()
         };
-        let parsed = match syn::parse_file(content) {
+        let mut parsed = match syn::parse_file(content) {
             Ok(parsed) => parsed,
             Err(_) => {
                 self.unparseable(unit, path, content);
                 return;
             }
         };
+        if let Some(reexport) = &self.index.reexport {
+            reexport.rewrite_file(&mut parsed);
+        }
         let mut scan = Scan::default();
         scan.visit_file(&parsed);
         let record = &mut self.index.units[unit];
@@ -262,6 +268,10 @@ impl Builder<'_> {
         let mut refs = Refs::default();
         let text = match content.parse::<TokenStream>() {
             Ok(tokens) => {
+                let tokens = match &self.index.reexport {
+                    Some(reexport) => reexport.rewrite_tokens(tokens),
+                    None => tokens,
+                };
                 token_refs(tokens.clone(), &mut refs, true, false);
                 canonical(tokens)
             }

@@ -204,7 +204,7 @@ fn expand(
     inject_constants(&mut item_impl, arguments.constants)?;
 
     let fingerprint = if arguments.fingerprint.as_ref().is_some_and(LitBool::value) {
-        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_file));
+        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_file, jalari));
         quote!(::core::option::Option::Some(#hex))
     } else {
         quote!(::core::option::Option::None)

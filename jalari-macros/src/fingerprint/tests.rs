@@ -11,6 +11,7 @@ use super::index::{Index, is_job_impl};
 use super::load;
 use super::lock::Lock;
 use super::reach::{MemberRule, reach};
+use super::reexport::Reexport;
 use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 
 const VERSION: &str = "0.5.0";
@@ -162,7 +163,7 @@ impl<'ast> Visit<'ast> for Finder {
 fn job_at(workspace: &Workspace, file: &str, self_ty: &str, version: &str) -> u128 {
     let item = macro_input(workspace, file, self_ty);
     fingerprint(
-        &Index::build(workspace),
+        &Index::build(workspace, None),
         workspace,
         &JobSite {
             item: &item,
@@ -759,7 +760,7 @@ fn test_root_selection_follows_call_site() {
 fn whole(workspace: &Workspace, file: Option<&str>, version: &str) -> u128 {
     let item = macro_input(workspace, "src/lib.rs", "J");
     fingerprint(
-        &Index::build(workspace),
+        &Index::build(workspace, None),
         workspace,
         &JobSite { item: &item, file },
         version,
@@ -809,7 +810,7 @@ fn test_gated_members_reach_no_more_than_name_only() {
             "struct Cache;\nimpl Cache {\n    fn get(&self, key: &u32) -> u32 { 1 }\n}",
         ),
     )]);
-    let index = Index::build(&workspace);
+    let index = Index::build(&workspace, None);
     let item = macro_input(&workspace, "src/lib.rs", "J");
     let site = JobSite {
         item: &item,
@@ -890,7 +891,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn checkout(root: &Path, self_ty: &str) -> u128 {
     let file = root.join("app/src/lib.rs");
     let item = find_job(&fs::read_to_string(&file).unwrap(), self_ty);
-    load::fingerprint_at(Some(&root.join("app")), Some(&file), &item)
+    load::fingerprint_at(Some(&root.join("app")), Some(&file), &item, None)
 }
 
 fn rewrite(path: &Path, from: &str, to: &str) {
@@ -944,7 +945,7 @@ fn test_loader_fingerprint_ignores_checkout_path() {
     let file = first.join("app/src/lib.rs");
     let item = find_job(&fs::read_to_string(&file).unwrap(), "Standalone");
     assert_ne!(
-        load::fingerprint_at(Some(&first.join("app")), None, &item),
+        load::fingerprint_at(Some(&first.join("app")), None, &item, None),
         standalone
     );
     fs::remove_dir_all(&base).unwrap();
@@ -969,9 +970,9 @@ fn test_loader_ignores_target_roots_that_do_not_contain_the_job() {
     .unwrap();
     let file = base.join("tests/alpha.rs");
     let item = find_job(&job, "J");
-    let before = load::fingerprint_at(Some(&base), Some(&file), &item);
+    let before = load::fingerprint_at(Some(&base), Some(&file), &item, None);
     fs::write(&other, "mod alpha_helpers {}\n").unwrap();
-    let after = load::fingerprint_at(Some(&base), Some(&file), &item);
+    let after = load::fingerprint_at(Some(&base), Some(&file), &item, None);
     fs::remove_dir_all(&base).unwrap();
     assert_eq!(before, after);
 }
@@ -983,7 +984,7 @@ fn test_measure_reach_over_this_repository() {
         .unwrap()
         .join("jalari");
     let workspace = load::load(&package);
-    let index = Index::build(&workspace);
+    let index = Index::build(&workspace, None);
     let mut measured = 0;
     for (path, text) in &workspace.crates[0].files {
         for item in jobs_in(text) {
@@ -1060,7 +1061,7 @@ fn test_job_trait_bound_does_not_join_jobs() {
         )
         .unwrap();
         fingerprint(
-            &Index::build(&workspace),
+            &Index::build(&workspace, None),
             &workspace,
             &JobSite {
                 item: &item,
@@ -1169,7 +1170,7 @@ fn test_shared_module_counts_once_across_roots() {
 #[test]
 fn test_impl_missing_from_the_file_falls_back() {
     let workspace = single(&[("src/lib.rs", &source("", "fn other() -> u32 { 1 }"))]);
-    let index = Index::build(&workspace);
+    let index = Index::build(&workspace, None);
     let item: syn::ItemImpl =
         syn::parse_str("impl Job for Elsewhere {\n    const NAME: &'static str = \"e\";\n}")
             .unwrap();
@@ -1268,8 +1269,8 @@ fn test_loader_resolves_a_relative_local_file() {
     );
     let item = find_job(&fs::read_to_string(&absolute).unwrap(), "UsesHelper");
     assert_eq!(
-        load::fingerprint_at(Some(&manifest), Some(relative), &item),
-        load::fingerprint_at(Some(&manifest), Some(&absolute), &item)
+        load::fingerprint_at(Some(&manifest), Some(relative), &item, None),
+        load::fingerprint_at(Some(&manifest), Some(&absolute), &item, None)
     );
 }
 
@@ -1279,12 +1280,12 @@ fn test_loader_fingerprint_uses_the_jalari_version() {
     let file = manifest.join("src/lib.rs");
     let item = find_job(&fs::read_to_string(&file).unwrap(), "Standalone");
     let workspace = load::load(&manifest);
-    let index = Index::build(&workspace);
+    let index = Index::build(&workspace, None);
     let site = JobSite {
         item: &item,
         file: Some("src/lib.rs"),
     };
-    let loaded = load::fingerprint_at(Some(&manifest), Some(&file), &item);
+    let loaded = load::fingerprint_at(Some(&manifest), Some(&file), &item, None);
     assert_eq!(
         loaded,
         fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
@@ -1480,7 +1481,7 @@ fn test_fingerprints_without_a_reexport_are_unchanged() {
     let fixture_job = |self_ty: &str| {
         let item = find_job(&fixture_text, self_ty);
         fingerprint(
-            &Index::build(&fixture_workspace),
+            &Index::build(&fixture_workspace, None),
             &fixture_workspace,
             &JobSite {
                 item: &item,
@@ -1546,4 +1547,190 @@ fn test_fingerprints_without_a_reexport_are_unchanged() {
     for ((label, value), expected) in cases.into_iter().zip(expected) {
         assert_eq!(hex(value), expected, "{label}");
     }
+}
+
+fn reexport(path: &str) -> Option<Reexport> {
+    Reexport::from_path(&syn::parse_str(path).unwrap())
+}
+
+fn through(workspace: &Workspace, path: &str) -> u128 {
+    let item = macro_input(workspace, "src/lib.rs", "J");
+    fingerprint(
+        &Index::build(workspace, reexport(path)),
+        workspace,
+        &JobSite {
+            item: &item,
+            file: Some("src/lib.rs"),
+        },
+        VERSION,
+    )
+}
+
+fn facade_job(facade: &str, body: &str) -> String {
+    facade_source(facade, body).replace(
+        &format!("#[{facade}::__jalari::job]"),
+        &format!("#[{facade}::__jalari::job(crate = \"::{facade}::__jalari\")]"),
+    )
+}
+
+#[test]
+fn test_reexport_rewrites_only_paths_through_it() {
+    let cases = [
+        (
+            "use facade::__jalari::{Job, JobResult};",
+            "use jalari::{Job, JobResult};",
+        ),
+        ("use ::facade::__jalari::Job;", "use ::jalari::Job;"),
+        ("use facade::__jalari;", "use jalari as __jalari;"),
+        (
+            "use facade::__jalari as reexported;",
+            "use jalari as reexported;",
+        ),
+        (
+            "use facade::__jalari::{self, Job};",
+            "use jalari::{self as __jalari, Job};",
+        ),
+        (
+            "use facade::{__jalari::Job, helpers::x};",
+            "use {jalari::Job, facade::{helpers::x}};",
+        ),
+        ("use facade::{__jalari::{Job}};", "use jalari::{Job};"),
+        ("use facade::helpers::x;", "use facade::helpers::x;"),
+        (
+            "use facade::__jalari_extra::x;",
+            "use facade::__jalari_extra::x;",
+        ),
+        ("use facade;", "use facade;"),
+        (
+            "fn f() -> facade::__jalari::JobResult { ::facade::__jalari::Priority::High; <T as facade::__jalari::Job>::NAME; Ok(()) }",
+            "fn f() -> jalari::JobResult { ::jalari::Priority::High; <T as jalari::Job>::NAME; Ok(()) }",
+        ),
+        (
+            "fn f() { let facade::__jalari::Wrapper(x) = facade::__jalari::Wrapper(1); let facade::__jalari::Pair { a } = facade::__jalari::Pair { a: 1 }; }",
+            "fn f() { let jalari::Wrapper(x) = jalari::Wrapper(1); let jalari::Pair { a } = jalari::Pair { a: 1 }; }",
+        ),
+        (
+            "fn f() { other::facade::__jalari::x(); facade::__jalari_extra::x(); facade::helpers::x(); let _ = \"facade::__jalari::Job\"; }",
+            "fn f() { other::facade::__jalari::x(); facade::__jalari_extra::x(); facade::helpers::x(); let _ = \"facade::__jalari::Job\"; }",
+        ),
+        (
+            "fn f() { println!(\"{}\", facade::__jalari::VERSION, ::facade::__jalari::NAME, x::facade::__jalari::Y, facade::__jalari_extra::Z, \"facade::__jalari\"); }",
+            "fn f() { println!(\"{}\", jalari::VERSION, ::jalari::NAME, x::facade::__jalari::Y, facade::__jalari_extra::Z, \"facade::__jalari\"); }",
+        ),
+        (
+            "#[facade::__jalari::job(crate = \"::facade::__jalari\")] impl facade::__jalari::Job for J {}",
+            "#[jalari::job(crate = \"::facade::__jalari\")] impl jalari::Job for J {}",
+        ),
+    ];
+    let facade = reexport("::facade::__jalari").unwrap();
+    for (input, expected) in cases {
+        let mut file = syn::parse_file(input).unwrap();
+        facade.rewrite_file(&mut file);
+        assert_eq!(
+            canonical(file.to_token_stream()),
+            canonical(syn::parse_file(expected).unwrap().to_token_stream()),
+            "{input}"
+        );
+    }
+    assert_eq!(reexport("::jalari"), None);
+    assert_eq!(reexport("jalari"), None);
+}
+
+#[test]
+fn test_job_through_a_reexport_hashes_like_a_direct_job() {
+    let rest = "fn helper() -> u32 { 1 }";
+    for body in [
+        "",
+        "helper();",
+        "let _ = {j}::Priority::High;",
+        "println!(\"{}\", {j}::VERSION);",
+    ] {
+        let direct = of(&single(&[(
+            "src/lib.rs",
+            &source(&body.replace("{j}", "jalari"), rest),
+        )]));
+        let facade = source(&body.replace("{j}", "facade::__jalari"), rest)
+            .replace(
+                "use jalari::{Job, JobResult};",
+                "use facade::__jalari::{Job, JobResult};",
+            )
+            .replace(
+                "#[jalari::job]",
+                "#[facade::__jalari::job(crate = \"::facade::__jalari\")]",
+            );
+        assert_eq!(
+            through(&through_facade(&facade, "facade"), "::facade::__jalari"),
+            direct,
+            "{body}"
+        );
+    }
+    let renamed = source("", "")
+        .replace("use jalari::", "use platform::")
+        .replace("#[jalari::job]", "#[platform::job(crate = \"::platform\")]");
+    assert_eq!(
+        through(&through_facade(&renamed, "platform"), "::platform"),
+        lib(&source("", ""))
+    );
+}
+
+#[test]
+fn test_renamed_reexport_keeps_fingerprint() {
+    let renamed = |body: &str| {
+        let build = |facade: &str| {
+            let job = facade_job(facade, &body.replace("{facade}", facade));
+            through(
+                &through_facade(&job, facade),
+                &format!("::{facade}::__jalari"),
+            )
+        };
+        (build("facade_a"), build("facade_b"))
+    };
+    let (a, b) = renamed("");
+    assert_eq!(a, b);
+    let (a, b) = renamed("let _ = {facade}::__jalari::Priority::High;");
+    assert_eq!(a, b);
+    let (a, b) = renamed("{facade}::__jalari_extra::x();");
+    assert_ne!(a, b);
+    let (a, b) = renamed("let _ = \"{facade}::__jalari::Job\";");
+    assert_ne!(a, b);
+}
+
+#[test]
+fn test_reexport_version_is_pinned_only_through_its_own_code() {
+    let bumped = FACADE_LOCK.replace("1.0.0", "1.0.1");
+    let bump = |body: &str| {
+        let job = facade_job("facade", body);
+        (
+            through(
+                &through_registry_facade(&job, FACADE_LOCK),
+                "::facade::__jalari",
+            ),
+            through(
+                &through_registry_facade(&job, &bumped),
+                "::facade::__jalari",
+            ),
+        )
+    };
+    let (before, after) = bump("");
+    assert_eq!(before, after);
+    let (before, after) = bump("let _ = facade::__jalari::Priority::High;");
+    assert_eq!(before, after);
+    let (before, after) = bump("facade::helpers::x();");
+    assert_ne!(before, after);
+    let (before, after) = bump("facade::__jalari_extra::x();");
+    assert_ne!(before, after);
+}
+
+#[test]
+fn test_unparseable_file_is_read_through_the_reexport() {
+    let build = |facade: &str| {
+        let job = format!("{}\nmod broken;\n", facade_job(facade, ""));
+        let mut workspace = through_facade(&job, facade);
+        workspace.crates[0].files.insert(
+            "src/broken.rs".to_owned(),
+            format!("fn x() -> u32 {{ 1 }}\n{facade}::__jalari::Priority::High;"),
+        );
+        through(&workspace, &format!("::{facade}::__jalari"))
+    };
+    assert_eq!(build("facade_a"), build("facade_b"));
 }

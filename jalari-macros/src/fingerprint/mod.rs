@@ -4,6 +4,7 @@ mod index;
 mod load;
 mod lock;
 mod reach;
+mod reexport;
 #[cfg(test)]
 mod tests;
 mod workspace;

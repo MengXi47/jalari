@@ -10,6 +10,7 @@ use super::analyse::fingerprint;
 use super::index::Index;
 use super::lock::Lock;
 use super::reach::locates;
+use super::reexport::Reexport;
 use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 
 const MAX_CACHED_INDEXES: usize = 16;
@@ -17,15 +18,25 @@ const MAX_DIRECTORY_DEPTH: usize = 32;
 
 static INDEXES: Mutex<BTreeMap<u64, Arc<Index>>> = Mutex::new(BTreeMap::new());
 
-pub(crate) fn of_call_site(item: &syn::ItemImpl, local_file: Option<PathBuf>) -> u128 {
+pub(crate) fn of_call_site(
+    item: &syn::ItemImpl,
+    local_file: Option<PathBuf>,
+    jalari: &syn::Path,
+) -> u128 {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
-    fingerprint_at(manifest_dir.as_deref(), local_file.as_deref(), item)
+    fingerprint_at(
+        manifest_dir.as_deref(),
+        local_file.as_deref(),
+        item,
+        Reexport::from_path(jalari).as_ref(),
+    )
 }
 
 pub(crate) fn fingerprint_at(
     manifest_dir: Option<&Path>,
     local_file: Option<&Path>,
     item: &syn::ItemImpl,
+    reexport: Option<&Reexport>,
 ) -> u128 {
     let mut workspace = manifest_dir.map(load).unwrap_or_default();
     let file = manifest_dir
@@ -44,16 +55,16 @@ pub(crate) fn fingerprint_at(
             .collect();
         for candidates in [likely, all.clone()] {
             set_roots(&mut workspace, candidates);
-            let index = cached(&workspace);
+            let index = cached(&workspace, reexport);
             if locates(&index, &site) {
                 set_roots(&mut workspace, roots_containing(&index, file));
-                let index = cached(&workspace);
+                let index = cached(&workspace, reexport);
                 return fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"));
             }
         }
         set_roots(&mut workspace, all);
     }
-    let index = cached(&workspace);
+    let index = cached(&workspace, reexport);
     fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
 }
 
@@ -108,13 +119,13 @@ pub(crate) fn load(manifest_dir: &Path) -> Workspace {
     }
 }
 
-fn cached(workspace: &Workspace) -> Arc<Index> {
-    let key = content_key(workspace);
+fn cached(workspace: &Workspace, reexport: Option<&Reexport>) -> Arc<Index> {
+    let key = content_key(workspace, reexport);
     let mut cache = INDEXES.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(index) = cache.get(&key) {
         return Arc::clone(index);
     }
-    let index = Arc::new(Index::build(workspace));
+    let index = Arc::new(Index::build(workspace, reexport.cloned()));
     if cache.len() >= MAX_CACHED_INDEXES {
         cache.clear();
     }
@@ -122,9 +133,10 @@ fn cached(workspace: &Workspace) -> Arc<Index> {
     index
 }
 
-fn content_key(workspace: &Workspace) -> u64 {
+fn content_key(workspace: &Workspace, reexport: Option<&Reexport>) -> u64 {
     let mut hasher = DefaultHasher::new();
     workspace.crates.hash(&mut hasher);
+    reexport.hash(&mut hasher);
     hasher.finish()
 }
 

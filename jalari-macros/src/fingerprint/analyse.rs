@@ -16,7 +16,11 @@ pub(crate) fn fingerprint(
     site: &JobSite<'_>,
     jalari_version: &str,
 ) -> u128 {
-    let item = hashed_job(site.item);
+    let mut item = site.item.clone();
+    if let Some(reexport) = &index.reexport {
+        reexport.rewrite_item(&mut item);
+    }
+    let item = hashed_job(&item);
     let site = &JobSite {
         item: &item,
         file: site.file,
