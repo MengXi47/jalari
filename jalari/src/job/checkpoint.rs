@@ -353,7 +353,8 @@ impl<P: Serialize> Checkpoint<P> {
     /// database: it keeps a JSON copy of `progress` at most once a second, which the worker
     /// writes every few seconds, so a crash loses only the last few seconds of progress. When
     /// the job was asked to stop, the copy it takes then is saved together with the stopped
-    /// state. Outside a job it does nothing and returns `Ok`.
+    /// state. When a crash must not lose the copy, use [`save_now`](Self::save_now) or
+    /// [`save_in`](Self::save_in). Outside a job it does nothing and returns `Ok`.
     ///
     /// # Errors
     ///

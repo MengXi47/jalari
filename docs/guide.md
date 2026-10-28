@@ -206,8 +206,10 @@ middleware, `()` by default; see [Context and middleware](#context-and-middlewar
 
 `run` returns `Ok(())` on success. Any error converts into a retryable `jalari::JobError`
 through `?`. Return `jalari::JobError::permanent(e)` when retrying cannot help, for example
-invalid input. A panic or a timeout counts as a failed attempt. [How an attempt
-ends](#retries) lists every outcome, including snoozing and discarding.
+invalid input. A panic or a timeout counts as a failed attempt. A job that times out is
+aborted at its current `.await`, and the worker waits up to a second for the aborted code to be
+dropped before it records the outcome. [How an attempt ends](#retries) lists every outcome,
+including snoozing and discarding.
 
 Inside `run`, `jalari::current_job()` returns a `jalari::JobRun` for the attempt: its id, name,
 queue, attempt number and `max_attempts`, when the job was created and when this attempt became
@@ -686,7 +688,8 @@ worker.run(shutdown).await;
 
 A worker runs every `#[jalari::job]` linked into its binary and only takes jobs from the
 queues it lists. A running job holds no connection: workers use the pool only for the short
-statements that claim and finish jobs, so the concurrency does not depend on the pool size.
+statements that claim jobs, store their progress and finish them, so the concurrency does not
+depend on the pool size.
 The pool needs at least two connections, one for the notification listener and one for those
 statements; `build()` checks this. Each worker also opens one session of its own, its
 [lifeline](#crashes-and-lost-connections).
@@ -819,12 +822,21 @@ heartbeat is at least 7 seconds old, and takes them over.
 | Job code blocks every runtime thread of the worker | never; it continues | never |
 | The database answers heartbeats with errors, such as statement timeouts while the worker row is locked | never; it continues | never |
 | The network goes silent | within 3 s | 10 to 13 s after the failure |
+| One of the jobs holds a [`save_in`](#durable-progress) transaction open when its worker freezes or loses its lifeline | as above | that job about 11 s after the transaction went idle; the worker's other jobs as above |
 
 A job taken over continues from the progress its [checkpoints](#checkpoints) last saved, and
 the interrupted attempt is recorded in the job history with
 `the worker stopped during the last attempt`. When that attempt was the job's last, the job
 fails instead. Jobs sharing the interrupted job's `queue_key` wait until it is taken over. A
 pending stop or cancel is settled at the takeover and the job does not run again.
+
+A transaction that `checkpoint.save_in` wrote to keeps the job's control row locked until it
+ends, and a job cannot be taken over while its row is locked. `save_in` sets
+`idle_in_transaction_session_timeout` to 10 seconds for that transaction, so PostgreSQL ends it
+once a frozen or stopped worker leaves it idle, and the job is taken over at the next check. The
+worker's other jobs are not held back. In jalari's tests, with one job holding such a
+transaction when its worker's lifeline was ended, the three other jobs ran again 7.0 seconds
+after the lifeline ended and the holding job 11.1 seconds after its transaction went idle.
 
 A worker whose heartbeat gets no answer within 2 seconds, or whose lifeline connection
 breaks, aborts every job it runs, closes its lifeline and registers again under a new id. The
@@ -927,7 +939,8 @@ run, and the `Checkpoint<P>` that saves the same type. `checkpoint.save(&progres
 touches the database: it keeps a JSON copy at most once a second, and the worker writes the
 latest copies every 5 seconds. It returns an error once the job should stop, and `?` unwinds
 the job. Jobs without progress call `jalari::checkpoint().await?` instead. Both do nothing
-outside a job. A job that finishes discards its progress, and so does a `Replace`.
+outside a job. A job that finishes discards its progress, and so does a `Replace`. When a
+crash must not lose the copy, [store it before going on](#durable-progress).
 
 A job that waits in one long `.await` between checkpoints races it against
 `jalari::interrupted()`, as in [Shutdown](#shutdown); it then stops within about a second of
@@ -937,6 +950,64 @@ Declare `checkpoints = true` on a job that reaches checkpoints regularly. When s
 aborted at `stop_timeout` or `shutdown_timeout`, the worker logs an error that says how long it
 went without a checkpoint, or that it kept running after a checkpoint asked it to stop. The
 flag changes nothing else.
+
+### Durable progress
+
+`checkpoint.save` keeps its copy in memory, so a crash loses the last few seconds of progress
+and the job repeats that work. Two calls store the copy before the job goes on:
+
+| Call | The copy is stored | Cost | Use it when a unit of work |
+|---|---|---|---|
+| `checkpoint.save(&progress)` | by the worker within about 6 seconds | none | may run again without harm |
+| `checkpoint.save_now(&progress).await?` | before the call returns | one short transaction | has effects outside the database, such as a page sent to another system |
+| `checkpoint.save_in(&mut transaction, &progress).await?` | when your transaction commits | one statement in it | writes to tables in the database jalari uses |
+
+```rust
+let (saved, checkpoint) = jalari::resume::<Cursor>()?;
+let mut cursor = saved.unwrap_or_default();
+while let Some(batch) = fetch(cursor.last_id).await? {
+    let mut transaction = pool.begin().await?;
+    insert_rows(&mut transaction, &batch).await?;
+    cursor.last_id = batch.last_id;
+    checkpoint.save_in(&mut transaction, &cursor).await?;
+    transaction.commit().await?;
+}
+```
+
+With `save_in`, a unit's rows and its progress commit together, so a retry, a takeover or a
+restart never applies a unit twice. With `save_now`, an effect outside the database can still
+happen twice when the worker dies after the effect and before the call returns; give such
+effects an idempotency key.
+
+- **Fenced.** Both writes check the run's lease. Once another worker has taken the job over,
+  they store nothing and return the lost error, and the job is aborted at its next `.await`
+  even when the error is ignored. A leftover call from an earlier run, for example from a task
+  the job spawned, is refused the same way.
+- **The newest copy wins.** Every copy carries a number, and the database keeps the highest.
+  `save`, `save_now`, `save_in` and the copy the worker writes when the attempt ends can land
+  in any order; a rolled-back `save_in` leaves no trace, and an older copy never replaces a
+  committed newer one.
+- **Stop points.** Both return the stop error when the job was asked to stop, like `save`.
+  `save_now` then keeps the copy for the stopped state without writing; `save_in` writes first
+  and then returns the error, so the transaction rolls back with the unit it carried when you
+  propagate the error.
+- **`save_now`** waits at most 2 seconds for a lock. A database error means the copy may have
+  been stored; the worker writes it again later. A missing control row is a permanent error: the
+  pool given to `jalari::init` reaches another database or schema than the worker.
+- **`save_in`** does not commit; call it as the last statement before `commit`. The
+  transaction must run on the database and schema jalari uses, at `READ COMMITTED`, the
+  default; under `REPEATABLE READ` or `SERIALIZABLE` it fails with a serialization error when
+  the worker wrote the job's progress after the transaction's snapshot, and the unit can be
+  retried in a new transaction. Commit within 10 seconds: the call sets
+  `idle_in_transaction_session_timeout` to 10 seconds for the rest of the transaction, unless a
+  shorter limit is set already. Make no other jalari call for the same job on another
+  connection before the commit; `save_now` would wait for the lock the transaction holds and
+  fail after 2 seconds.
+- **An ignored `save_in` error rolls everything back.** When the lease moved, the statement
+  fails and PostgreSQL aborts the transaction: `transaction.commit()` then returns `Ok` and
+  stores nothing, neither your rows nor the progress. Rolling back to a savepoint taken before
+  the call is the exception: it keeps the transaction alive without the progress, so do not
+  wrap `save_in` in a savepoint.
 
 ### What each call does
 
@@ -955,7 +1026,7 @@ A running job sees a request within about a second. How it ends:
 | The job | It ends as |
 |---|---|
 | Returns the checkpoint's error, or the error from `interrupted()` | `stopped` (or `deleted` for a cancel) with the progress it saved last |
-| Reaches no checkpoint within `stop_timeout` | aborted at its current `.await`, then `stopped` with the last saved progress |
+| Reaches no checkpoint within `stop_timeout` | aborted at its current `.await`, then `stopped` with the last saved progress; the worker waits up to a second for the aborted code to be dropped first |
 | Returns any other error, panics or times out | `stopped` (or `deleted`), not retried |
 | Returns `Ok` first | `succeeded`; a later `stop` returns `Finished` |
 | Its worker crashes | `stopped` (or `deleted`) by another worker 6 to 8 seconds later; it never runs again |
@@ -984,9 +1055,13 @@ A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snoo
 - The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
   work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
   outlive the stop, as with `timeout` and shutdown aborts. `interrupted()` cannot reach them
-  either: it completes only where the job awaits it.
-- A crash loses at most about 6 seconds of progress: one second before a copy is kept, and
-  five before it is written.
+  either: it completes only where the job awaits it. After a `stop_timeout` or `timeout`
+  abort, the worker waits up to a second for the job's task to be dropped, so drop guards have
+  run before the outcome is recorded. A job that never yields cannot be dropped: its outcome is
+  recorded a second after the abort, and the stop takes up to `stop_timeout` plus a second.
+- A crash loses at most about 6 seconds of progress saved with `save`: one second before a
+  copy is kept, and five before it is written. A copy for which `save_now` returned, or whose
+  `save_in` transaction committed, is never lost.
 - A job a worker aborted at shutdown keeps waiting the 7 seconds after the abort when it is
   stopped and restarted or retried in between.
 
@@ -1239,10 +1314,12 @@ The pool given to `jalari::init` may set session options such as `statement_time
 example as `-c` startup options. jalari never changes a pooled connection's session settings,
 so every connection returns to the pool with the values it had.
 
-- A running job holds no connection and no transaction, so no pool setting limits how long a
-  job may run. Every jalari statement runs under the pool's settings, `statement_timeout`
-  included, and none of them waits for long on its own. Jobs that share a `queue_key` are
-  skipped while the key is taken, not waited for.
+- A running job holds no connection and no transaction, so no pool setting limits how long a job
+  may run. `save_now` takes a pool connection for one short transaction with a 2 second
+  `lock_timeout`. `save_in` runs on your transaction and sets its
+  `idle_in_transaction_session_timeout` for that transaction only. Every jalari statement runs
+  under the pool's settings, `statement_timeout` included, and none of them waits for long on
+  its own. Jobs that share a `queue_key` are skipped while the key is taken, not waited for.
 - The lifeline is a connection the worker opens next to the pool with the pool's connect
   options; the pool's `after_connect` does not run on it, so a `SET ROLE`, `search_path` or
   other setting made there does not apply. The lifeline only reads and writes jalari's tables,
@@ -1330,6 +1407,19 @@ until the old build's jobs have drained. Jobs left behind after the last old wor
 until you release them with `jalari::admin::clear_fingerprint`. Every worker logs a warning
 every five minutes while due jobs in its queues have no live worker that can run them, and
 `jalari::admin::stranded()` lists those jobs.
+
+### Upgrading from 0.7
+
+0.8.0 brings migration 10. It adds two columns with defaults and creates the empty `job_step`
+table, whose foreign key on the job table blocks writes to the job table until the migration
+commits, normally for a fraction of a second. 0.7 processes that are already running keep
+working after the upgrade. A 0.7 process started after it fails `init` with
+`SchemaVersionMismatch`, because each release checks for its own version, so start only 0.8
+processes from then on.
+
+From 0.8 on, a worker creates a job's control row when it claims the job, so
+`jalari::admin::job` shows a `control` entry for every job a worker has claimed, and
+housekeeping removes the row together with the job.
 
 ### Upgrading from 0.6
 
@@ -1538,6 +1628,12 @@ worker, since no job became due.
   time. A fire commits in milliseconds, so this lasts as long as a fire does.
 - On PostgreSQL 14 to 17, many far-future jobs of a high [priority](#priority) slow every
   claim of their queue.
+- While a [`save_in`](#durable-progress) transaction is open, its job cannot be taken over, and
+  a release of that job by its own worker, after a lost claim reply, an abandoned close or a
+  shutdown abort, waits for the transaction too. PostgreSQL ends an idle one after 10 seconds;
+  a transaction that keeps running statements holds the job for as long as it runs.
+- `save_in` fails with a serialization error under `REPEATABLE READ` or `SERIALIZABLE` when the
+  worker wrote the job's progress after the transaction's snapshot.
 - While the database answers heartbeats with errors, the worker keeps its jobs but its
   heartbeat ages past the 7 second takeover grace. If its lifeline session then ends, another
   worker can take the jobs over within milliseconds, while this worker notices at its next
