@@ -7,7 +7,7 @@ use syn::{
     Path, PathSegment, QSelf, TypePath, UseGroup, UseName, UsePath, UseRename, UseTree,
 };
 
-const JALARI: &str = "jalari";
+pub(crate) const JALARI: &str = "jalari";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Reexport {
@@ -22,6 +22,10 @@ impl Reexport {
             .map(|segment| segment.ident.to_string())
             .collect();
         (!segments.is_empty() && segments != [JALARI]).then_some(Self { segments })
+    }
+
+    pub(crate) fn root(&self) -> &str {
+        &self.segments[0]
     }
 
     pub(crate) fn rewrite_file(&self, file: &mut File) {

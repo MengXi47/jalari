@@ -4,8 +4,10 @@ use quote::ToTokens;
 
 use super::hash::{Fnv, canonical};
 use super::index::{Index, ItemId, hashed_job};
+use super::lock::Lock;
 use super::reach::{MemberRule, reach};
-use super::workspace::{Dependency, JobSite, Workspace};
+use super::reexport::{JALARI, Reexport};
+use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 
 const TAG: &str = "jalari-fingerprint/1";
 const WHOLE_TAG: &str = "jalari-fingerprint/1/whole";
@@ -37,6 +39,7 @@ pub(crate) fn fingerprint(
             }
             let pins = pins(
                 workspace,
+                index.reexport.as_ref(),
                 roots.iter().map(|(krate, name)| (*krate, name.as_str())),
             );
             (TAG, reached.items.into_iter().collect::<Vec<_>>(), pins)
@@ -52,7 +55,7 @@ pub(crate) fn fingerprint(
             (
                 WHOLE_TAG,
                 (0..index.items.len()).collect(),
-                pins(workspace, roots),
+                pins(workspace, index.reexport.as_ref(), roots),
             )
         }
     };
@@ -96,6 +99,7 @@ pub(crate) fn texts<'i>(index: &'i Index, workspace: &Workspace, items: &[ItemId
 
 fn pins<'a>(
     workspace: &Workspace,
+    reexport: Option<&Reexport>,
     roots: impl Iterator<Item = (usize, &'a str)>,
 ) -> BTreeSet<String> {
     let Some(lock) = &workspace.lock else {
@@ -104,10 +108,35 @@ fn pins<'a>(
     roots
         .filter_map(|(krate, name)| {
             let source = workspace.crates.get(krate)?;
-            let Some(Dependency::Registry(package)) = source.deps.get(name) else {
-                return None;
-            };
-            lock.pin(&source.package, package)
+            match source.deps.get(name) {
+                Some(Dependency::Registry(package)) => lock.pin(&source.package, package),
+                Some(Dependency::Path(_)) => None,
+                None if name == JALARI => reexported_jalari(workspace, lock, source, reexport?),
+                None => None,
+            }
         })
         .collect()
+}
+
+fn reexported_jalari(
+    workspace: &Workspace,
+    lock: &Lock,
+    source: &CrateSource,
+    reexport: &Reexport,
+) -> Option<String> {
+    match source.deps.get(reexport.root())? {
+        Dependency::Registry(_) => lock.pin(&source.package, JALARI),
+        Dependency::Path(facade) => {
+            let facade = workspace.crates.get(*facade)?;
+            facade
+                .deps
+                .values()
+                .find_map(|dependency| match dependency {
+                    Dependency::Registry(package) if package == JALARI => {
+                        lock.pin(&facade.package, package)
+                    }
+                    _ => None,
+                })
+        }
+    }
 }

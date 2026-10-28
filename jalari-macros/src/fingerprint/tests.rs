@@ -1765,3 +1765,69 @@ fn test_job_attribute_through_a_reexport_hashes_as_jalari_job() {
         lib(&bare_direct)
     );
 }
+
+const JALARI_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "{app_dependency}",
+]
+
+[[package]]
+name = "facade"
+version = "1.0.0"
+{facade_source}dependencies = [
+ "jalari",
+]
+
+[[package]]
+name = "jalari"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+
+#[test]
+fn test_registry_jalari_is_pinned_through_the_reexport() {
+    let lock = |app_dependency: &str, facade_source: &str| {
+        JALARI_LOCK
+            .replace("{app_dependency}", app_dependency)
+            .replace("{facade_source}", facade_source)
+    };
+    let registry = "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let job = facade_job("facade", "");
+    let builds = |version: &str| {
+        let bump = |text: String| text.replace("0.8.0", version);
+        let mut direct = single(&[("src/lib.rs", &source("", ""))]);
+        direct.crates[0].deps.insert(
+            "jalari".to_owned(),
+            Dependency::Registry("jalari".to_owned()),
+        );
+        direct.lock = Some(Lock::parse(&bump(lock("jalari", registry))));
+        let mut registry_facade = single(&[("src/lib.rs", &job)]);
+        registry_facade.crates[0].deps.insert(
+            "facade".to_owned(),
+            Dependency::Registry("facade".to_owned()),
+        );
+        registry_facade.lock = Some(Lock::parse(&bump(lock("facade", registry))));
+        let mut path_facade = through_facade(&job, "facade");
+        path_facade.crates[1].deps.insert(
+            "jalari".to_owned(),
+            Dependency::Registry("jalari".to_owned()),
+        );
+        path_facade.lock = Some(Lock::parse(&bump(lock("facade", ""))));
+        [
+            of(&direct),
+            through(&registry_facade, "::facade::__jalari"),
+            through(&path_facade, "::facade::__jalari"),
+        ]
+    };
+    let [direct, registry_facade, path_facade] = builds("0.8.0");
+    assert_eq!(registry_facade, direct);
+    assert_eq!(path_facade, direct);
+    let [bumped_direct, bumped_registry, bumped_path] = builds("0.8.1");
+    assert_ne!(bumped_direct, direct);
+    assert_eq!(bumped_registry, bumped_direct);
+    assert_eq!(bumped_path, bumped_direct);
+}
