@@ -24,8 +24,20 @@ const CLOSE_RETRY: Duration = Duration::from_secs(1);
 const CLOSE_WINDOW: Duration = Duration::from_secs(30);
 const CLOSE_BACKOFF: Duration = Duration::from_millis(100);
 const CLOSE_BACKOFF_LIMIT: Duration = Duration::from_millis(500);
+const ABORT_WAIT: Duration = Duration::from_secs(1);
 
 struct AbortOnDrop(JoinHandle<JobResult>);
+
+impl AbortOnDrop {
+    async fn abort_and_wait(&mut self) {
+        self.0.abort();
+        if tokio::time::timeout(ABORT_WAIT, &mut self.0).await.is_err() {
+            warn!(
+                "the aborted job did not stop within {ABORT_WAIT:?}, recording its outcome anyway"
+            );
+        }
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -101,30 +113,36 @@ impl Shared {
                         needs: (job.context)(),
                         captured: Captured::from_stored(claimed.context.clone()),
                     });
-                    let run = claimed.run(self, job, job_run, meta);
-                    tokio::pin!(run);
-                    let mut deadline = None;
+                    let mut attempt = claimed.spawn(self, job, job_run, meta);
                     let shutdown_abort = ShutdownAbort {
                         control: &control,
                         window: Some(self.settings.shutdown_timeout),
                     };
-                    let ending = loop {
-                        tokio::select! {
-                            biased;
-                            () = control.lost().cancelled() => {
-                                warn!("the worker lost the job, aborting it");
-                                return;
+                    let ending = {
+                        let run = claimed.join(&mut attempt);
+                        tokio::pin!(run);
+                        let mut deadline = None;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                () = control.lost().cancelled() => {
+                                    warn!("the worker lost the job, aborting it");
+                                    return;
+                                }
+                                () = sleep_until(deadline), if deadline.is_some() => {
+                                    report_missed_checkpoints(&control, self.settings.stop_timeout);
+                                    break Ending::Aborted { after: self.settings.stop_timeout };
+                                }
+                                () = control.commanded(), if deadline.is_none() => {
+                                    deadline = Some(tokio::time::Instant::now() + self.settings.stop_timeout);
+                                }
+                                result = &mut run => break Ending::Returned(result),
                             }
-                            () = sleep_until(deadline), if deadline.is_some() => {
-                                report_missed_checkpoints(&control, self.settings.stop_timeout);
-                                break Ending::Aborted { after: self.settings.stop_timeout };
-                            }
-                            () = control.commanded(), if deadline.is_none() => {
-                                deadline = Some(tokio::time::Instant::now() + self.settings.stop_timeout);
-                            }
-                            result = &mut run => break Ending::Returned(result),
                         }
                     };
+                    if let Ending::Aborted { .. } = ending {
+                        attempt.abort_and_wait().await;
+                    }
                     shutdown_abort.finished();
                     ending
                 }
@@ -364,13 +382,13 @@ impl Claimed {
         }
     }
 
-    async fn run(
+    fn spawn(
         &self,
         shared: &Shared,
         registration: &'static JobRegistration,
         job_run: JobRun,
         meta: Arc<JobMeta>,
-    ) -> JobResult {
+    ) -> AbortOnDrop {
         let captured = Captured::from_stored(self.context.clone());
         let middlewares = Arc::clone(&shared.middlewares);
         let payload = self.payload.clone();
@@ -386,16 +404,22 @@ impl Claimed {
             .await
         };
         let attempt = run::within(job_run, context::within(captured, attempt)).in_current_span();
-        let mut handle = AbortOnDrop(tokio::spawn(attempt));
+        AbortOnDrop(tokio::spawn(attempt))
+    }
+
+    async fn join(&self, attempt: &mut AbortOnDrop) -> JobResult {
         let joined = match self.timeout_ms {
             Some(timeout_ms) => {
                 let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
-                match tokio::time::timeout(timeout, &mut handle.0).await {
+                match tokio::time::timeout(timeout, &mut attempt.0).await {
                     Ok(joined) => joined,
-                    Err(_) => return Err(JobError::new(format!("timed out after {timeout:?}"))),
+                    Err(_) => {
+                        attempt.abort_and_wait().await;
+                        return Err(JobError::new(format!("timed out after {timeout:?}")));
+                    }
                 }
             }
-            None => (&mut handle.0).await,
+            None => (&mut attempt.0).await,
         };
         match joined {
             Ok(result) => result,

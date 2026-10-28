@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,8 @@ const INTERRUPTED: &str = "the worker stopped during the last attempt";
 const IMPATIENT: Duration = Duration::from_secs(1);
 const ABORT_LATENCY: Duration = Duration::from_secs(5);
 const DECLARED: &str = "job declared checkpoints but";
+const DROP_WORK: Duration = Duration::from_millis(300);
+const ABORT_WAIT: Duration = Duration::from_secs(1);
 const IGNORED: &str =
     "job declared checkpoints but kept running after a checkpoint asked it to stop";
 
@@ -183,6 +186,52 @@ impl Job for UndeclaredSleeper {
     }
 }
 
+static RELEASE_SPINNER: AtomicBool = AtomicBool::new(false);
+
+struct SlowDrop(String);
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(DROP_WORK);
+        LEDGER.record(&self.0, "dropped");
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SlowToDrop {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control")]
+impl Job for SlowToDrop {
+    const NAME: &'static str = "run_control_slow_to_drop";
+
+    async fn run(self) -> JobResult {
+        let _guard = SlowDrop(self.label.clone());
+        LEDGER.record(&self.label, "start");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Spinner {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control")]
+impl Job for Spinner {
+    const NAME: &'static str = "run_control_spinner";
+
+    async fn run(self) -> JobResult {
+        LEDGER.record(&self.label, "start");
+        while !RELEASE_SPINNER.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
 struct Shape {
     state: String,
@@ -267,6 +316,8 @@ async fn test_run_control() {
     check_swallowed_halt_logs(&database).await;
     check_undeclared_job_logs_nothing(&database).await;
     check_shutdown_abort_logs(&database).await;
+    check_close_waits_for_the_aborted_body(&database).await;
+    check_close_waits_at_most_a_second_for_a_blocked_body(&database).await;
     database.finish().await;
 }
 
@@ -442,4 +493,53 @@ async fn check_shutdown_abort_logs(database: &Database) {
         [("scheduled".to_owned(), Some(INTERRUPTED.to_owned()))]
     );
     assert_eq!(jalari::cancel(id).await.unwrap(), CancelOutcome::Cancelled);
+}
+
+async fn check_close_waits_for_the_aborted_body(database: &Database) {
+    let worker = spawn_worker(IMPATIENT, PATIENT).await;
+    let id = start(
+        &SlowToDrop {
+            label: "slow_drop".to_owned(),
+        },
+        "slow_drop",
+    )
+    .await;
+    assert_eq!(jalari::stop(id).await.unwrap(), StopOutcome::Requested);
+    wait_for_state(database, id, "stopped", ABORT_LATENCY).await;
+    let stopped_seen = Instant::now();
+    let dropped = LEDGER
+        .events("slow_drop")
+        .into_iter()
+        .find(|(event, _)| *event == "dropped")
+        .map(|(_, at)| at);
+    assert!(
+        dropped.is_some_and(|dropped| dropped <= stopped_seen),
+        "the outcome was recorded before the aborted body was dropped: {dropped:?}"
+    );
+    worker.stop().await;
+}
+
+async fn check_close_waits_at_most_a_second_for_a_blocked_body(database: &Database) {
+    let worker = spawn_worker(IMPATIENT, PATIENT).await;
+    let id = start(
+        &Spinner {
+            label: "spinner".to_owned(),
+        },
+        "spinner",
+    )
+    .await;
+    let asked = Instant::now();
+    assert_eq!(jalari::stop(id).await.unwrap(), StopOutcome::Requested);
+    wait_for_state(
+        database,
+        id,
+        "stopped",
+        CONTROL_LATENCY + IMPATIENT + ABORT_WAIT,
+    )
+    .await;
+    let stopped = asked.elapsed();
+    RELEASE_SPINNER.store(true, Ordering::SeqCst);
+    eprintln!("spinner: stopped {stopped:?} after the request while its body never yielded");
+    assert_eq!(LEDGER.count("spinner", "start"), 1);
+    worker.stop().await;
 }
