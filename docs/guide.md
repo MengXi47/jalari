@@ -295,7 +295,10 @@ The fingerprint covers:
 - the jalari version
 
 Formatting, comments and code that the job cannot reach leave it unchanged. The same sources
-and the same `Cargo.lock` give the same fingerprint on every machine and in every directory.
+and the same `Cargo.lock` give the same fingerprint on every machine and in every directory,
+in debug and release builds and under `cargo test`. A `cfg_attr` on the `impl Job` block counts
+as written, whichever attributes it expands to. Cargo rebuilds the crate when any file that a
+fingerprint read changes, including a module that the current build leaves out with `#[cfg]`.
 
 The name, the aliases, the priority, `RETRY_POLICY`, the `checkpoints` flag and the `missed`
 policy are left out, in the attribute and in the impl, so renaming a job with an alias, changing
@@ -314,9 +317,13 @@ The analysis matches names rather than resolving paths, so it errs toward a chan
 function with the same name as one the job calls, in any module, changes the fingerprint too.
 A method call reaches the methods of that name on the types the reached code names, and naming
 a trait reaches all of its implementations. Code that a build script generates into `OUT_DIR`
-and names that macros such as `paste!` build are not analysed. When the compiler does not
-report the source file of the job, as in some IDE and non-Cargo builds, the fingerprint covers
-every item of the crate and of its `path` dependencies.
+and names that macros such as `paste!` build are not analysed, and neither are the files that
+`include!`, `include_str!` and `include_bytes!` read, or a module file whose name differs in case
+from its `mod` declaration, which only compiles on a case-insensitive file system. When `#[cfg]`
+chooses between two `impl Job` blocks of one job, each build hashes the block it compiles, so
+builds with different features, profiles or targets get different fingerprints. When the
+compiler does not report the source file of the job, as in some IDE and non-Cargo builds, the
+fingerprint covers every item of the crate and of its `path` dependencies.
 
 This holds on your own machine as much as in production. After you edit a job and restart its
 worker, the jobs that the earlier build enqueued, before the edit or from a process that still
