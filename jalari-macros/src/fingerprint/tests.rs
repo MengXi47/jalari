@@ -1405,3 +1405,145 @@ fn test_loader_resolves_workspace_dependencies_per_package() {
     };
     assert_eq!(workspace.crates[near].package, "near");
 }
+
+const FACADE: &str = "pub use jalari as __jalari;
+
+pub mod helpers {
+    pub fn x() -> u32 {
+        1
+    }
+}
+";
+
+const FACADE_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "facade",
+ "jalari",
+]
+
+[[package]]
+name = "facade"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "jalari",
+]
+
+[[package]]
+name = "jalari"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+
+fn through_facade(app_lib: &str, facade: &str) -> Workspace {
+    let mut workspace = single(&[("src/lib.rs", app_lib)]);
+    workspace.crates[0]
+        .deps
+        .insert(facade.to_owned(), Dependency::Path(1));
+    workspace.crates.push(crate_source(
+        facade,
+        &["src/lib.rs"],
+        &[("src/lib.rs", FACADE)],
+    ));
+    workspace
+}
+
+fn through_registry_facade(app_lib: &str, lock: &str) -> Workspace {
+    let mut workspace = single(&[("src/lib.rs", app_lib)]);
+    for name in ["facade", "jalari"] {
+        workspace.crates[0]
+            .deps
+            .insert(name.to_owned(), Dependency::Registry(name.to_owned()));
+    }
+    workspace.lock = Some(Lock::parse(lock));
+    workspace
+}
+
+fn facade_source(facade: &str, body: &str) -> String {
+    source(body, "")
+        .replace(
+            "use jalari::{Job, JobResult};",
+            &format!("use {facade}::__jalari::{{Job, JobResult}};"),
+        )
+        .replace("#[jalari::job]", &format!("#[{facade}::__jalari::job]"))
+}
+
+#[test]
+fn test_fingerprints_without_a_reexport_are_unchanged() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fingerprint/app");
+    let fixture_text = fs::read_to_string(fixture.join("src/lib.rs")).unwrap();
+    let fixture_workspace = load::load(&fixture);
+    let fixture_job = |self_ty: &str| {
+        let item = find_job(&fixture_text, self_ty);
+        fingerprint(
+            &Index::build(&fixture_workspace),
+            &fixture_workspace,
+            &JobSite {
+                item: &item,
+                file: Some("src/lib.rs"),
+            },
+            VERSION,
+        )
+    };
+    let bare = source("", "").replace("#[jalari::job]", "#[job]").replace(
+        "use jalari::{Job, JobResult};",
+        "use jalari::{Job, JobResult, job};",
+    );
+    let glob = source("", "").replace("use jalari::{Job, JobResult};", "use jalari::*;");
+    let reads_json = source("serde_json::to_vec(&self.count);", "");
+    let names_facade = facade_source("facade", "facade::helpers::x();");
+    let only_facade = facade_source("facade", "");
+    let cases = [
+        ("fixture UsesHelper", fixture_job("UsesHelper")),
+        ("fixture Standalone", fixture_job("Standalone")),
+        ("plain", lib(&source("", ""))),
+        ("bare attribute", lib(&bare)),
+        ("glob import", lib(&glob)),
+        ("registry crate", of(&with_registry(&reads_json, LOCK))),
+        (
+            "registry jalari",
+            of(&through_registry_facade(&source("", ""), FACADE_LOCK)),
+        ),
+        (
+            "facade path dependency",
+            of(&through_facade(&names_facade, "facade")),
+        ),
+        (
+            "facade path dependency, only re-export",
+            of(&through_facade(&only_facade, "facade")),
+        ),
+        (
+            "facade registry crate",
+            of(&through_registry_facade(&names_facade, FACADE_LOCK)),
+        ),
+        (
+            "facade path in macro tokens",
+            job("println!(\"{}\", facade::__jalari::VERSION);", ""),
+        ),
+        (
+            "whole workspace",
+            whole(&single(&[("src/lib.rs", &source("", ""))]), None, VERSION),
+        ),
+    ];
+    let expected = [
+        "3e6b03ae43be5ef673b4674180f77c53",
+        "07178e6614fba9672e80e8aa6a9ecab3",
+        "b4dace73b9b0e70427ac58a4e4646e5f",
+        "89452a5b6f26950f4f15f28cc9f7c0cc",
+        "8fed02c7c470fa7a027daea1b361d443",
+        "f5fd535006a710c02b14f3bb8109100d",
+        "f33a15dd9fbe3ab9d7ab229f969bc18a",
+        "a6c09c3db903a53c49ad7490a8d20f10",
+        "b3ff90c4e3532d82e3d6d69a9d23090d",
+        "6ac1430308a61a581c6f52987836e4c8",
+        "f87fe17fb58f9d414335ff807c1b51cb",
+        "65aed252aebb750124982a7455007c99",
+    ];
+    for ((label, value), expected) in cases.into_iter().zip(expected) {
+        assert_eq!(hex(value), expected, "{label}");
+    }
+}
