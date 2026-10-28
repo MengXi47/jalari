@@ -164,6 +164,47 @@ impl JobRun {
         let control = Arc::clone(&self.control);
         async move { control.halted().await }
     }
+
+    /// Returns `true` once this attempt should stop; the synchronous twin of
+    /// [`JobRun::interrupted`].
+    ///
+    /// It turns `true` at the same moment `interrupted` completes: on a [`stop`](crate::stop) or
+    /// a [`cancel`](crate::cancel), when the worker starts shutting down, and when the worker has
+    /// lost the job. It never turns back to `false`. Poll it from blocking code, which cannot
+    /// await a future. The free functions [`current_job`] and [`interrupted`] read a task-local
+    /// that does not exist inside `spawn_blocking`, so take the handle in the job's own task and
+    /// move it in. Once the loop has noticed, return the error from `interrupted`, which is
+    /// ready at once, so a stop, a cancel or a shutdown settles the job the way it does for
+    /// async code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # fn process(chunk: u32) {}
+    /// # async fn example(chunks: Vec<u32>) -> jalari::JobResult {
+    /// let run = jalari::current_job().expect("inside a job");
+    /// let polled = run.clone();
+    /// let finished = tokio::task::spawn_blocking(move || {
+    ///     for chunk in chunks {
+    ///         if polled.is_interrupted() {
+    ///             return false;
+    ///         }
+    ///         process(chunk);
+    ///     }
+    ///     true
+    /// })
+    /// .await?;
+    /// if !finished {
+    ///     return Err(run.interrupted().await);
+    /// }
+    /// Ok(())
+    /// # }
+    /// ```
+    pub fn is_interrupted(&self) -> bool {
+        self.control.command().is_some()
+            || self.control.lost().is_cancelled()
+            || self.control.shutdown().is_cancelled()
+    }
 }
 
 /// Returns the attempt that is running, or `None` outside a job.

@@ -1094,11 +1094,35 @@ A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snoo
 
 - The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
   work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
-  outlive the stop, as with `timeout` and shutdown aborts. `interrupted()` cannot reach them
-  either: it completes only where the job awaits it. After a `stop_timeout` or `timeout`
+  outlive the stop, as with `timeout` and shutdown aborts. After a `stop_timeout` or `timeout`
   abort, the worker waits up to a second for the job's task to be dropped, so drop guards have
   run before the outcome is recorded. A job that never yields cannot be dropped: its outcome is
   recorded a second after the abort, and the stop takes up to `stop_timeout` plus a second.
+- Blocking code in `spawn_blocking` can stop itself. `jalari::interrupted()` and
+  `jalari::current_job()` read a task-local that `spawn_blocking` does not carry, so they do
+  not work there. Take the run handle in the job's own task, move it in, and poll
+  `is_interrupted()` between pieces of work. It turns `true` when `interrupted()` would
+  complete. Then return the error of `run.interrupted()`, which is ready at once, so a stop, a
+  cancel or a shutdown settles the job as it does for async code. In jalari's tests such a loop
+  saw a stop about 1 second after the request.
+
+  ```rust
+  let run = jalari::current_job().expect("inside a job");
+  let polled = run.clone();
+  let finished = tokio::task::spawn_blocking(move || {
+      for chunk in chunks {
+          if polled.is_interrupted() {
+              return false;
+          }
+          process(chunk);
+      }
+      true
+  })
+  .await?;
+  if !finished {
+      return Err(run.interrupted().await);
+  }
+  ```
 - A crash loses at most about 6 seconds of progress saved with `save`: one second before a
   copy is kept, and five before it is written. A copy for which `save_now` returned, or whose
   `save_in` transaction committed, is never lost.

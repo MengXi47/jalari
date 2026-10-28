@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use common::{Database, LEDGER, RunningWorker, wait_until};
 use jalari::sqlx::{self, AssertSqlSafe};
-use jalari::{CancelOutcome, Job, JobId, JobResult, StopOutcome, Worker, WorkerConfig};
+use jalari::{CancelOutcome, Job, JobId, JobResult, JobRun, StopOutcome, Worker, WorkerConfig};
 use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -29,6 +29,8 @@ const ABORT_LATENCY: Duration = Duration::from_secs(5);
 const DECLARED: &str = "job declared checkpoints but";
 const DROP_WORK: Duration = Duration::from_millis(300);
 const ABORT_WAIT: Duration = Duration::from_secs(1);
+const POLL: Duration = Duration::from_millis(10);
+const BLOCKING_LIMIT: Duration = Duration::from_secs(30);
 const IGNORED: &str =
     "job declared checkpoints but kept running after a checkpoint asked it to stop";
 
@@ -232,6 +234,47 @@ impl Job for Spinner {
     }
 }
 
+fn poll_until_interrupted(run: &JobRun, label: &str) -> bool {
+    if run.is_interrupted() {
+        LEDGER.record(label, "interrupted at start");
+    }
+    LEDGER.record(label, "start");
+    let started = Instant::now();
+    while started.elapsed() < BLOCKING_LIMIT {
+        if run.is_interrupted() {
+            LEDGER.record(label, "noticed");
+            return false;
+        }
+        std::thread::sleep(POLL);
+    }
+    true
+}
+
+async fn run_blocking_poller(label: String) -> JobResult {
+    let run = jalari::current_job().unwrap();
+    let polled = run.clone();
+    let finished =
+        tokio::task::spawn_blocking(move || poll_until_interrupted(&polled, &label)).await?;
+    if !finished {
+        return Err(run.interrupted().await);
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct BlockingPoller {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control")]
+impl Job for BlockingPoller {
+    const NAME: &'static str = "run_control_blocking_poller";
+
+    async fn run(self) -> JobResult {
+        run_blocking_poller(self.label).await
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
 struct Shape {
     state: String,
@@ -318,6 +361,7 @@ async fn test_run_control() {
     check_shutdown_abort_logs(&database).await;
     check_close_waits_for_the_aborted_body(&database).await;
     check_close_waits_at_most_a_second_for_a_blocked_body(&database).await;
+    check_blocking_code_sees_a_stop(&database).await;
     database.finish().await;
 }
 
@@ -541,5 +585,46 @@ async fn check_close_waits_at_most_a_second_for_a_blocked_body(database: &Databa
     RELEASE_SPINNER.store(true, Ordering::SeqCst);
     eprintln!("spinner: stopped {stopped:?} after the request while its body never yielded");
     assert_eq!(LEDGER.count("spinner", "start"), 1);
+    worker.stop().await;
+}
+
+async fn check_blocking_code_sees_a_stop(database: &Database) {
+    let worker = spawn_worker(PATIENT, PATIENT).await;
+    let label = "blocking_stop";
+    let id = start(
+        &BlockingPoller {
+            label: label.to_owned(),
+        },
+        label,
+    )
+    .await;
+    let asked = Instant::now();
+    assert_eq!(jalari::stop(id).await.unwrap(), StopOutcome::Requested);
+    wait_until(
+        "the blocking loop to see the stop",
+        CONTROL_LATENCY,
+        || async { LEDGER.count(label, "noticed") == 1 },
+    )
+    .await;
+    let noticed = LEDGER
+        .events(label)
+        .into_iter()
+        .find(|(event, _)| *event == "noticed")
+        .map(|(_, at)| at.saturating_duration_since(asked))
+        .unwrap();
+    eprintln!("blocking_stop: the blocking loop saw the stop {noticed:?} after the request");
+    wait_for_state(database, id, "stopped", CONTROL_LATENCY).await;
+    assert_eq!(LEDGER.count(label, "interrupted at start"), 0);
+    assert_eq!(
+        shape(database, id).await,
+        Shape {
+            state: "stopped".to_owned(),
+            attempts: 0,
+        }
+    );
+    assert_eq!(
+        history(database, id).await,
+        [("stopped".to_owned(), Some(STOP.to_owned()))]
+    );
     worker.stop().await;
 }
