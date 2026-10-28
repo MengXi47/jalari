@@ -469,17 +469,24 @@ fn is_target_root(path: &str) -> bool {
 
 fn read_files(dir: &Path) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
-    walk(dir, dir, 0, &mut files);
+    walk(dir, dir, &mut Vec::new(), &mut files);
     files
 }
 
-fn walk(base: &Path, dir: &Path, depth: usize, files: &mut BTreeMap<String, String>) {
-    if depth > MAX_DIRECTORY_DEPTH {
+fn walk(
+    base: &Path,
+    dir: &Path,
+    ancestors: &mut Vec<PathBuf>,
+    files: &mut BTreeMap<String, String>,
+) {
+    let real = canonical(dir);
+    if ancestors.len() > MAX_DIRECTORY_DEPTH || ancestors.contains(&real) {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    ancestors.push(real);
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -493,7 +500,7 @@ fn walk(base: &Path, dir: &Path, depth: usize, files: &mut BTreeMap<String, Stri
         };
         if metadata.is_dir() {
             if name != "target" && !path.join("Cargo.toml").is_file() {
-                walk(base, &path, depth + 1, files);
+                walk(base, &path, ancestors, files);
             }
             continue;
         }
@@ -507,6 +514,7 @@ fn walk(base: &Path, dir: &Path, depth: usize, files: &mut BTreeMap<String, Stri
             files.insert(relative, normalize(&text));
         }
     }
+    ancestors.pop();
 }
 
 fn normalize(text: &str) -> String {

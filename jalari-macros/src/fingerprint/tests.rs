@@ -2633,3 +2633,30 @@ fn test_backslash_paths_are_read_like_forward_slashes() {
     assert_eq!(workspace.crates[1].roots, vec!["lib/root.rs".to_owned()]);
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn test_walk_reads_each_directory_of_a_symlink_loop_once() {
+    let base = env::temp_dir().join(format!("jalari-fingerprint-symlinks-{}", process::id()));
+    write(
+        &base.join("Cargo.toml"),
+        "[package]\nname = \"looped\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(&base.join("src/lib.rs"), "pub mod shared;\n");
+    write(&base.join("common/helper.rs"), "pub fn helper() {}\n");
+    std::os::unix::fs::symlink("../common", base.join("src/shared")).unwrap();
+    let keys = |links: &[&str]| {
+        for link in links {
+            std::os::unix::fs::symlink(".", base.join("src").join(link)).unwrap();
+        }
+        let files: Vec<String> = load::load(&base).crates[0].files.keys().cloned().collect();
+        for link in links {
+            fs::remove_file(base.join("src").join(link)).unwrap();
+        }
+        files
+    };
+    let expected = ["common/helper.rs", "src/lib.rs", "src/shared/helper.rs"];
+    assert_eq!(keys(&["again"]), expected);
+    assert_eq!(keys(&["again", "twice"]), expected);
+    fs::remove_dir_all(&base).unwrap();
+}
