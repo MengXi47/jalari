@@ -107,6 +107,7 @@ pub(crate) struct Unit {
     pub(crate) uses: BTreeSet<String>,
     pub(crate) globs: BTreeMap<String, BTreeSet<String>>,
     pub(crate) jobs: BTreeSet<(String, String)>,
+    pub(crate) declared: BTreeMap<(String, String), Vec<String>>,
     pub(crate) always: Vec<ItemId>,
     pub(crate) open: Vec<ImplId>,
 }
@@ -237,7 +238,8 @@ impl Builder<'_> {
                 return;
             }
         };
-        unfold(&mut parsed.items);
+        let mut declared = Vec::new();
+        unfold(&mut parsed.items, &mut declared);
         if let Some(reexport) = &self.index.reexport {
             reexport.rewrite_file(&mut parsed);
         }
@@ -255,6 +257,11 @@ impl Builder<'_> {
         record
             .jobs
             .extend(scan.jobs.into_iter().map(|job| (path.to_owned(), job)));
+        record.declared.extend(
+            declared
+                .into_iter()
+                .map(|(job, call)| ((path.to_owned(), job), call)),
+        );
         let place = Place {
             unit,
             file: path,
@@ -676,7 +683,7 @@ fn is_job_attribute(attribute: &Attribute) -> bool {
         .is_some_and(|segment| segment.ident == "job")
 }
 
-fn unfold(items: &mut Vec<syn::Item>) {
+fn unfold(items: &mut Vec<syn::Item>, declared: &mut Vec<(String, Vec<String>)>) {
     for item in std::mem::take(items) {
         match item {
             syn::Item::Macro(mut call) if call.ident.is_none() => {
@@ -685,7 +692,17 @@ fn unfold(items: &mut Vec<syn::Item>) {
                     items.push(syn::Item::Macro(call));
                     continue;
                 }
-                items.extend(jobs.into_iter().map(syn::Item::Impl));
+                let path: Vec<String> = call
+                    .mac
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                for job in jobs {
+                    declared.push((canonical(job.self_ty.to_token_stream()), path.clone()));
+                    items.push(syn::Item::Impl(job));
+                }
                 if !call.attrs.is_empty() || !is_blank(&rest) {
                     call.mac.tokens = rest;
                     items.push(syn::Item::Macro(call));
@@ -693,7 +710,7 @@ fn unfold(items: &mut Vec<syn::Item>) {
             }
             syn::Item::Mod(mut module) => {
                 if let Some((_, content)) = &mut module.content {
-                    unfold(content);
+                    unfold(content, declared);
                 }
                 items.push(syn::Item::Mod(module));
             }

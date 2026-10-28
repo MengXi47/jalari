@@ -46,12 +46,47 @@ pub(crate) fn locates(index: &Index, site: &JobSite<'_>) -> bool {
     site_units(index, site).is_some()
 }
 
-fn site_units(index: &Index, site: &JobSite<'_>) -> Option<Vec<usize>> {
-    let file = site.file?;
-    let job = (
-        file.to_owned(),
+pub(crate) fn declaring_crate(index: &Index, site: &JobSite<'_>) -> Option<String> {
+    let job = site_job(site)?;
+    let call = index
+        .units
+        .iter()
+        .filter(|unit| unit.krate == 0)
+        .find_map(|unit| unit.declared.get(&job))?;
+    let first = match call.as_slice() {
+        [name] => index
+            .nominal
+            .get(name)?
+            .iter()
+            .map(|&item| &index.items[item])
+            .find(|item| {
+                item.kind == ItemKind::Use
+                    && item.file == job.0
+                    && index.units[item.unit].krate == 0
+            })?
+            .refs
+            .roots
+            .first()?
+            .clone(),
+        [first, ..] => first.clone(),
+        [] => return None,
+    };
+    Some(match first.as_str() {
+        "self" | "super" => "crate".to_owned(),
+        _ => first,
+    })
+}
+
+fn site_job(site: &JobSite<'_>) -> Option<(String, String)> {
+    Some((
+        site.file?.to_owned(),
         canonical(site.item.self_ty.to_token_stream()),
-    );
+    ))
+}
+
+fn site_units(index: &Index, site: &JobSite<'_>) -> Option<Vec<usize>> {
+    let job = site_job(site)?;
+    let file = job.0.as_str();
     let units: Vec<usize> = index
         .units
         .iter()

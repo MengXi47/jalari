@@ -10,7 +10,7 @@ use super::hash::{Fnv, canonical};
 use super::index::{Index, ItemKind, is_job_impl};
 use super::load;
 use super::lock::Lock;
-use super::reach::{MemberRule, locates, reach};
+use super::reach::{MemberRule, declaring_crate, locates, reach};
 use super::reexport::Reexport;
 use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 
@@ -891,7 +891,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn checkout(root: &Path, self_ty: &str) -> u128 {
     let file = root.join("app/src/lib.rs");
     let item = find_job(&fs::read_to_string(&file).unwrap(), self_ty);
-    load::fingerprint_at(Some(&root.join("app")), Some(&file), &item, None)
+    load::fingerprint_at(Some(&root.join("app")), &[file.as_path()], &item, None)
 }
 
 fn rewrite(path: &Path, from: &str, to: &str) {
@@ -945,7 +945,7 @@ fn test_loader_fingerprint_ignores_checkout_path() {
     let file = first.join("app/src/lib.rs");
     let item = find_job(&fs::read_to_string(&file).unwrap(), "Standalone");
     assert_ne!(
-        load::fingerprint_at(Some(&first.join("app")), None, &item, None),
+        load::fingerprint_at(Some(&first.join("app")), &[], &item, None),
         standalone
     );
     fs::remove_dir_all(&base).unwrap();
@@ -970,9 +970,9 @@ fn test_loader_ignores_target_roots_that_do_not_contain_the_job() {
     .unwrap();
     let file = base.join("tests/alpha.rs");
     let item = find_job(&job, "J");
-    let before = load::fingerprint_at(Some(&base), Some(&file), &item, None);
+    let before = load::fingerprint_at(Some(&base), &[file.as_path()], &item, None);
     fs::write(&other, "mod alpha_helpers {}\n").unwrap();
-    let after = load::fingerprint_at(Some(&base), Some(&file), &item, None);
+    let after = load::fingerprint_at(Some(&base), &[file.as_path()], &item, None);
     fs::remove_dir_all(&base).unwrap();
     assert_eq!(before, after);
 }
@@ -1269,8 +1269,8 @@ fn test_loader_resolves_a_relative_local_file() {
     );
     let item = find_job(&fs::read_to_string(&absolute).unwrap(), "UsesHelper");
     assert_eq!(
-        load::fingerprint_at(Some(&manifest), Some(relative), &item, None),
-        load::fingerprint_at(Some(&manifest), Some(&absolute), &item, None)
+        load::fingerprint_at(Some(&manifest), &[relative], &item, None),
+        load::fingerprint_at(Some(&manifest), &[absolute.as_path()], &item, None)
     );
 }
 
@@ -1285,7 +1285,7 @@ fn test_loader_fingerprint_uses_the_jalari_version() {
         item: &item,
         file: Some("src/lib.rs"),
     };
-    let loaded = load::fingerprint_at(Some(&manifest), Some(&file), &item, None);
+    let loaded = load::fingerprint_at(Some(&manifest), &[file.as_path()], &item, None);
     assert_eq!(
         loaded,
         fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
@@ -2008,4 +2008,86 @@ fn test_job_inside_a_macro_call_hashes_like_a_plain_job() {
         wrapped_lib(&format!("{attributed}\n{rest}"), body),
         plain("(queue = \"q\")")
     );
+}
+
+#[test]
+fn test_macro_crate_is_read_from_the_declaring_call() {
+    let cases = [
+        ("", "facade::job!", Some("facade")),
+        ("", "::facade::job!", Some("facade")),
+        ("use facade::job;", "job!", Some("facade")),
+        ("use facade::job as declare;", "declare!", Some("facade")),
+        ("", "crate::job!", Some("crate")),
+        ("", "self::job!", Some("crate")),
+        ("", "job!", None),
+    ];
+    let item = find_job(&source("", ""), "J");
+    for (imports, call, expected) in cases {
+        let text = format!("{imports}\n{}", wrapped(call, "", ""));
+        let index = Index::build(&single(&[("src/lib.rs", &text)]), None);
+        let site = JobSite {
+            item: &item,
+            file: Some("src/lib.rs"),
+        };
+        assert_eq!(
+            declaring_crate(&index, &site).as_deref(),
+            expected,
+            "{imports} {call}"
+        );
+    }
+}
+
+#[test]
+fn test_wrapper_job_through_a_facade_hashes_like_a_direct_job() {
+    let base = env::temp_dir().join(format!("jalari-fingerprint-wrapper-{}", process::id()));
+    let manifest = |name: &str, dependency: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{dependency}\n"
+        )
+    };
+    let rest = "fn helper() -> u32 { 1 }\nconst UNRELATED: u32 = 1;";
+    write(
+        &base.join("facade/Cargo.toml"),
+        &manifest("facade", "jalari = \"0.8\""),
+    );
+    write(
+        &base.join("facade/src/lib.rs"),
+        "pub use jalari as __jalari;\n\n#[macro_export]\nmacro_rules! job {\n    (($($arguments:tt)*) $($item:tt)*) => {\n        #[$crate::__jalari::job(crate = $crate::__jalari, $($arguments)*)]\n        $($item)*\n    };\n}\n",
+    );
+    write(
+        &base.join("direct/Cargo.toml"),
+        &manifest("direct", "jalari = \"0.8\""),
+    );
+    write(
+        &base.join("direct/src/lib.rs"),
+        &format!("{}\n{rest}", source("helper();", "")),
+    );
+    let through = wrapped("facade::job!", "name = \"j\"", "helper();")
+        .replace("use jalari::", "use facade::__jalari::");
+    write(
+        &base.join("app/Cargo.toml"),
+        &manifest("app", "facade = { path = \"../facade\" }"),
+    );
+    write(&base.join("app/src/lib.rs"), &format!("{through}\n{rest}"));
+    let item = find_job(&source("helper();", ""), "J");
+    let macro_crate = Reexport::new(vec!["$crate".to_owned(), "__jalari".to_owned()]);
+    let facade_file = base.join("facade/src/lib.rs");
+    let app_file = base.join("app/src/lib.rs");
+    let app = |files: &[&Path]| {
+        load::fingerprint_at(Some(&base.join("app")), files, &item, macro_crate.as_ref())
+    };
+    let direct = load::fingerprint_at(
+        Some(&base.join("direct")),
+        &[base.join("direct/src/lib.rs").as_path()],
+        &item,
+        None,
+    );
+    let located = app(&[facade_file.as_path(), app_file.as_path()]);
+    let whole = app(&[facade_file.as_path()]);
+    rewrite(&app_file, "UNRELATED: u32 = 1", "UNRELATED: u32 = 2");
+    let unrelated = app(&[facade_file.as_path(), app_file.as_path()]);
+    fs::remove_dir_all(&base).unwrap();
+    assert_eq!(located, direct);
+    assert_ne!(whole, direct);
+    assert_eq!(unrelated, located);
 }

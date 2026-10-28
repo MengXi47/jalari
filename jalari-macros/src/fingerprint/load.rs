@@ -9,7 +9,7 @@ use toml::de::{DeTable, DeValue};
 use super::analyse::fingerprint;
 use super::index::Index;
 use super::lock::Lock;
-use super::reach::locates;
+use super::reach::{declaring_crate, locates};
 use super::reexport::Reexport;
 use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 
@@ -20,13 +20,14 @@ static INDEXES: Mutex<BTreeMap<u64, Arc<Index>>> = Mutex::new(BTreeMap::new());
 
 pub(crate) fn of_call_site(
     item: &syn::ItemImpl,
-    local_file: Option<PathBuf>,
+    local_files: &[PathBuf],
     jalari: &syn::Path,
 ) -> u128 {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let local_files: Vec<&Path> = local_files.iter().map(PathBuf::as_path).collect();
     fingerprint_at(
         manifest_dir.as_deref(),
-        local_file.as_deref(),
+        &local_files,
         item,
         Reexport::from_path(jalari).as_ref(),
     )
@@ -34,38 +35,68 @@ pub(crate) fn of_call_site(
 
 pub(crate) fn fingerprint_at(
     manifest_dir: Option<&Path>,
-    local_file: Option<&Path>,
+    local_files: &[&Path],
     item: &syn::ItemImpl,
     reexport: Option<&Reexport>,
 ) -> u128 {
     let mut workspace = manifest_dir.map(load).unwrap_or_default();
-    let file = manifest_dir
-        .zip(local_file)
-        .and_then(|(dir, file)| relative(dir, file));
+    let all = workspace
+        .crates
+        .first()
+        .map(|primary| primary.roots.clone())
+        .unwrap_or_default();
+    let files = manifest_dir.into_iter().flat_map(|dir| {
+        local_files
+            .iter()
+            .filter_map(move |file| relative(dir, file))
+    });
+    for file in files {
+        if let Some(found) = located(&mut workspace, &all, &file, item, reexport) {
+            return found;
+        }
+    }
+    set_roots(&mut workspace, all);
+    let index = cached(&workspace, reexport);
+    let site = JobSite { item, file: None };
+    fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
+}
+
+fn located(
+    workspace: &mut Workspace,
+    all: &[String],
+    file: &str,
+    item: &syn::ItemImpl,
+    reexport: Option<&Reexport>,
+) -> Option<u128> {
+    let primary = workspace.crates.first()?;
+    let likely: Vec<String> = all
+        .iter()
+        .filter(|root| could_contain(&primary.files, root, file))
+        .cloned()
+        .collect();
     let site = JobSite {
         item,
-        file: file.as_deref(),
+        file: Some(file),
     };
-    if let (Some(file), Some(primary)) = (&file, workspace.crates.first()) {
-        let all = primary.roots.clone();
-        let likely: Vec<String> = all
-            .iter()
-            .filter(|root| could_contain(&primary.files, root, file))
-            .cloned()
-            .collect();
-        for candidates in [likely, all.clone()] {
-            set_roots(&mut workspace, candidates);
-            let index = cached(&workspace, reexport);
-            if locates(&index, &site) {
-                set_roots(&mut workspace, roots_containing(&index, file));
-                let index = cached(&workspace, reexport);
-                return fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"));
-            }
+    for candidates in [likely, all.to_vec()] {
+        set_roots(workspace, candidates);
+        let index = cached(workspace, reexport);
+        if locates(&index, &site) {
+            let reexport = match (reexport, declaring_crate(&index, &site)) {
+                (Some(reexport), Some(krate)) => reexport.with_macro_crate(&krate),
+                (reexport, _) => reexport.cloned(),
+            };
+            set_roots(workspace, roots_containing(&index, file));
+            let index = cached(workspace, reexport.as_ref());
+            return Some(fingerprint(
+                &index,
+                workspace,
+                &site,
+                env!("CARGO_PKG_VERSION"),
+            ));
         }
-        set_roots(&mut workspace, all);
     }
-    let index = cached(&workspace, reexport);
-    fingerprint(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
+    None
 }
 
 fn set_roots(workspace: &mut Workspace, roots: Vec<String>) {

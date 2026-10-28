@@ -148,7 +148,15 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     let arguments =
         parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
     let item_impl = parse_macro_input!(item as ItemImpl);
-    match expand(arguments, item_impl, Span::call_site().local_file()) {
+    let mut local_files: Vec<PathBuf> = [
+        Span::call_site().local_file(),
+        item_impl.impl_token.span.unwrap().local_file(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    local_files.dedup();
+    match expand(arguments, item_impl, &local_files) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -194,7 +202,7 @@ const PRIORITIES: [(&str, &str); 4] = [
 fn expand(
     arguments: Punctuated<MetaNameValue, Token![,]>,
     mut item_impl: ItemImpl,
-    local_file: Option<PathBuf>,
+    local_files: &[PathBuf],
 ) -> syn::Result<TokenStream2> {
     let arguments = parse_arguments(arguments)?;
     let jalari = &arguments.jalari;
@@ -220,7 +228,7 @@ fn expand(
     inject_constants(&mut item_impl, arguments.constants)?;
 
     let fingerprint = if arguments.fingerprint.as_ref().is_some_and(LitBool::value) {
-        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_file, jalari));
+        let hex = fingerprint::hex(fingerprint::of_call_site(&item_impl, local_files, jalari));
         quote!(::core::option::Option::Some(#hex))
     } else {
         quote!(::core::option::Option::None)

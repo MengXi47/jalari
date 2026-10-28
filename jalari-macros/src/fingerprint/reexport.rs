@@ -9,19 +9,36 @@ use syn::{
 
 pub(crate) const JALARI: &str = "jalari";
 
+const MACRO_CRATE: &str = "$crate";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Reexport {
     segments: Vec<String>,
 }
 
 impl Reexport {
-    pub(crate) fn from_path(path: &Path) -> Option<Self> {
-        let segments: Vec<String> = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect();
+    pub(crate) fn new(segments: Vec<String>) -> Option<Self> {
         (!segments.is_empty() && segments != [JALARI]).then_some(Self { segments })
+    }
+
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        Self::new(
+            path.segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect(),
+        )
+    }
+
+    pub(crate) fn with_macro_crate(&self, krate: &str) -> Option<Self> {
+        if self.root() != MACRO_CRATE {
+            return Some(self.clone());
+        }
+        Self::new(
+            std::iter::once(krate.to_owned())
+                .chain(self.segments[1..].iter().cloned())
+                .collect(),
+        )
     }
 
     pub(crate) fn root(&self) -> &str {
