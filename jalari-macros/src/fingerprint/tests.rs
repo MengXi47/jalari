@@ -2209,6 +2209,76 @@ impl Job for P {
 }
 
 #[test]
+fn test_job_inside_a_macro_call_reaches_its_wrapper() {
+    let plain = "#[derive(Serialize, Deserialize)]
+struct P;
+
+#[jalari::job]
+impl Job for P {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}";
+    let text = |name: &str, limit: u32| {
+        format!(
+            "use jalari::{{Job, JobResult}};
+
+macro_rules! {name} {{
+    (($($arguments:tt)*) $($item:tt)*) => {{
+        fn limit() -> u32 {{ {limit} }}
+        #[jalari::job($($arguments)*)]
+        $($item)*
+    }};
+}}
+
+#[derive(Serialize, Deserialize)]
+struct J;
+
+{name}! {{
+    ()
+    impl Job for J {{
+        async fn run(self) -> JobResult {{
+            let _ = limit();
+            Ok(())
+        }}
+    }}
+}}
+
+{plain}
+"
+        )
+    };
+    let item = find_job(
+        &source("let _ = limit();", "").replace("const NAME: &'static str = \"j\";\n\n", ""),
+        "J",
+    );
+    let wrapped = |name: &str, limit: u32| {
+        let workspace = single(&[("src/lib.rs", &text(name, limit))]);
+        fingerprint(
+            &Index::build(&workspace, None),
+            &workspace,
+            &JobSite {
+                item: &item,
+                file: Some("src/lib.rs"),
+            },
+            VERSION,
+        )
+    };
+    let neighbour = |name: &str, limit: u32| {
+        job_at(
+            &single(&[("src/lib.rs", &text(name, limit))]),
+            "src/lib.rs",
+            "P",
+            VERSION,
+        )
+    };
+    for name in ["jobs", "job"] {
+        assert_ne!(wrapped(name, 5), wrapped(name, 6), "{name}!");
+    }
+    assert_eq!(neighbour("jobs", 5), neighbour("jobs", 6));
+}
+
+#[test]
 fn test_macro_call_without_a_job_stays_one_opaque_item() {
     let calls = [
         "lazy! {\n    static COUNTER: u32 = 1;\n}",

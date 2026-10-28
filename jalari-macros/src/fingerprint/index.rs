@@ -524,6 +524,17 @@ impl Builder<'_> {
         let header_text = canonical(header.to_token_stream());
         let mut refs = Refs::default();
         header_refs(item_impl, &mut refs, true);
+        let job = (
+            place.file.to_owned(),
+            canonical(item_impl.self_ty.to_token_stream()),
+        );
+        if let Some(wrapper) = self.index.units[place.unit]
+            .declared
+            .get(&job)
+            .and_then(|call| call.last())
+        {
+            refs.names.insert(wrapper.clone());
+        }
         let mut gate_refs = Refs::default();
         header_refs(item_impl, &mut gate_refs, false);
         let trait_gates = if is_job_impl(item_impl) {
