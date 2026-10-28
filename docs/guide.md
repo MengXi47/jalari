@@ -1100,6 +1100,10 @@ effects an idempotency key.
   the call is the exception: it keeps the transaction alive without the progress, so do not
   wrap `save_in` in a savepoint.
 
+The [`durable_progress`](../jalari/examples/durable_progress.rs) example runs one job per call,
+kills its worker process mid-run and counts the pages each job delivered twice after the
+takeover.
+
 ### Steps
 
 A cursor suits a loop over many items. A job that does a few named things with effects outside
@@ -1928,6 +1932,7 @@ cargo run -p jalari --example outcomes
 cargo run -p jalari --example queues
 cargo run -p jalari --example missed_runs
 cargo run -p jalari --example stop_restart
+cargo run -p jalari --example durable_progress
 cargo run -p jalari --example steps
 cargo run -p jalari --example blocking_work
 cargo run -p jalari --example middleware
@@ -1945,6 +1950,7 @@ cargo run -p jalari --example split_control -- stranded
 | [`queues`](../jalari/examples/queues.rs) | `pause_queue`, `paused_queues` and `resume_queue`; `enqueue_many` with a key repeated in the batch, and `enqueue_many_in` inside a transaction; priorities from the `priority` attribute and from `EnqueueOptions::priority`, moved with `set_priority` while the queue is paused, then run in priority order; `queue_key_limit` letting two jobs of one key run at once; and a job that enqueues children and a grandchild, listed with `JobFilter::parent` and `JobFilter::root`. It exits when done |
 | [`missed_runs`](../jalari/examples/missed_runs.rs) | Two hourly runtime schedules built with `Schedule::missed`, one `Missed::Once` and one `Missed::Skip`, pushed 3 hours overdue in SQL: `Once` enqueues one catch-up run and `Skip` none, then a run 10 seconds late fires under `Skip`. Each step prints the schedules' `run_count`, `last_run_at`, `next_run_at` and the jobs they enqueued. It exits when done |
 | [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress and `checkpoints = true`, a job blocked in one long sleep that `interrupted()` stops within a second, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
+| [`durable_progress`](../jalari/examples/durable_progress.rs) | Three jobs deliver pages in a cursor loop, one storing the cursor with `save`, one with `save_now` and one with `save_in` in the same transaction as its page row. The program kills its first worker process with SIGKILL mid-run, prints each job's stored cursor, lets a second worker take the jobs over, and counts the pages each job delivered twice: only the `save` job repeats the pages after its last written copy. It exits when done |
 | [`steps`](../jalari/examples/steps.rs) | An order job with a `charge` step that passes `idempotency_key()` to a fake payment gateway and a `receipt` step written with the `starts() > 1` at-most-once recipe. A simulated crash after each effect, before its step is recorded, makes the next attempt charge again under the same key, which the gateway deduplicates, and give up on the receipt; the last attempt reads the charge from its record without calling the gateway. The run ends with `JobDetail::steps` and `admin::clear_steps`. It exits when done |
 | [`blocking_work`](../jalari/examples/blocking_work.rs) | A loop in `spawn_blocking` that polls `JobRun::is_interrupted` between chunks: run to the end, stopped with `jalari::stop` and noticing it within a second, and ended by a 2 second `timeout`. It exits when done |
 | [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, a job that passes its context to the jobs it enqueues, the `finished` hook with `is_last_attempt`, and a job stored under an old name that runs through `aliases`. It exits when done |
