@@ -2361,3 +2361,38 @@ mod tests {
     );
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn test_backslash_paths_are_read_like_forward_slashes() {
+    let build = |path: &str, body: &str| {
+        let text = source("helper();", &format!("#[path = {path:?}]\nmod helpers;"));
+        of(&single(&[
+            ("src/lib.rs", &text),
+            ("src/custom/place.rs", body),
+        ]))
+    };
+    let forward = build("custom/place.rs", "pub fn helper() -> u32 { 1 }");
+    assert_eq!(
+        build("custom\\place.rs", "pub fn helper() -> u32 { 1 }"),
+        forward
+    );
+    assert_ne!(
+        build("custom\\place.rs", "pub fn helper() -> u32 { 2 }"),
+        forward
+    );
+
+    let base = env::temp_dir().join(format!("jalari-fingerprint-backslash-{}", process::id()));
+    write(
+        &base.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"lib\\\\root.rs\"\n\n[[bin]]\nname = \"run\"\npath = \"tools\\\\run.rs\"\n",
+    );
+    write(&base.join("lib/root.rs"), "pub fn root() {}\n");
+    write(&base.join("tools/run.rs"), "fn main() {}\n");
+    let workspace = load::load(&base);
+    assert_eq!(
+        workspace.crates[0].roots,
+        vec!["lib/root.rs".to_owned(), "tools/run.rs".to_owned()]
+    );
+    assert_eq!(workspace.crates[1].roots, vec!["lib/root.rs".to_owned()]);
+    fs::remove_dir_all(&base).unwrap();
+}
