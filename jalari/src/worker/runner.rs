@@ -10,7 +10,7 @@ use tracing::warn;
 
 use super::builder::WorkerBuilder;
 use super::flusher;
-use super::lifeline::{Current, LifelineThread, WorkerRegistration};
+use super::lifeline::{Current, LifelineThread, RuntimeWatch, WorkerRegistration};
 use super::middleware::ErasedMiddleware;
 use super::ownership::{Target, interrupt};
 use super::pauses::{Pauses, watch_pauses};
@@ -169,7 +169,10 @@ impl Worker {
         let registration = WorkerRegistration::new(&self.queues, self.scheduler);
         let queue_names = registration.queue_names.clone();
         let (current, registered) = watch::channel(None);
-        let lifeline = LifelineThread::start(Arc::clone(&self.shared), registration, current);
+        let job_runtime = Arc::new(RuntimeWatch::new());
+        let _ticker = AbortOnDrop(tokio::spawn(Arc::clone(&job_runtime).tick()));
+        let lifeline =
+            LifelineThread::start(Arc::clone(&self.shared), registration, current, job_runtime);
         let flusher_shutdown = CancellationToken::new();
         let mut flusher = AbortOnDrop(tokio::spawn(flusher::flush_progress(
             Arc::clone(&self.shared),

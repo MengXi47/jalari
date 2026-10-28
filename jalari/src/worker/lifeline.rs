@@ -1,5 +1,6 @@
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -10,7 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use super::ownership::{Target, interrupt, lock_prefix};
 use super::runner::{QueueConfig, Shared};
@@ -30,6 +31,8 @@ const REGISTER_BACKOFF: Duration = Duration::from_secs(1);
 const REFUSAL_LIMIT: Duration = Duration::from_secs(30);
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(6);
 const APPLICATION_NAME: &str = "jalari lifeline";
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
+const RUNTIME_STALL: Duration = Duration::from_secs(10);
 
 const _: () =
     assert!(SELF_FENCE.as_millis() >= PING_INTERVAL.as_millis() + PING_TIMEOUT.as_millis());
@@ -43,6 +46,8 @@ const _: () = assert!(
 );
 const _: () = assert!(LIFELINE_IDLE_TIMEOUT.as_millis() > TAKEOVER_GRACE.as_millis());
 const _: () = assert!(REFUSAL_LIMIT.as_millis() > LIFELINE_IDLE_TIMEOUT.as_millis());
+const _: () =
+    assert!(RUNTIME_STALL.as_millis() > TICK_INTERVAL.as_millis() + PING_INTERVAL.as_millis());
 
 pub(super) struct WorkerRegistration {
     hostname: String,
@@ -89,6 +94,63 @@ impl Incarnation {
 
 pub(super) type Current = watch::Receiver<Option<Arc<Incarnation>>>;
 
+pub(super) struct RuntimeWatch {
+    anchor: std::time::Instant,
+    ticked_millis: AtomicU64,
+    stalled_at: Mutex<Option<Duration>>,
+}
+
+impl RuntimeWatch {
+    pub(super) fn new() -> Self {
+        Self {
+            anchor: std::time::Instant::now(),
+            ticked_millis: AtomicU64::new(0),
+            stalled_at: Mutex::new(None),
+        }
+    }
+
+    pub(super) async fn tick(self: Arc<Self>) {
+        loop {
+            let millis = u64::try_from(self.anchor.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.ticked_millis.store(millis, Ordering::Relaxed);
+            tokio::time::sleep(TICK_INTERVAL).await;
+        }
+    }
+
+    fn ticked(&self) -> Duration {
+        Duration::from_millis(self.ticked_millis.load(Ordering::Relaxed))
+    }
+
+    fn check(&self, worker_id: &str) {
+        let ticked = self.ticked();
+        let silence = self.anchor.elapsed().saturating_sub(ticked);
+        let mut stalled_at = self.stalled_at.lock().unwrap();
+        match *stalled_at {
+            None if silence >= RUNTIME_STALL => {
+                *stalled_at = Some(ticked);
+                error!(
+                    worker_id,
+                    "the job runtime has not run for {} s; its jobs cannot be stopped or timed out \
+                     until it does",
+                    silence.as_secs()
+                );
+            }
+            Some(last) if ticked > last => {
+                *stalled_at = None;
+                info!(
+                    worker_id,
+                    "the job runtime runs again after {} s without running",
+                    ticked
+                        .saturating_sub(last)
+                        .saturating_sub(TICK_INTERVAL)
+                        .as_secs()
+                );
+            }
+            None | Some(_) => {}
+        }
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct Registered {
     id: String,
@@ -121,6 +183,7 @@ impl LifelineThread {
         shared: Arc<Shared>,
         registration: WorkerRegistration,
         current: watch::Sender<Option<Arc<Incarnation>>>,
+        job_runtime: Arc<RuntimeWatch>,
     ) -> Self {
         let thread = Self {
             retire: CancellationToken::new(),
@@ -135,7 +198,15 @@ impl LifelineThread {
             .name("jalari-lifeline".to_owned())
             .spawn(move || {
                 let _ended = ended;
-                run_thread(&shared, &registration, &current, &retire, &abort, &jobs);
+                run_thread(
+                    &shared,
+                    &registration,
+                    &current,
+                    &job_runtime,
+                    &retire,
+                    &abort,
+                    &jobs,
+                );
             });
         if let Err(e) = spawned {
             error!(error = %e, "failed to start the worker lifeline thread");
@@ -164,6 +235,7 @@ fn run_thread(
     shared: &Arc<Shared>,
     registration: &WorkerRegistration,
     current: &watch::Sender<Option<Arc<Incarnation>>>,
+    job_runtime: &RuntimeWatch,
     retire: &CancellationToken,
     abort: &CancellationToken,
     jobs: &Handle,
@@ -183,7 +255,7 @@ fn run_thread(
             runtime.block_on(async {
                 tokio::select! {
                     () = abort.cancelled() => {}
-                    () = lifeline(shared, registration, current, retire, jobs) => {}
+                    () = lifeline(shared, registration, current, job_runtime, retire, jobs) => {}
                 }
             });
         }));
@@ -203,6 +275,7 @@ async fn lifeline(
     shared: &Arc<Shared>,
     registration: &WorkerRegistration,
     current: &watch::Sender<Option<Arc<Incarnation>>>,
+    job_runtime: &RuntimeWatch,
     retire: &CancellationToken,
     jobs: &Handle,
 ) {
@@ -227,7 +300,7 @@ async fn lifeline(
         }
         let incarnation = Arc::clone(&lifeline.incarnation);
         current.send_replace(Some(Arc::clone(&incarnation)));
-        let kept = lifeline.keep(shared, retire, jobs).await;
+        let kept = lifeline.keep(shared, job_runtime, retire, jobs).await;
         current.send_replace(None);
         match kept {
             Some(lifeline) => {
@@ -322,6 +395,7 @@ impl Lifeline {
     async fn keep(
         mut self,
         shared: &Arc<Shared>,
+        job_runtime: &RuntimeWatch,
         retire: &CancellationToken,
         jobs: &Handle,
     ) -> Option<Self> {
@@ -332,6 +406,7 @@ impl Lifeline {
                 () = retire.cancelled() => return Some(self),
                 () = tokio::time::sleep_until(due) => {}
             }
+            job_runtime.check(&worker_id);
             let sent_at = Instant::now();
             due = sent_at + PING_INTERVAL;
             let deadline = (self.answered + LIFELINE_IDLE_TIMEOUT).min(sent_at + PING_TIMEOUT);

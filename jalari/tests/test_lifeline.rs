@@ -1,13 +1,77 @@
 mod common;
 
+use std::fmt;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Database, LEDGER, RunningWorker, fast_retry, worker_config};
 use jalari::sqlx::{self, AssertSqlSafe};
 use jalari::{Finished, Job, JobError, JobMeta, JobMiddleware, JobResult, Next, Worker};
 use serde::{Deserialize, Serialize};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
+const STALLED: &str = "the job runtime has not run for ";
+const RECOVERED: &str = "the job runtime runs again after ";
+
+static WATCHDOG: LazyLock<Mutex<Vec<(Level, String)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+struct Message(Option<String>);
+
+impl Visit for Message {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+struct CaptureWatchdog;
+
+impl Subscriber for CaptureWatchdog {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() <= Level::INFO && metadata.target().starts_with("jalari")
+    }
+
+    fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut message = Message(None);
+        event.record(&mut message);
+        if let Some(message) = message.0
+            && message.starts_with("the job runtime")
+        {
+            WATCHDOG
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message));
+        }
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+fn watchdog_lines() -> Vec<(Level, String)> {
+    WATCHDOG.lock().unwrap().clone()
+}
+
+fn seconds_after(message: &str, prefix: &str) -> u64 {
+    message
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|seconds| seconds.parse().ok())
+        .unwrap_or_else(|| panic!("no seconds in {message:?}"))
+}
 
 #[derive(Serialize, Deserialize)]
 struct Idle;
@@ -198,6 +262,7 @@ async fn holds_advisory_lock(database: &Database, pid: i32) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lifeline() {
+    tracing::subscriber::set_global_default(CaptureWatchdog).unwrap();
     let Some(database) = Database::start("lifeline", 4).await else {
         return;
     };
@@ -437,6 +502,7 @@ async fn check_blocked_runtime_keeps_the_lifeline(database: &Database) {
     )
     .await;
     let registered = database.lifelines().await;
+    assert_eq!(watchdog_lines(), []);
     let labels = ["blocked_0", "blocked_1"];
     let mut ids = Vec::new();
     for label in labels {
@@ -471,6 +537,20 @@ async fn check_blocked_runtime_keeps_the_lifeline(database: &Database) {
         finished_after < BLOCK + Duration::from_secs(3),
         "{finished_after:?}"
     );
+    common::wait_until(
+        "the watchdog to see the runtime again",
+        Duration::from_secs(3),
+        || async { watchdog_lines().len() == 2 },
+    )
+    .await;
+    let lines = watchdog_lines();
+    eprintln!("blocked: the watchdog logged {lines:?}");
+    let [(Level::ERROR, stalled), (Level::INFO, recovered)] = lines.as_slice() else {
+        panic!("expected one error and one info line from the watchdog, got {lines:?}");
+    };
+    assert!(seconds_after(stalled, STALLED) >= 10, "{stalled}");
+    assert!(seconds_after(recovered, RECOVERED) >= 10, "{recovered}");
+    assert_eq!(database.lifelines().await, registered);
     worker.stop().await;
 }
 

@@ -911,7 +911,10 @@ Aborting a job drops its task at its next `.await`. Code that does not yield kee
 blocking loop, `spawn_blocking`, threads, child processes and tasks the job spawned itself. In
 every case above such code can still run while the job runs again elsewhere, for as long as it
 takes. Blocked runtime threads do not cost the worker its lifeline: in jalari's tests two jobs
-that blocked both runtime threads for 12 seconds each ran once and the worker kept its id.
+that blocked both runtime threads for 12 seconds each ran once and the worker kept its id. A
+runtime that has not run for 10 seconds cannot stop or time out its jobs, so the lifeline logs
+an error, `the job runtime has not run for 10 s`, and an info line when the runtime runs
+again; it only logs, and the worker keeps its lifeline and its jobs.
 
 A worker also hands back jobs it owns but no longer runs, within a second, and they run again 7
 seconds later. When the database committed a claim but the reply never reached the worker, the
