@@ -7,10 +7,10 @@ use syn::visit::Visit;
 
 use super::analyse::{fingerprint, hex};
 use super::hash::{Fnv, canonical};
-use super::index::{Index, is_job_impl};
+use super::index::{Index, ItemKind, is_job_impl};
 use super::load;
 use super::lock::Lock;
-use super::reach::{MemberRule, reach};
+use super::reach::{MemberRule, locates, reach};
 use super::reexport::Reexport;
 use super::workspace::{CrateSource, Dependency, JobSite, Workspace};
 
@@ -1830,4 +1830,182 @@ fn test_registry_jalari_is_pinned_through_the_reexport() {
     assert_ne!(bumped_direct, direct);
     assert_eq!(bumped_registry, bumped_direct);
     assert_eq!(bumped_path, bumped_direct);
+}
+
+fn wrapped(call: &str, arguments: &str, body: &str) -> String {
+    let plain = source(body, "");
+    let (head, job) = plain.split_once("#[jalari::job]\n").unwrap();
+    format!("{head}{call} {{\n({arguments})\n{job}}}\n")
+}
+
+fn wrapped_job(workspace: &Workspace, body: &str) -> u128 {
+    let item = find_job(&source(body, ""), "J");
+    fingerprint(
+        &Index::build(workspace, None),
+        workspace,
+        &JobSite {
+            item: &item,
+            file: Some("src/lib.rs"),
+        },
+        VERSION,
+    )
+}
+
+fn wrapped_lib(text: &str, body: &str) -> u128 {
+    wrapped_job(&single(&[("src/lib.rs", text)]), body)
+}
+
+#[test]
+fn test_job_inside_a_macro_call_is_located_and_reaches_only_its_items() {
+    let rest = "fn helper() -> u32 { 1 }\nconst UNRELATED: u32 = 1;";
+    let plain = wrapped("job!", "name = \"j\"", "helper();");
+    let nested = format!("mod jobs {{\n{plain}\n}}\nuse jobs::*;");
+    for text in [plain, nested] {
+        let workspace = single(&[("src/lib.rs", &format!("{text}\n{rest}"))]);
+        let index = Index::build(&workspace, None);
+        let item = find_job(&source("helper();", ""), "J");
+        let site = JobSite {
+            item: &item,
+            file: Some("src/lib.rs"),
+        };
+        let reached = reach(&index, &site, MemberRule::Gated).expect("the job is located");
+        let texts: Vec<&str> = reached
+            .items
+            .iter()
+            .map(|&id| index.items[id].text.as_str())
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("fn helper")),
+            "{text}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("UNRELATED")),
+            "{text}"
+        );
+        assert!(!texts.iter().any(|text| text.contains("job !")), "{text}");
+    }
+}
+
+#[test]
+fn test_job_inside_a_macro_call_changes_only_with_its_own_code() {
+    let rest = "fn helper() -> u32 { 1 }\nconst UNRELATED: u32 = 1;";
+    let build = |body: &str, rest: &str| {
+        wrapped_lib(
+            &format!("{}\n{rest}", wrapped("job!", "name = \"j\"", body)),
+            body,
+        )
+    };
+    let base = build("helper();", rest);
+    assert_eq!(
+        build(
+            "helper();",
+            &rest.replace("UNRELATED: u32 = 1", "UNRELATED: u32 = 2")
+        ),
+        base
+    );
+    assert_ne!(
+        build("helper();", &rest.replace("-> u32 { 1 }", "-> u32 { 2 }")),
+        base
+    );
+    assert_ne!(build("helper(); helper();", rest), base);
+}
+
+#[test]
+fn test_plain_job_ignores_a_job_inside_a_macro_call() {
+    let plain = "#[derive(Serialize, Deserialize)]
+struct P;
+
+#[jalari::job]
+impl Job for P {
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}";
+    let build = |body: &str| {
+        let text = format!("{}\n{plain}", wrapped("job!", "name = \"j\"", body));
+        job_at(
+            &single(&[("src/lib.rs", &text)]),
+            "src/lib.rs",
+            "P",
+            VERSION,
+        )
+    };
+    assert_eq!(build("let _ = 1;"), build("let _ = 2;"));
+}
+
+#[test]
+fn test_macro_call_without_a_job_stays_one_opaque_item() {
+    let calls = [
+        "lazy! {\n    static COUNTER: u32 = 1;\n}",
+        "wrap! {\n    impl Display for J {\n        fn fmt(&self) {}\n    }\n}",
+        "job! {\n    (name = \"k\")\n    impl Job for K {\n        async fn run(self) -> {}\n    }\n}",
+    ];
+    for call in calls {
+        let text = source("", call);
+        let index = Index::build(&single(&[("src/lib.rs", &text)]), None);
+        let opaque: Vec<&str> = index
+            .items
+            .iter()
+            .filter(|item| item.kind == ItemKind::Opaque)
+            .map(|item| item.text.as_str())
+            .collect();
+        let parsed: syn::Item = syn::parse_str(call).unwrap();
+        assert_eq!(opaque, [canonical(parsed.to_token_stream())], "{call}");
+    }
+}
+
+#[test]
+fn test_macro_call_keeps_the_tokens_around_the_job_as_an_opaque_item() {
+    let text = wrapped("job!", "name = \"j\"", "")
+        .replace("job! {\n(", "job! {\nstatic COUNTER: u32 = 1;\n(");
+    let index = Index::build(&single(&[("src/lib.rs", &text)]), None);
+    let opaque: Vec<&str> = index
+        .items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Opaque)
+        .map(|item| item.text.as_str())
+        .collect();
+    assert_eq!(opaque, ["job ! { static COUNTER : u32 = 1 ; } "]);
+    let item = find_job(&source("", ""), "J");
+    assert!(locates(
+        &index,
+        &JobSite {
+            item: &item,
+            file: Some("src/lib.rs"),
+        }
+    ));
+}
+
+#[test]
+fn test_job_inside_a_macro_call_hashes_like_a_plain_job() {
+    let body = "helper();";
+    let rest = "fn helper() -> u32 { 1 }";
+    let plain = |attribute: &str| {
+        lib(&source(body, rest).replace("#[jalari::job]", &format!("#[jalari::job{attribute}]")))
+    };
+    let call = |arguments: &str| {
+        wrapped_lib(
+            &format!("{}\n{rest}", wrapped("job!", arguments, body)),
+            body,
+        )
+    };
+    assert_eq!(call(""), plain(""));
+    assert_eq!(call("name = \"j\""), plain(""));
+    assert_eq!(
+        call("queue = \"q\", timeout = 5"),
+        plain("(queue = \"q\", timeout = 5)")
+    );
+    assert_ne!(call("queue = \"q\""), call("queue = \"r\""));
+    assert_eq!(
+        call("queue = \"q\", priority = \"high\""),
+        call("queue = \"q\"")
+    );
+    let attributed = wrapped("job!", "", body).replace(
+        "job! {\n()\nimpl",
+        "job! {\n#[jalari::job(queue = \"q\")]\nimpl",
+    );
+    assert_eq!(
+        wrapped_lib(&format!("{attributed}\n{rest}"), body),
+        plain("(queue = \"q\")")
+    );
 }

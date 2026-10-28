@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use proc_macro2::{Literal, Spacing, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, Literal, Spacing, TokenStream, TokenTree};
 use quote::ToTokens;
+use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
@@ -236,6 +237,7 @@ impl Builder<'_> {
                 return;
             }
         };
+        unfold(&mut parsed.items);
         if let Some(reexport) = &self.index.reexport {
             reexport.rewrite_file(&mut parsed);
         }
@@ -630,12 +632,7 @@ pub(crate) fn hashed_job(item_impl: &ItemImpl, reexport: Option<&Reexport>) -> I
             if UNHASHED_CONSTANTS.iter().any(|name| constant.ident == name))
     });
     for attribute in &mut hashed.attrs {
-        let is_job = attribute
-            .path()
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "job");
-        if !is_job {
+        if !is_job_attribute(attribute) {
             continue;
         }
         if reexport.is_some() {
@@ -669,6 +666,119 @@ pub(crate) fn hashed_job(item_impl: &ItemImpl, reexport: Option<&Reexport>) -> I
         };
     }
     hashed
+}
+
+fn is_job_attribute(attribute: &Attribute) -> bool {
+    attribute
+        .path()
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "job")
+}
+
+fn unfold(items: &mut Vec<syn::Item>) {
+    for item in std::mem::take(items) {
+        match item {
+            syn::Item::Macro(mut call) if call.ident.is_none() => {
+                let (rest, jobs) = split_call(call.mac.tokens.clone());
+                if jobs.is_empty() {
+                    items.push(syn::Item::Macro(call));
+                    continue;
+                }
+                items.extend(jobs.into_iter().map(syn::Item::Impl));
+                if !call.attrs.is_empty() || !is_blank(&rest) {
+                    call.mac.tokens = rest;
+                    items.push(syn::Item::Macro(call));
+                }
+            }
+            syn::Item::Mod(mut module) => {
+                if let Some((_, content)) = &mut module.content {
+                    unfold(content);
+                }
+                items.push(syn::Item::Mod(module));
+            }
+            other => items.push(other),
+        }
+    }
+}
+
+fn split_call(tokens: TokenStream) -> (TokenStream, Vec<ItemImpl>) {
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut rest: Vec<TokenTree> = Vec::with_capacity(trees.len());
+    let mut jobs = Vec::new();
+    let mut floor = 0;
+    let mut position = 0;
+    while position < trees.len() {
+        if let Some((start, end, job)) = job_in_call(&trees, floor, position) {
+            rest.truncate(rest.len() - (position - start));
+            jobs.push(job);
+            position = end;
+            floor = end;
+            continue;
+        }
+        rest.push(match &trees[position] {
+            TokenTree::Group(group) => {
+                let (stream, inner) = split_call(group.stream());
+                jobs.extend(inner);
+                let mut rebuilt = Group::new(group.delimiter(), stream);
+                rebuilt.set_span(group.span());
+                TokenTree::Group(rebuilt)
+            }
+            other => other.clone(),
+        });
+        position += 1;
+    }
+    (rest.into_iter().collect(), jobs)
+}
+
+fn job_in_call(trees: &[TokenTree], floor: usize, at: usize) -> Option<(usize, usize, ItemImpl)> {
+    if !matches!(&trees[at], TokenTree::Ident(ident) if ident == "impl") {
+        return None;
+    }
+    let mut start = at;
+    while start >= floor + 2
+        && matches!(&trees[start - 2], TokenTree::Punct(pound) if pound.as_char() == '#')
+        && matches!(&trees[start - 1], TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket)
+    {
+        start -= 2;
+    }
+    let body = (at + 1..trees.len()).find(|&position| {
+        matches!(&trees[position], TokenTree::Group(group) if group.delimiter() == Delimiter::Brace)
+    })?;
+    let end = body + 1;
+    let mut job: ItemImpl = syn::parse2(trees[start..end].iter().cloned().collect()).ok()?;
+    if !is_job_impl(&job) {
+        return None;
+    }
+    if !job.attrs.iter().any(is_job_attribute) {
+        let arguments = start
+            .checked_sub(1)
+            .filter(|&before| before >= floor)
+            .and_then(|before| match &trees[before] {
+                TokenTree::Group(group) if group.delimiter() == Delimiter::Parenthesis => {
+                    Punctuated::<MetaNameValue, Token![,]>::parse_terminated
+                        .parse2(group.stream())
+                        .ok()
+                }
+                _ => None,
+            });
+        let attribute: Attribute = match &arguments {
+            Some(arguments) if !arguments.is_empty() => parse_quote!(#[jalari::job(#arguments)]),
+            _ => parse_quote!(#[jalari::job]),
+        };
+        if arguments.is_some() {
+            start -= 1;
+        }
+        job.attrs.insert(0, attribute);
+    }
+    Some((start, end, job))
+}
+
+fn is_blank(tokens: &TokenStream) -> bool {
+    tokens
+        .clone()
+        .into_iter()
+        .all(|tree| matches!(tree, TokenTree::Group(group) if is_blank(&group.stream())))
 }
 
 pub(crate) fn is_job_impl(item_impl: &ItemImpl) -> bool {
