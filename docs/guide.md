@@ -399,12 +399,35 @@ through `__jalari`.
 
 A job declared through the wrapper is fingerprinted like a job written as a plain item.
 
+`platform` can export an attribute macro instead, from a proc-macro crate of its own. The macro
+emits the job attribute through the re-export in front of the item it receives, adding `crate`
+to the arguments it was given:
+
+```rust
+quote! {
+    #[::platform::__jalari::job(crate = ::platform::__jalari, #arguments)]
+    #item
+}
+```
+
+A crate that depends only on `platform` then writes `#[platform::job(name = "send_invoice")]` on
+a plain `impl Job` block. Such a job is fingerprinted like the same job written against jalari,
+whatever the attribute macro is called: the fingerprint reads its attribute as `#[jalari::job]`
+with the arguments written there. Arguments that the macro adds itself are not among them. A
+`queue`, `cron` or `timezone` that it adds is not covered, and a `max_attempts` or `timeout` that
+it adds is covered through the constant it sets, but hashes differently from the same argument
+written at the impl. Name the macro by its path, as above: in a crate that imports it with
+`use platform::job;`, every fingerprinted job reaches `platform` through that import, and its
+fingerprint covers `platform` and the macro's own code like any other dependency.
+
 The repository's [`tests/facade`](../tests/facade) holds such a pair: `facade` re-exports jalari,
 and `facade-consumer` defines a plain and a recurring job through it without depending on
 jalari. `cargo test -p facade-consumer` builds them, checks every argument of the recurring
 job's attribute, checks that its fingerprint equals that of the same job written against jalari,
 declares a third job through `facade::job!` and checks its fingerprint the same way, and with
-`DATABASE_URL` set runs the plain job and the third one on a worker.
+`DATABASE_URL` set runs the plain job and the third one on a worker. `facade-macros` provides
+`#[facade::job_attr]`, an attribute macro that also sets `queue = "facade"` when no queue is
+given, and the consumer declares a plain and a recurring job through it, checked the same way.
 
 ## Enqueueing
 

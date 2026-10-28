@@ -94,7 +94,9 @@ use syn::{
 /// hashed as the same paths through `jalari`, and the crate they go through is not pinned for
 /// them. Moving a job behind a crate that re-exports jalari, renaming that crate or bumping its
 /// version therefore leaves waiting jobs runnable, as long as the job reaches that crate only
-/// through the re-export.
+/// through the re-export. An attribute macro of that crate that emits this attribute is read the
+/// same way, whatever it is called: its attribute on the impl is hashed as `jalari::job` with the
+/// arguments written there.
 ///
 /// Every enqueue stores the fingerprint with the job, and a worker takes a job only when the
 /// stored fingerprint is empty or equals its own build's. A job enqueued by another build of
