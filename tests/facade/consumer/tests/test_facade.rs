@@ -5,9 +5,26 @@ use facade::__jalari::recurring::Missed;
 use facade::__jalari::sqlx::postgres::PgPoolOptions;
 use facade::__jalari::sqlx::{self, AssertSqlSafe};
 use facade::__jalari::{
-    CancellationToken, JobState, Priority, Schema, Worker, WorkerConfig, admin, enqueue, init,
+    CancellationToken, Job, JobResult, JobState, Priority, Schema, Worker, WorkerConfig, admin,
+    enqueue, init,
 };
 use facade_consumer::{ECHOED, Echo};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct WrappedEcho {
+    word: String,
+}
+
+facade::job! {
+    (name = "facade_wrapped_echo")
+    impl Job for WrappedEcho {
+        async fn run(self) -> JobResult {
+            ECHOED.lock().unwrap().push(self.word);
+            Ok(())
+        }
+    }
+}
 
 #[test]
 fn test_jobs_register_through_the_facade() {
@@ -17,6 +34,12 @@ fn test_jobs_register_through_the_facade() {
     assert_eq!(echo.queue, "default");
     assert!(echo.cron.is_none());
     assert_eq!(echo.fingerprint, None);
+
+    let wrapped = registrations()
+        .find(|registration| registration.name == "facade_wrapped_echo")
+        .expect("facade_wrapped_echo is registered through the job! wrapper");
+    assert_eq!(wrapped.queue, "default");
+    assert!(wrapped.cron.is_none());
 
     let nightly = registrations()
         .find(|registration| registration.name == "facade_nightly")
@@ -68,24 +91,36 @@ async fn test_worker_runs_a_job_defined_through_the_facade() {
     let shutdown = CancellationToken::new();
     let running = tokio::spawn(worker.run(shutdown.clone()));
 
-    let job_id = enqueue(&Echo {
-        word: "through the facade".to_owned(),
-    })
-    .await
-    .unwrap()
-    .id();
+    let job_ids = [
+        enqueue(&Echo {
+            word: "through the facade".to_owned(),
+        })
+        .await
+        .unwrap()
+        .id(),
+        enqueue(&WrappedEcho {
+            word: "through the wrapper".to_owned(),
+        })
+        .await
+        .unwrap()
+        .id(),
+    ];
     tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let detail = admin::job(job_id).await.unwrap().expect("the job exists");
-            if detail.job.state == JobState::Succeeded {
-                break;
+        for job_id in job_ids {
+            loop {
+                let detail = admin::job(job_id).await.unwrap().expect("the job exists");
+                if detail.job.state == JobState::Succeeded {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the job succeeds within 30 s");
-    assert_eq!(*ECHOED.lock().unwrap(), ["through the facade"]);
+    .expect("both jobs succeed within 30 s");
+    let mut echoed = ECHOED.lock().unwrap().clone();
+    echoed.sort();
+    assert_eq!(echoed, ["through the facade", "through the wrapper"]);
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(60), running)

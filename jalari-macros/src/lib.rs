@@ -15,8 +15,8 @@ use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Expr, ExprLit, ImplItem, ItemImpl, Lit, LitBool, LitInt, LitStr, MetaNameValue, Path, Token,
-    Type, parse_macro_input, parse_quote, parse_quote_spanned,
+    Expr, ExprLit, ExprPath, ImplItem, ItemImpl, Lit, LitBool, LitInt, LitStr, MetaNameValue, Path,
+    Token, Type, parse_macro_input, parse_quote, parse_quote_spanned,
 };
 
 /// Registers an `impl Job for T` so workers can run `T`, optionally on a cron schedule.
@@ -486,27 +486,38 @@ fn jalari_path(arguments: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<
         .iter()
         .filter(|argument| argument.path.is_ident("crate"))
     {
-        let literal = string_value(argument)?;
         if jalari.is_some() {
-            return Err(syn::Error::new_spanned(&literal, "duplicate argument"));
+            return Err(syn::Error::new_spanned(
+                &argument.value,
+                "duplicate argument",
+            ));
         }
-        jalari = Some(path_value(&literal)?);
+        jalari = Some(path_value(&argument.value)?);
     }
     Ok(jalari.unwrap_or_else(|| parse_quote!(::jalari)))
 }
 
-fn path_value(literal: &LitStr) -> syn::Result<Path> {
-    literal
-        .parse::<Path>()
-        .ok()
-        .filter(|path| {
-            path.segments
-                .iter()
-                .all(|segment| segment.arguments.is_none())
-        })
-        .ok_or_else(|| {
-            syn::Error::new_spanned(literal, "expected a path such as \"::my_facade::__jalari\"")
-        })
+fn path_value(value: &Expr) -> syn::Result<Path> {
+    let path = match value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(literal),
+            ..
+        }) => literal.parse::<Path>().ok(),
+        Expr::Path(ExprPath {
+            attrs,
+            qself: None,
+            path,
+        }) if attrs.is_empty() => Some(path.clone()),
+        _ => None,
+    };
+    path.filter(|path| {
+        path.segments
+            .iter()
+            .all(|segment| segment.arguments.is_none())
+    })
+    .ok_or_else(|| {
+        syn::Error::new_spanned(value, "expected a path such as \"::my_facade::__jalari\"")
+    })
 }
 
 fn name_item(argument: &MetaNameValue, span: Span2, _: &Path) -> syn::Result<ImplItem> {

@@ -603,15 +603,62 @@ fn test_crate_argument_rejects_a_non_path_on_the_literal() {
             "{attribute}"
         );
     }
-    let e = rejected_argument("crate = facade");
-    assert_eq!(e.to_string(), "expected a string literal");
-    assert_eq!(e.span().source_text().as_deref(), Some("facade"));
+}
+
+#[test]
+fn test_crate_argument_takes_a_bare_path_like_the_string() {
+    for path in [
+        "::facade::__jalari",
+        "facade::__jalari",
+        "crate::reexported",
+        "::jalari",
+    ] {
+        for item in [SHORT, UNNAMED] {
+            for attribute in ARGUMENT_SETS {
+                let bare = if attribute.is_empty() {
+                    format!("crate = {path}")
+                } else {
+                    format!("{attribute}, crate = {path}")
+                };
+                assert_eq!(
+                    expanded(&bare, item),
+                    expanded(&with_crate(attribute, path), item),
+                    "{bare}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_crate_argument_rejects_a_non_path_expression_on_the_value() {
+    for (attribute, value) in [
+        ("crate = facade::<T>::__jalari", "facade::<T>::__jalari"),
+        ("crate = <T as Facade>::__jalari", "<T as Facade>::__jalari"),
+        ("crate = 1 + 2", "1 + 2"),
+        ("crate = [facade]", "[facade]"),
+        ("crate = true", "true"),
+    ] {
+        let e = rejected_argument(attribute);
+        assert_eq!(
+            e.to_string(),
+            "expected a path such as \"::my_facade::__jalari\"",
+            "{attribute}"
+        );
+        assert_eq!(
+            e.span().source_text().as_deref(),
+            Some(value),
+            "{attribute}"
+        );
+    }
 }
 
 #[test]
 fn test_crate_argument_rejects_duplicates_on_the_literal() {
     for (attribute, literal) in [
         ("crate = \"::a\", crate = \"::b\"", "\"::b\""),
+        ("crate = \"::a\", crate = ::b", "::b"),
+        ("crate = ::a, crate = \"::a\"", "\"::a\""),
         (
             "crate = \"::a\", queue = \"q\", crate = \"::a\", priority = \"low\"",
             "\"::a\"",
