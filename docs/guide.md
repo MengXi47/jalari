@@ -1295,6 +1295,28 @@ The same jobs can run in several shapes; pick per process.
   schedules firing if one stops. Turn it off with `.scheduler(false)` on workers that should
   only process jobs, but keep at least one with it on.
 
+### Before going live
+
+- Give the process time to stop. After its token is cancelled, `Worker::run` waits up to
+  `shutdown_timeout` (30 seconds by default) for running jobs. A supervisor or container
+  runtime that kills the process sooner turns an orderly stop into a crash: the jobs are taken
+  over 7 to 8 seconds later and the attempt counts. Set the stop grace period above
+  `shutdown_timeout`, or `shutdown_timeout` below it.
+- Run at least two workers. A dead worker's jobs are taken over by another worker. With one
+  worker they wait until that process is back, and it then takes over its own previous
+  incarnation's jobs 7 seconds after their last heartbeat.
+- Keep the worker process alive. A host that stops idle processes stops the worker and its
+  scheduler with it; nothing runs until it is started again, and each schedule then fires its
+  one catch-up run.
+- Rotate database credentials with the pool in mind. The pool and the lifeline open new
+  connections with the options the pool was built with, so once the old password is revoked
+  every reconnect fails until the process restarts with the new one. Start processes with the
+  new credentials before revoking the old ones.
+- Keep blocking work off the runtime. A blocking client, `std::thread::sleep` or a CPU-bound
+  loop belongs in `spawn_blocking`. The lifeline keeps beating while the runtime is blocked,
+  but a stop, a cancel, a timeout and shutdown reach a job only at an `.await`, so keep
+  blocking sections short and check `interrupted()` between them.
+
 For a task with `fingerprint = true`, a worker runs only the jobs enqueued by its own build of
 the task's code, as [code fingerprints](#code-fingerprints) describes. A task whose code a
 deploy did not change keeps its fingerprint, so both builds run its jobs. For a task whose code
@@ -1512,6 +1534,10 @@ worker, since no job became due.
   time. A fire commits in milliseconds, so this lasts as long as a fire does.
 - On PostgreSQL 14 to 17, many far-future jobs of a high [priority](#priority) slow every
   claim of their queue.
+- While the database answers heartbeats with errors, the worker keeps its jobs but its
+  heartbeat ages past the 7 second takeover grace. If its lifeline session then ends, another
+  worker can take the jobs over within milliseconds, while this worker notices at its next
+  beat, up to a second later. The outcome stays fenced; side effects in that second can overlap.
 
 ## Errors
 
