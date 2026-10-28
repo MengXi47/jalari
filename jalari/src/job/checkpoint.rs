@@ -497,8 +497,8 @@ impl<P: Serialize> Checkpoint<P> {
     ///   the call sets `idle_in_transaction_session_timeout` to 10 seconds for the rest of the
     ///   transaction, unless a shorter limit is set already, so that a frozen worker cannot keep
     ///   the job from being taken over. Make no other jalari call for the same job on another
-    ///   connection before the commit, such as [`save_now`](Self::save_now), which waits for the
-    ///   lock and fails after 2 seconds.
+    ///   connection before the commit, such as [`save_now`](Self::save_now) or
+    ///   [`step`](crate::step), which wait for the lock and fail after 2 seconds.
     ///
     /// Like [`save`](Self::save), it is a stop point: when the job was asked to stop, it writes
     /// the progress and then returns the stop error, so the transaction can roll back with the

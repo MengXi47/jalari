@@ -460,8 +460,9 @@ fn permanent(msg: String) -> JobError {
 /// - The output of `f` cannot be serialized, is larger than 1 MiB of JSON, contains the
 ///   character `\u{0}`, which PostgreSQL cannot store, or does not deserialize back into `T`,
 ///   as a `NaN` float does not (a [`JobError::permanent`]; the record stays started)
-/// - The database could not be reached or refused the write; when the output could not be
-///   stored, the next call runs `f` again
+/// - The database could not be reached or refused the write, for example after waiting 2
+///   seconds for the lock that an open [`save_in`](crate::Checkpoint::save_in) transaction of
+///   the same job holds; when the output could not be stored, the next call runs `f` again
 ///
 /// # Examples
 ///

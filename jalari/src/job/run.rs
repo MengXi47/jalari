@@ -146,7 +146,9 @@ impl JobRun {
     /// Same as [`interrupted`] for this attempt; usable from tasks the job spawns.
     ///
     /// It also completes after the attempt timed out and was aborted, so a spawned task learns
-    /// that the job it serves has gone.
+    /// that the job it serves has gone. The error then says that the worker is shutting down,
+    /// although only this attempt ended; the attempt is already recorded as timed out, so the
+    /// error only matters to code that logs it.
     ///
     /// # Examples
     ///

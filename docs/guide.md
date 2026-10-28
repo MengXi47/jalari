@@ -877,7 +877,8 @@ are ready at once, either may win, so the unit of work must be safe to run again
 `jalari::current_job()` returns the running attempt. Its id stays the same across retries, so
 it works as an idempotency key. `current_job()` and `interrupted()` only work in the job's own
 task. A task the job spawns gets the same signal from `run.interrupted()`, where `run` is the
-`current_job()` value taken before the spawn; it also completes once the attempt timed out.
+`current_job()` value taken before the spawn; it also completes once the attempt timed out,
+with the shutdown error although only that attempt ended.
 `run.cancellation()` is the shutdown signal as a `CancellationToken`, for code that takes one;
 it is also cancelled once the attempt timed out.
 
@@ -917,9 +918,11 @@ A transaction that `checkpoint.save_in` wrote to keeps the job's control row loc
 ends, and a job cannot be taken over while its row is locked. `save_in` sets
 `idle_in_transaction_session_timeout` to 10 seconds for that transaction, so PostgreSQL ends it
 once a frozen or stopped worker leaves it idle, and the job is taken over at the next check. The
-worker's other jobs are not held back. In jalari's tests, with one job holding such a
-transaction when its worker's lifeline was ended, the three other jobs ran again 7.0 seconds
-after the lifeline ended and the holding job 11.1 seconds after its transaction went idle.
+worker's other jobs are not held back: their takeover and the worker's batched progress writes
+pass over the locked row. In jalari's tests, with one job holding such a transaction when its
+worker's lifeline was ended, the three other jobs ran again 7.0 seconds after the lifeline ended
+and the holding job 11.1 seconds after its transaction went idle, and on a live worker another
+job's progress was written 5.0 seconds after the row was locked, at the next regular write.
 
 A worker whose heartbeat gets no answer within 2 seconds, or whose lifeline connection
 breaks, aborts every job it runs, closes its lifeline and registers again under a new id. The
@@ -1087,8 +1090,8 @@ effects an idempotency key.
   retried in a new transaction. Commit within 10 seconds: the call sets
   `idle_in_transaction_session_timeout` to 10 seconds for the rest of the transaction, unless a
   shorter limit is set already. Make no other jalari call for the same job on another
-  connection before the commit; `save_now` would wait for the lock the transaction holds and
-  fail after 2 seconds.
+  connection before the commit: `save_now` and `jalari::step` would wait for the lock the
+  transaction holds and fail after 2 seconds.
 - **An ignored `save_in` error rolls everything back.** When the lease moved, the statement
   fails and PostgreSQL aborts the transaction: `transaction.commit()` then returns `Ok` and
   stores nothing, neither your rows nor the progress. Rolling back to a savepoint taken before
@@ -1196,7 +1199,9 @@ together.
 | Housekeeping removes the job | deleted with it |
 
 `jalari::admin::job(id)` lists the steps in `JobDetail::steps`, with their state, starts,
-attempt, times, error and output.
+attempt, times, error and output. When a job succeeds without calling a step that an earlier
+run started and never finished, for example because a deploy renamed its key, the worker logs a
+warning that names those steps, since their effects may or may not have happened.
 
 `admin::clear_steps` is for an operator who knows the recorded effects did not happen, or wants
 them to happen again: the next run runs every step, with new idempotency keys. It answers
@@ -1210,6 +1215,8 @@ record, and prints and clears the steps.
 
 - A step works only in the job's own task. Called from a task the job spawned, it returns a
   permanent error.
+- Start no step while a [`save_in`](#durable-progress) transaction of the same job is open: the
+  step waits 2 seconds for the lock that transaction holds and fails with a retryable error.
 - During a rolling upgrade from 0.7, a `Replace` from a 0.7 process keeps the job's steps, so the
   replaced job gets the old payload's outputs. Upgrade those processes first, as
   [Upgrading from 0.7](#upgrading-from-07) says.
@@ -1255,6 +1262,38 @@ A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snoo
 - Housekeeping never deletes stopped jobs. A cancelled job is `deleted` and frees its
   `job_key`; housekeeping removes it after `deleted_retention`.
 
+### Blocking code
+
+Blocking code belongs in `spawn_blocking`, and it can stop itself there. `jalari::interrupted()`
+and `jalari::current_job()` read a task-local that `spawn_blocking` does not carry, so they do
+not work inside it. Take the run handle in the job's own task, move it in, and poll
+`is_interrupted()` between pieces of work:
+
+```rust
+let run = jalari::current_job().expect("inside a job");
+let polled = run.clone();
+let finished = tokio::task::spawn_blocking(move || {
+    for chunk in chunks {
+        if polled.is_interrupted() {
+            return false;
+        }
+        process(chunk);
+    }
+    true
+})
+.await?;
+if !finished {
+    return Err(run.interrupted().await);
+}
+```
+
+`is_interrupted()` turns `true` when `interrupted()` would complete: on a stop, a cancel, a
+shutdown or a lost job, and once the attempt has timed out and been aborted. It never turns
+back. Then return the error of `run.interrupted()`, which is ready at once, so a stop, a cancel
+or a shutdown settles the job as it does for async code. In jalari's tests such a loop, polling
+every 10 milliseconds, saw a stop about 1.0 second after the request and a 1 second timeout 1.0
+seconds after the attempt started.
+
 ### Limits
 
 - The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
@@ -1263,32 +1302,7 @@ A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snoo
   abort, the worker waits up to a second for the job's task to be dropped, so drop guards have
   run before the outcome is recorded. A job that never yields cannot be dropped: its outcome is
   recorded a second after the abort, and the stop takes up to `stop_timeout` plus a second.
-- Blocking code in `spawn_blocking` can stop itself. `jalari::interrupted()` and
-  `jalari::current_job()` read a task-local that `spawn_blocking` does not carry, so they do
-  not work there. Take the run handle in the job's own task, move it in, and poll
-  `is_interrupted()` between pieces of work. It turns `true` when `interrupted()` would
-  complete, and also once the attempt has timed out and been aborted. Then return the error of `run.interrupted()`, which is ready at once, so a stop, a
-  cancel or a shutdown settles the job as it does for async code. In jalari's tests such a loop
-  saw a stop about 1 second after the request, and a 1 second timeout 1.0 seconds after it
-  started.
-
-  ```rust
-  let run = jalari::current_job().expect("inside a job");
-  let polled = run.clone();
-  let finished = tokio::task::spawn_blocking(move || {
-      for chunk in chunks {
-          if polled.is_interrupted() {
-              return false;
-          }
-          process(chunk);
-      }
-      true
-  })
-  .await?;
-  if !finished {
-      return Err(run.interrupted().await);
-  }
-  ```
+  [Blocking code](#blocking-code) shows how code in `spawn_blocking` stops itself.
 - A crash loses at most about 6 seconds of progress saved with `save`: one second before a
   copy is kept, and five before it is written. A copy for which `save_now` returned, or whose
   `save_in` transaction committed, is never lost.
@@ -1625,8 +1639,10 @@ The same jobs can run in several shapes; pick per process.
   new credentials before revoking the old ones.
 - Keep blocking work off the runtime. A blocking client, `std::thread::sleep` or a CPU-bound
   loop belongs in `spawn_blocking`. The lifeline keeps beating while the runtime is blocked,
-  but a stop, a cancel, a timeout and shutdown reach a job only at an `.await`, so keep
-  blocking sections short and check `interrupted()` between them.
+  but a stop, a cancel, a timeout and shutdown reach a job only at an `.await`, and a runtime
+  that has not run for 10 seconds makes the lifeline log `the job runtime has not run`. Inside
+  `spawn_blocking`, poll `JobRun::is_interrupted()` between pieces of work, as
+  [Blocking code](#blocking-code) shows.
 
 For a task with `fingerprint = true`, a worker runs only the jobs enqueued by its own build of
 the task's code, as [code fingerprints](#code-fingerprints) describes. A task whose code a
@@ -1866,6 +1882,9 @@ worker, since no job became due.
   a transaction that keeps running statements holds the job for as long as it runs.
 - `save_in` fails with a serialization error under `REPEATABLE READ` or `SERIALIZABLE` when the
   worker wrote the job's progress after the transaction's snapshot.
+- A [step](#steps) whose `f` returns an error with a `\u0000` in its text cannot store that
+  text: the worker logs a warning, the record keeps its previous error, and the error is still
+  returned to the job.
 - While the database answers heartbeats with errors, the worker keeps its jobs but its
   heartbeat ages past the 7 second takeover grace. If its lifeline session then ends, another
   worker can take the jobs over within milliseconds, while this worker notices at its next
@@ -1892,7 +1911,8 @@ Database errors are classified by SQLSTATE. `ConnectionFailed`, `PoolTimedOut`,
 out of range, such as `max_attempts(0)` or a `queue_key_limit` without a `queue_key`, or
 `OnConflict::Replace` in `enqueue_many` or `enqueue_on_success_with`. Its message names the
 option. `NotInJob` means a function that only works in a running job's own task, such as
-`enqueue_on_success`, was called elsewhere. `DuplicateJobName` from `build()` names every
+`enqueue_on_success`, was called elsewhere, or `enqueue_on_success` was called inside a
+[step](#steps). `DuplicateJobName` from `build()` names every
 name or alias that two linked jobs share.
 
 ## Examples

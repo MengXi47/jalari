@@ -93,8 +93,11 @@ impl IntervalUnit {
 /// that month's last day, and later months use the anchor's day again, so every month from
 /// January 31st runs on February 28th or 29th and then on March 31st.
 ///
-/// Missed runs are not made up: after an outage the next run is the first one after now that is
-/// aligned with the anchor.
+/// Each next run is computed from the anchor, never by stepping through the runs an outage
+/// missed, so a long outage costs nothing. A run found overdue after an outage follows the
+/// schedule's [`Missed`](crate::Missed) policy: one catch-up run under the default
+/// [`Missed::Once`](crate::Missed::Once), none under [`Missed::Skip`](crate::Missed::Skip).
+/// Either way the run after it is the first one after now that is aligned with the anchor.
 ///
 /// # Examples
 ///
