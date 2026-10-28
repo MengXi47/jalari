@@ -769,8 +769,7 @@ Jobs still running after `shutdown_timeout` are aborted and count as an attempt;
 saves their progress and hands them back, and another worker runs them again 7 seconds later,
 so whatever the aborted run spawned has time to stop. A job that reaches a
 [checkpoint](#checkpoints) during the shutdown gets an error from it; when it returns that
-error, the job goes back to its queue without counting the attempt and keeps its saved
-progress.
+error, the job goes back to its queue without counting the attempt and keeps its saved progress.
 
 A job blocked in a long `.await` can notice the shutdown, a stop or a cancel at once:
 
@@ -798,15 +797,16 @@ as a `CancellationToken`, for code that takes one.
 
 ### Crashes and lost connections
 
-Each worker holds a lifeline: one session outside the pool, named
-`jalari lifeline <worker id>` in `pg_stat_activity`, that keeps an advisory lock on the worker's
-id and records a heartbeat every second. PostgreSQL itself ends a lifeline that stays silent for
-11 seconds, through `idle_session_timeout` set on that session only, and the lock goes with the
+Each worker holds a lifeline: one session outside the pool, named `jalari lifeline <worker id>`
+in `pg_stat_activity`, that keeps an advisory lock on the worker's id and records a heartbeat
+every second. The lifeline runs on a thread of its own, so job code that blocks the worker's
+runtime threads does not delay it. PostgreSQL itself ends a lifeline that stays silent for 11
+seconds, through `idle_session_timeout` set on that session only, and the lock goes with the
 session. The worker also sets `tcp_user_timeout` to 11 seconds there, which only servers that
 support it (Linux) apply; others, macOS among them, ignore it and report 0, and
 `idle_session_timeout` alone ends the session. Every worker checks every second, and once when
-it starts before it claims anything, for running jobs whose worker's lock is gone and whose
-last heartbeat is at least 7 seconds old, and takes them over.
+it starts before it claims anything, for running jobs whose worker's lock is gone and whose last
+heartbeat is at least 7 seconds old, and takes them over.
 
 | What happened | Old run stops | Job runs again |
 |---|---|---|
@@ -816,6 +816,8 @@ last heartbeat is at least 7 seconds old, and takes them over.
 | The database restarts | within about 1 s | 6 to 8 s later if the database is back by then, otherwise within about 1 s of it accepting connections again |
 | The worker freezes for less than 10 s | never; it continues | never |
 | The worker freezes for 10 s or more | as soon as it wakes up | 10 to 12 s after the freeze began |
+| Job code blocks every runtime thread of the worker | never; it continues | never |
+| The database answers heartbeats with errors, such as statement timeouts while the worker row is locked | never; it continues | never |
 | The network goes silent | within 3 s | 10 to 13 s after the failure |
 
 A job taken over continues from the progress its [checkpoints](#checkpoints) last saved, and
@@ -824,23 +826,38 @@ the interrupted attempt is recorded in the job history with
 fails instead. Jobs sharing the interrupted job's `queue_key` wait until it is taken over. A
 pending stop or cancel is settled at the takeover and the job does not run again.
 
-A worker whose heartbeat fails or times out aborts every job it runs, closes its lifeline and
-registers again under a new id. The 7 second wait covers the time such a worker needs to
-notice, so the old run has stopped before the new one starts. The worker also keeps its own
-count on its monotonic clock: it trusts its lifeline for 11 seconds after it sent the last
-heartbeat the database acknowledged, the same 11 seconds after which PostgreSQL ends a silent
-lifeline. A takeover needs that session gone, and the server only starts counting once the
-heartbeat has arrived, so a worker that may have been taken over always finds its 11 seconds
-gone; one that wakes just past them may abort although its lock was still held.
-A worker frozen for 10 seconds or more, for example by a virtual machine pause, is taken over
-while it is frozen; when it wakes up those 11 seconds have passed, so it aborts its jobs at
-once, within milliseconds in jalari's tests, without waiting for the database to answer. In
-that moment the job's writes to the job tables are rejected, but its own side effects are not.
+A worker whose heartbeat gets no answer within 2 seconds, or whose lifeline connection
+breaks, aborts every job it runs, closes its lifeline and registers again under a new id. The
+7 second wait covers the time such a worker needs to notice, so the old run has stopped before
+the new one starts.
+
+When PostgreSQL answers a heartbeat with an error instead, for example a statement timeout
+because a lock holds the worker's row, the session is alive and keeps its lock, so no other
+worker can take the jobs over. The worker logs a warning, keeps its jobs running and sends the
+next heartbeat. Its claims are refused once its last successful heartbeat is 3 seconds old, so
+it starts nothing new until a heartbeat succeeds again. In jalari's tests a job ran once, with
+attempt 1, through a 12 second stall, and a job enqueued during the stall started about 0.1
+seconds after it ended. An error that ends the session, such as `pg_terminate_backend`, still
+aborts the jobs at once. The heartbeat grows old during a stall, so when the lifeline breaks in
+one, another worker can take the jobs over within about a second instead of 7; a refused
+heartbeat is followed by the next one right away, so the worker learns of the break at once, and
+in jalari's tests the old run stopped within milliseconds and the job ran again a second later.
+
+The worker also keeps its own count on its monotonic clock: it trusts its lifeline for 11
+seconds after it sent the last heartbeat the database answered, the same 11 seconds after which
+PostgreSQL ends a silent lifeline. A takeover needs that session gone, and the server only
+starts counting once the heartbeat has arrived, so a worker that may have been taken over always
+finds its 11 seconds gone; one that wakes just past them may abort although its lock was still
+held. A worker frozen for 10 seconds or more, for example by a virtual machine pause, is taken
+over while it is frozen; when it wakes up those 11 seconds have passed, so it aborts its jobs at
+once, within milliseconds in jalari's tests, without waiting for the database to answer. In that
+moment the job's writes to the job tables are rejected, but its own side effects are not.
 
 Aborting a job drops its task at its next `.await`. Code that does not yield keeps running: a
 blocking loop, `spawn_blocking`, threads, child processes and tasks the job spawned itself. In
 every case above such code can still run while the job runs again elsewhere, for as long as it
-takes, and a worker whose threads it blocks cannot even notice that it lost its lifeline.
+takes. Blocked runtime threads do not cost the worker its lifeline: in jalari's tests two jobs
+that blocked both runtime threads for 12 seconds each ran once and the worker kept its id.
 
 A worker also hands back jobs it owns but no longer runs, within a second, and they run again 7
 seconds later. When the database committed a claim but the reply never reached the worker, the
@@ -1224,10 +1241,10 @@ so every connection returns to the pool with the values it had.
   job may run. Every jalari statement runs under the pool's settings, `statement_timeout`
   included, and none of them waits for long on its own. Jobs that share a `queue_key` are
   skipped while the key is taken, not waited for.
-- The lifeline is a pooled connection the worker detaches for good, so it inherits the pool's
-  connect options and `after_connect`. On that session alone the worker sets
+- The lifeline is a connection the worker opens next to the pool with the pool's connect
+  options; the pool's `after_connect` does not run on it. On that session alone the worker sets
   `idle_session_timeout` and `tcp_user_timeout` to 11 seconds (the latter only where the server
-  supports it), `statement_timeout` to 2 seconds and, on PostgreSQL 17 and later,
+  supports it), `statement_timeout` to 1.5 seconds and, on PostgreSQL 17 and later,
   `transaction_timeout` to 0.
 - An enqueue with a `job_key` waits while another open transaction is inserting or replacing
   a job with the same key, for example your own transaction that called `jalari::enqueue_in`.

@@ -29,10 +29,13 @@ pub(super) const ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// worker runs its jobs again from their saved progress within seconds. A worker that loses its
 /// database connection aborts the jobs it was running before anyone else can start them; one
 /// frozen for 10 seconds or more is taken over while frozen and aborts its jobs as soon as it
-/// wakes up, because it stops trusting its lifeline 11 seconds after the last acknowledged
-/// heartbeat, before PostgreSQL can have ended that session and released it. Aborting is cooperative: a job stops at its next `.await`, and code that never
-/// yields, such as a blocking loop or a thread the job started, keeps running. The guide's
-/// "Crashes and lost connections" gives the timings.
+/// wakes up, because it stops trusting its lifeline 11 seconds after the last answered
+/// heartbeat, before PostgreSQL can have ended that session and released it. A database that
+/// answers heartbeats with errors, such as statement timeouts, keeps the jobs running. The
+/// lifeline runs on its own thread, so job code that blocks the runtime does not cost the
+/// worker its lifeline. Aborting is cooperative: a job stops at its next `.await`, and code
+/// that never yields, such as a blocking loop or a thread the job started, keeps running. The
+/// guide's "Crashes and lost connections" gives the timings.
 ///
 /// # Examples
 ///
