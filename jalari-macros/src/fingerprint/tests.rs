@@ -2502,7 +2502,7 @@ impl Job for J {{
 }
 
 #[test]
-fn test_stamp_inputs_are_the_files_of_the_analysed_units() {
+fn test_stamp_inputs_are_the_analysed_files_and_every_root() {
     let base = env::temp_dir().join(format!("jalari-fingerprint-inputs-{}", process::id()));
     let app = base.join("app");
     write(
@@ -2550,6 +2550,7 @@ mod tests {
         "pub fn platform_name() -> &'static str {\n    \"windows\"\n}\n",
     );
     write(&app.join("src/unused.rs"), "pub fn unused() {}\n");
+    write(&app.join("src/main.rs"), "fn scale() {}\n\nfn main() {}\n");
     write(&app.join("tests/it.rs"), "#[test]\nfn test_it() {}\n");
     for (package, text) in [
         (
@@ -2574,7 +2575,13 @@ mod tests {
     let located = load::stamp_at(Some(&app), &[file.as_path()], &item, None);
     assert_eq!(
         located.inputs,
-        paths(&["app/src/lib.rs", "app/src/win.rs", "testkit/src/lib.rs"])
+        paths(&[
+            "app/src/lib.rs",
+            "app/src/main.rs",
+            "app/src/win.rs",
+            "app/tests/it.rs",
+            "testkit/src/lib.rs",
+        ])
     );
 
     let whole = load::stamp_at(Some(&app), &[], &item, None);
@@ -2582,6 +2589,7 @@ mod tests {
         whole.inputs,
         paths(&[
             "app/src/lib.rs",
+            "app/src/main.rs",
             "app/src/win.rs",
             "app/tests/it.rs",
             "other/src/lib.rs",

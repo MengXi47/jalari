@@ -67,25 +67,30 @@ pub(crate) fn stamp_at(
     reexport: Option<&Reexport>,
 ) -> Stamp {
     let mut workspace = manifest_dir.map(load).unwrap_or_default();
-    let all = workspace
+    let (all, roots): (Vec<String>, Vec<PathBuf>) = workspace
         .crates
         .first()
-        .map(|primary| primary.roots.clone())
+        .map(|primary| {
+            let roots = primary.roots.iter().map(|root| primary.path(root));
+            (primary.roots.clone(), roots.collect())
+        })
         .unwrap_or_default();
-    let files = manifest_dir.into_iter().flat_map(|dir| {
-        local_files
-            .iter()
-            .filter_map(move |file| relative(dir, file))
+    let found = manifest_dir
+        .into_iter()
+        .flat_map(|dir| {
+            local_files
+                .iter()
+                .filter_map(move |file| relative(dir, file))
+        })
+        .find_map(|file| located(&mut workspace, &all, &file, item, reexport));
+    let mut stamp = found.unwrap_or_else(|| {
+        set_roots(&mut workspace, all);
+        let index = cached(&workspace, reexport);
+        let site = JobSite { item, file: None };
+        stamp(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
     });
-    for file in files {
-        if let Some(found) = located(&mut workspace, &all, &file, item, reexport) {
-            return found;
-        }
-    }
-    set_roots(&mut workspace, all);
-    let index = cached(&workspace, reexport);
-    let site = JobSite { item, file: None };
-    stamp(&index, &workspace, &site, env!("CARGO_PKG_VERSION"))
+    stamp.inputs.extend(roots);
+    stamp
 }
 
 fn located(

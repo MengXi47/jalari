@@ -18,6 +18,14 @@ pub(crate) struct CrateSource {
     pub(crate) deps: BTreeMap<String, Dependency>,
 }
 
+impl CrateSource {
+    pub(crate) fn path(&self, file: &str) -> PathBuf {
+        let mut path = self.dir.clone();
+        path.extend(file.split('/'));
+        path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Dependency {
     Path(usize),

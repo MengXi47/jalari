@@ -100,11 +100,7 @@ fn inputs(index: &Index, workspace: &Workspace, units: &BTreeSet<usize>) -> BTre
         let Some(source) = workspace.crates.get(record.krate) else {
             continue;
         };
-        for file in &record.files {
-            let mut path = source.dir.clone();
-            path.extend(file.split('/'));
-            inputs.insert(path);
-        }
+        inputs.extend(record.files.iter().map(|file| source.path(file)));
     }
     inputs
 }
