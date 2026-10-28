@@ -498,6 +498,49 @@ impl Job for Retried {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Child {
+    n: u32,
+}
+
+#[jalari::job(queue = "step_children")]
+impl Job for Child {
+    const NAME: &'static str = "step_child";
+
+    async fn run(self) -> JobResult {
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct OnSuccess {
+    label: String,
+}
+
+#[jalari::job(queue = "step")]
+impl Job for OnSuccess {
+    const NAME: &'static str = "step_on_success";
+
+    async fn run(self) -> JobResult {
+        let inside = jalari::step("child", |_| async {
+            let enqueued = jalari::enqueue_on_success(&Child { n: 1 });
+            Ok(format!("{:?}", enqueued.map_err(|e| (e.kind, e.msg))))
+        })
+        .await?;
+        see(&self.label, inside);
+        let (beside, stepped) = tokio::join!(
+            async { jalari::enqueue_on_success(&Child { n: 2 }) },
+            jalari::step("beside", |_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(())
+            }),
+        );
+        beside?;
+        stepped?;
+        Ok(())
+    }
+}
+
 async fn spawn_worker() -> RunningWorker {
     let mut config = WorkerConfig::default();
     config.poll_interval = Duration::from_millis(100);
@@ -909,6 +952,33 @@ async fn check_the_finish_survives_a_dropped_connection() {
     assert_eq!(detail.job.attempts, 1);
 }
 
+async fn check_enqueue_on_success_is_refused_inside_a_step() {
+    let label = "on_success";
+    let id = enqueue(&OnSuccess {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_state(id, "succeeded").await;
+    assert_eq!(
+        seen(label),
+        [
+            "Err((NotInJob, \"step_child: enqueue_on_success does not work inside jalari::step; \
+          call it after the step returns\"))"
+        ]
+    );
+    let children: Vec<u32> = jalari::admin::jobs(
+        &jalari::admin::JobFilter::new().task("step_child"),
+        10,
+        None,
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|child| child.payload_json::<Child>().unwrap().n)
+    .collect();
+    assert_eq!(children, [2]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_step() {
     let Some(database) = Database::start("step", 16).await else {
@@ -933,6 +1003,7 @@ async fn test_step() {
     check_closure_errors_pass_through().await;
     check_a_retry_clears_the_recorded_error().await;
     check_the_finish_survives_a_dropped_connection().await;
+    check_enqueue_on_success_is_refused_inside_a_step().await;
     worker.stop().await;
     database.finish().await;
 }

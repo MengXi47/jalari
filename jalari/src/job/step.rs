@@ -24,6 +24,14 @@ const FINISH_BACKOFF_LIMIT: Duration = Duration::from_millis(500);
 const STARTED: &str = "started";
 const DONE: &str = "done";
 
+tokio::task_local! {
+    static INSIDE: ();
+}
+
+pub(crate) fn in_step() -> bool {
+    INSIDE.try_with(|()| ()).is_ok()
+}
+
 /// The step that [`step`] is running, handed to its closure.
 ///
 /// # Examples
@@ -485,7 +493,7 @@ where
             in_flight.done();
             Ok(output)
         }
-        Started::Open(run) => match f(run).await {
+        Started::Open(run) => match INSIDE.scope((), f(run)).await {
             Ok(output) => {
                 let (value, output) = match encode(&output) {
                     Ok(encoded) => encoded,

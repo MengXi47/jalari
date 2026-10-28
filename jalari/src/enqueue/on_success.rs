@@ -1,4 +1,5 @@
 use super::request::EnqueueRequest;
+use crate::job::in_step;
 use crate::{EnqueueOptions, Error, ErrorKind, Job, OnConflict, Result, current_job};
 
 /// Enqueues a job when the running job succeeds, in the same statement that records the success.
@@ -9,10 +10,17 @@ use crate::{EnqueueOptions, Error, ErrorKind, Job, OnConflict, Result, current_j
 /// running job's own `job_key` is inserted, since that key is released by the same statement.
 /// The call returns no id; use [`enqueue`](crate::enqueue) when you need one.
 ///
+/// It is refused inside a [`step`](crate::step) closure: the step would be recorded as done
+/// while the child exists only in memory, so a failed attempt would lose the child for good.
+/// Enqueue it with [`enqueue_in`](crate::enqueue_in) in a transaction that
+/// [`Checkpoint::save_in`](crate::Checkpoint::save_in) also writes to, or call
+/// `enqueue_on_success` after the step returns.
+///
 /// # Errors
 ///
 /// Returns an error if:
-/// - It is called outside a running job's own task ([`NotInJob`](crate::ErrorKind::NotInJob))
+/// - It is called outside a running job's own task, or inside a [`step`](crate::step) closure
+///   ([`NotInJob`](crate::ErrorKind::NotInJob))
 /// - The job or its context cannot be serialized
 ///   ([`PayloadEncodeFailed`](crate::ErrorKind::PayloadEncodeFailed))
 ///
@@ -80,6 +88,16 @@ pub fn enqueue_on_success_with<T: Job>(job: &T, options: EnqueueOptions) -> Resu
             ),
         ));
     };
+    if in_step() {
+        return Err(Error::new(
+            ErrorKind::NotInJob,
+            format!(
+                "{}: enqueue_on_success does not work inside jalari::step; call it after the \
+                 step returns",
+                T::NAME
+            ),
+        ));
+    }
     if options.on_conflict == OnConflict::Replace {
         return Err(Error::new(
             ErrorKind::InvalidOptions,
