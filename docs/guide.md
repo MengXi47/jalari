@@ -297,8 +297,16 @@ The fingerprint covers:
 Formatting, comments and code that the job cannot reach leave it unchanged. The same sources
 and the same `Cargo.lock` give the same fingerprint on every machine and in every directory,
 in debug and release builds and under `cargo test`. A `cfg_attr` on the `impl Job` block counts
-as written, whichever attributes it expands to. Cargo rebuilds the crate when any file that a
-fingerprint read changes, including a module that the current build leaves out with `#[cfg]`.
+as written, whichever attributes it expands to; a job attribute written inside one, as in
+`#[cfg_attr(feature = "jobs", jalari::job(name = "export"))]`, is hashed as written with all its
+arguments, the name included. Cargo rebuilds the crate when any file that a fingerprint read
+changes, including a module that the current build leaves out with `#[cfg]` and the package's
+other target roots, such as `src/main.rs`, whose `mod` declarations decide which files the
+analysis follows.
+
+A job declared inside a call of a `macro_rules!` wrapper reaches that wrapper by name, so what
+the wrapper emits beside the `impl`, such as a helper function the job calls, is covered when
+the wrapper is defined in the job's crate.
 
 The name, the aliases, the priority, `RETRY_POLICY`, the `checkpoints` flag and the `missed`
 policy are left out, in the attribute and in the impl, so renaming a job with an alias, changing
@@ -311,7 +319,10 @@ With [`crate`](#using-jalari-through-another-crate), the `crate` path is left ou
 the job attribute's own path and every path that reaches jalari through the `crate` path: such a
 path is hashed as the same path through `jalari`, and the crate it goes through is neither
 analysed nor pinned for it. When the job names that crate by another path, such as
-`platform::billing::rates`, the crate is covered like any other dependency.
+`platform::billing::rates`, the crate is covered like any other dependency. The attribute's own
+path is hashed as `jalari::job` with or without a leading `::`. Without `crate` the path is
+hashed as written, so a job written `#[::jalari::job]` hashes differently from the same job
+written `#[jalari::job]`, and moving it behind a facade changes its fingerprint once.
 
 The analysis matches names rather than resolving paths, so it errs toward a change. Editing a
 function with the same name as one the job calls, in any module, changes the fingerprint too.
@@ -375,6 +386,14 @@ attribute generates starts with it. A string literal holding the path, such as
 `"::platform::__jalari"`, works the same. A value that is not a plain path, or a second
 `crate`, is a compile error.
 
+The path must name jalari itself or a re-export of the crate: `pub use jalari as __jalari`, as
+above, or jalari under another dependency name. A path to a module that only glob re-exports
+jalari, such as `crate = ::platform` for a `platform` that does `pub use jalari::*`, also
+compiles. When that module defines items of its own, such as a `pub fn helper`, those items are
+covered only through the paths that name them, `platform::helper` or a `use` of it, and only
+when `platform` is a `path` dependency; every other path through it is hashed as a path through
+`jalari`.
+
 So that the crates that define jobs never write the path, `platform` can export a wrapper that
 passes `$crate`:
 
@@ -404,7 +423,12 @@ same path through `jalari`, so moving a fingerprinted job behind `platform`, ren
 or bumping its version leaves waiting jobs runnable, as long as the job reaches `platform` only
 through `__jalari`.
 
-A job declared through the wrapper is fingerprinted like a job written as a plain item.
+A job declared through the wrapper is fingerprinted like a job written as a plain item. Call
+the wrapper by its path through `platform`, as `platform::job!`. A bare `job!` brought in with
+`use` reads `$crate` from that `use`: through a local re-export, such as
+`use crate::reexports::job;`, it finds the wrong crate and the paths through `__jalari` are
+hashed as written, and in every case the import reaches `platform`, so the fingerprint covers
+`platform` like any other dependency.
 
 `platform` can export an attribute macro instead, from a proc-macro crate of its own. The macro
 emits the job attribute through the re-export in front of the item it receives, adding `crate`
@@ -419,13 +443,18 @@ quote! {
 
 A crate that depends only on `platform` then writes `#[platform::job(name = "send_invoice")]` on
 a plain `impl Job` block. Such a job is fingerprinted like the same job written against jalari,
-whatever the attribute macro is called: the fingerprint reads its attribute as `#[jalari::job]`
-with the arguments written there. Arguments that the macro adds itself are not among them. A
-`queue`, `cron` or `timezone` that it adds is not covered, and a `max_attempts` or `timeout` that
-it adds is covered through the constant it sets, but hashes differently from the same argument
-written at the impl. Name the macro by its path, as above: in a crate that imports it with
-`use platform::job;`, every fingerprinted job reaches `platform` through that import, and its
-fingerprint covers `platform` and the macro's own code like any other dependency.
+whatever the attribute macro is called, as long as its arguments are written as `name = value`
+pairs or left out: the fingerprint reads its attribute as `#[jalari::job]` with the arguments
+written there. An attribute whose arguments are flags, such as `#[platform::task(fingerprint)]`,
+is hashed as written, its path into `platform` included. Arguments that the macro adds itself
+are not among the ones written there. A `queue`, `cron` or `timezone` that it adds is not
+covered, and a `max_attempts` or `timeout` that it adds is covered through the constant it sets,
+but hashes differently from the same argument written at the impl. A macro that adds
+`fingerprint = true` itself never hashes like the same job written with `fingerprint = true` at
+the impl, because that argument is hashed only where the source writes it. Name the macro by
+its path, as above: in a crate that imports it with `use platform::job;`, every fingerprinted
+job reaches `platform` through that import, and its fingerprint covers `platform` and the
+macro's own code like any other dependency.
 
 The repository's [`tests/facade`](../tests/facade) holds such a pair: `facade` re-exports jalari,
 and `facade-consumer` defines a plain and a recurring job through it without depending on

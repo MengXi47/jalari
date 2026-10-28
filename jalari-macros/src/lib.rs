@@ -47,9 +47,10 @@ use syn::{
 /// * `fingerprint` - `true` turns the code fingerprint on for this job; `false` when omitted
 /// * `checkpoints` - `true` declares that the job reaches checkpoints regularly; an abort at
 ///   `stop_timeout` or `shutdown_timeout` is then logged as an error. `false` when omitted
-/// * `crate` - Path at which the generated code reaches jalari, written as a path or as a
-///   string literal, such as `::my_facade::__jalari` for a crate that re-exports jalari as
-///   `__jalari`; `::jalari` when omitted. Lets a crate that depends only on the re-exporting
+/// * `crate` - Path at which the generated code reaches jalari, which must name jalari itself
+///   or a re-export of the crate, written as a path or as a string literal, such as
+///   `::my_facade::__jalari` for a crate that re-exports jalari as `__jalari`; `::jalari` when
+///   omitted. Lets a crate that depends only on the re-exporting
 ///   crate define jobs, and a `macro_rules!` wrapper of that crate pass `$crate::__jalari`. The
 ///   code fingerprint reads every path through it as the same path through `jalari`
 ///
