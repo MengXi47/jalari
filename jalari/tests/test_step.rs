@@ -16,6 +16,7 @@ const LOST: &str = "the worker no longer owns the job";
 
 struct Tables {
     pool: PgPool,
+    schema: String,
     job_control: String,
     job_step: String,
 }
@@ -294,6 +295,209 @@ impl Job for ZombieStart {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Replayed {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for Replayed {
+    const NAME: &'static str = "step_replayed";
+
+    async fn run(self) -> JobResult {
+        let label = self.label.clone();
+        let charge = jalari::step("charge", |run| async move {
+            count(&label);
+            Ok(format!("charge {}", run.idempotency_key()))
+        })
+        .await?;
+        see(&self.label, charge);
+        pass(&self.label).await;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CutShort {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for CutShort {
+    const NAME: &'static str = "step_cut_short";
+
+    async fn run(self) -> JobResult {
+        let label = self.label.clone();
+        let starts = jalari::step("effect", |run| async move {
+            count(&label);
+            see(&label, format!("start {}", run.starts()));
+            if run.starts() == 1 {
+                pass(&label).await;
+            }
+            Ok(run.starts())
+        })
+        .await?;
+        see(&self.label, format!("returned {starts}"));
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ZombieFinish {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for ZombieFinish {
+    const NAME: &'static str = "step_zombie_finish";
+
+    async fn run(self) -> JobResult {
+        let run_number = count(&format!("{}:runs", self.label));
+        let label = self.label.clone();
+        let result = jalari::step("late", |_| async move {
+            if run_number == 1 {
+                pass(&label).await;
+            }
+            Ok(run_number)
+        })
+        .await;
+        see(&self.label, outcome(&result));
+        if run_number == 1 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            reach(&format!("{}:continued", self.label));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct BadOutput {
+    label: String,
+    kind: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for BadOutput {
+    const NAME: &'static str = "step_bad_output";
+
+    async fn run(self) -> JobResult {
+        let label = self.label.clone();
+        let result = match self.kind.as_str() {
+            "large" => {
+                let large = "x".repeat(1024 * 1024 - 1);
+                jalari::step("bad", |_| async move {
+                    count(&label);
+                    Ok(large)
+                })
+                .await
+                .map(drop)
+            }
+            "nul" => jalari::step("bad", |_| async move {
+                count(&label);
+                Ok("a\0b".to_owned())
+            })
+            .await
+            .map(drop),
+            _ => jalari::step("bad", |_| async move {
+                count(&label);
+                Ok(f64::NAN)
+            })
+            .await
+            .map(drop),
+        };
+        see(&self.label, outcome(&result));
+        result
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LargestOutput {
+    label: String,
+}
+
+#[jalari::job(queue = "step")]
+impl Job for LargestOutput {
+    const NAME: &'static str = "step_largest_output";
+
+    async fn run(self) -> JobResult {
+        let largest =
+            jalari::step("largest", |_| async { Ok("x".repeat(1024 * 1024 - 2)) }).await?;
+        see(&self.label, format!("{} bytes", largest.len()));
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PassThrough {
+    label: String,
+    kind: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for PassThrough {
+    const NAME: &'static str = "step_pass_through";
+
+    async fn run(self) -> JobResult {
+        let kind = self.kind.clone();
+        let result = jalari::step("passed", |_| async move {
+            if kind == "discard" {
+                Err(JobError::discard(std::io::Error::other("no longer needed")))
+            } else {
+                jalari::snooze(Duration::from_secs(3600))
+            }
+        })
+        .await;
+        see(&self.label, outcome(&result));
+        result
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Flaky {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for Flaky {
+    const NAME: &'static str = "step_flaky";
+
+    async fn run(self) -> JobResult {
+        let run = jalari::current_job().unwrap();
+        if run.attempt() > 1 {
+            let rows = step_rows(run.id()).await;
+            see(&self.label, format!("{:?}", rows[0].error));
+        }
+        jalari::step("flaky", |step| async move {
+            if step.starts() == 1 {
+                return Err(JobError::new("flaky once".to_owned()));
+            }
+            Ok(step.starts())
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Retried {
+    label: String,
+}
+
+#[jalari::job(queue = "step", max_attempts = 3)]
+impl Job for Retried {
+    const NAME: &'static str = "step_retried";
+
+    async fn run(self) -> JobResult {
+        let label = self.label.clone();
+        jalari::step("retried", |_| async move {
+            count(&label);
+            Ok(1)
+        })
+        .await?;
+        Ok(())
+    }
+}
+
 async fn spawn_worker() -> RunningWorker {
     let mut config = WorkerConfig::default();
     config.poll_interval = Duration::from_millis(100);
@@ -405,6 +609,10 @@ async fn check_key_rules() {
         ]
     );
     assert!(rows.iter().all(|row| row.attempt == 1));
+    assert!(
+        rows.iter()
+            .all(|row| row.state == "done" && row.error.is_none())
+    );
 }
 
 async fn check_recorded_step_returns_its_output() {
@@ -477,6 +685,230 @@ async fn check_a_zombie_cannot_start_a_step() {
     assert_eq!(step_rows(id).await, []);
 }
 
+async fn check_a_done_step_is_not_rerun_after_a_crash(worker: RunningWorker) -> RunningWorker {
+    let label = "replayed";
+    let id = enqueue(&Replayed {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_gate(label).await;
+    worker.crash().await;
+    open(label);
+    let worker = spawn_worker().await;
+    wait_for_state(id, "succeeded").await;
+    let [first, second] = &seen(label)[..] else {
+        panic!("{:?}", seen(label));
+    };
+    assert_eq!(first, second, "the replay returned another output");
+    assert_eq!(counted(label), 1, "the done step ran again");
+    let [row] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_eq!(first, &format!("charge {}", row.nonce));
+    assert_eq!((row.state.as_str(), row.starts), ("done", 1));
+    worker
+}
+
+async fn check_a_crash_before_done_reruns_the_step(worker: RunningWorker) -> RunningWorker {
+    let label = "cut_short";
+    let id = enqueue(&CutShort {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_gate(label).await;
+    worker.crash().await;
+    let worker = spawn_worker().await;
+    wait_for_state(id, "succeeded").await;
+    assert_eq!(seen(label), ["start 1", "start 2", "returned 2"]);
+    assert_eq!(counted(label), 2);
+    let [row] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_eq!(
+        (row.state.as_str(), row.starts, row.attempt, &row.output),
+        ("done", 2, 2, &Some(json!(2)))
+    );
+    worker
+}
+
+async fn check_a_zombie_cannot_finish_a_step() {
+    let label = "zombie_finish";
+    let id = enqueue(&ZombieFinish {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_gate(label).await;
+    bump_lease(id).await;
+    open(label);
+    wait_for_state(id, "succeeded").await;
+    assert_eq!(
+        seen(label),
+        [format!("interruption {LOST}"), "ok 2".to_owned()]
+    );
+    assert!(
+        !reached("zombie_finish:continued"),
+        "a run that ignored the lost error kept running past its next await"
+    );
+    let [row] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_eq!(
+        (row.state.as_str(), row.starts, &row.output),
+        ("done", 2, &Some(json!(2)))
+    );
+    let succeeded = jalari::admin::job(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .history
+        .iter()
+        .filter(|entry| entry.state == jalari::JobState::Succeeded)
+        .count();
+    assert_eq!(succeeded, 1);
+}
+
+async fn check_a_bad_output_leaves_the_step_started() {
+    for (kind, reason) in [
+        (
+            "large",
+            "the output is 1048577 bytes of JSON, above the limit of 1048576",
+        ),
+        (
+            "nul",
+            "the output contains the character \\u0000, which PostgreSQL cannot store",
+        ),
+        (
+            "nan",
+            "the output does not read back as the step's type: invalid type: null, expected f64",
+        ),
+    ] {
+        let label = format!("bad_{kind}");
+        let id = enqueue(&BadOutput {
+            label: label.clone(),
+            kind: kind.to_owned(),
+        })
+        .await;
+        wait_for_state(id, "failed").await;
+        let msg = format!("step \"bad\": {reason}");
+        assert_eq!(seen(&label), [format!("permanent {msg}")], "{kind}");
+        assert_eq!(counted(&label), 1, "{kind}");
+        let [row] = &step_rows(id).await[..] else {
+            panic!("one step row expected");
+        };
+        assert_eq!(
+            (row.state.as_str(), &row.output, row.error.as_deref()),
+            ("started", &None, Some(msg.as_str())),
+            "{kind}"
+        );
+    }
+    let label = "largest";
+    let id = enqueue(&LargestOutput {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_state(id, "succeeded").await;
+    assert_eq!(seen(label), ["1048574 bytes"]);
+}
+
+async fn check_closure_errors_pass_through() {
+    for (kind, ended, recorded, last_error, attempts) in [
+        (
+            "discard",
+            "discarded",
+            "no longer needed",
+            Some("no longer needed"),
+            1,
+        ),
+        ("snooze", "scheduled", "snoozed for 3600s", None, 0),
+    ] {
+        let label = format!("pass_{kind}");
+        let id = enqueue(&PassThrough {
+            label: label.clone(),
+            kind: kind.to_owned(),
+        })
+        .await;
+        wait_for_state(id, ended).await;
+        let [row] = &step_rows(id).await[..] else {
+            panic!("one step row expected");
+        };
+        assert_eq!(
+            (row.state.as_str(), row.error.as_deref()),
+            ("started", Some(recorded)),
+            "{kind}"
+        );
+        let detail = jalari::admin::job(id).await.unwrap().unwrap();
+        assert_eq!(detail.job.last_error.as_deref(), last_error, "{kind}");
+        assert_eq!(detail.job.attempts, attempts, "{kind}");
+    }
+}
+
+async fn check_a_retry_clears_the_recorded_error() {
+    let label = "flaky";
+    let id = enqueue(&Flaky {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_state(id, "succeeded").await;
+    assert_eq!(seen(label), ["Some(\"flaky once\")"]);
+    let [row] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_eq!(
+        (row.state.as_str(), row.starts, row.attempt, &row.error),
+        ("done", 2, 2, &None)
+    );
+}
+
+async fn check_the_finish_survives_a_dropped_connection() {
+    let tables = TABLES.get().unwrap();
+    let schema = &tables.schema;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE SEQUENCE \"{schema}\".finish_kills;
+         CREATE FUNCTION \"{schema}\".kill_finish() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF strpos(current_query(), 'finished_at = statement_timestamp()') > 0 THEN
+                 IF nextval('\"{schema}\".finish_kills') = 1 THEN
+                     PERFORM pg_terminate_backend(pg_backend_pid());
+                 END IF;
+             END IF;
+             RETURN NULL;
+         END $$;
+         CREATE TRIGGER kill_finish BEFORE UPDATE ON {job_step}
+             FOR EACH STATEMENT EXECUTE FUNCTION \"{schema}\".kill_finish();",
+        job_step = tables.job_step,
+    )))
+    .execute(&tables.pool)
+    .await
+    .unwrap();
+    let label = "retried";
+    let id = enqueue(&Retried {
+        label: label.to_owned(),
+    })
+    .await;
+    wait_for_state(id, "succeeded").await;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "DROP TRIGGER kill_finish ON {};",
+        tables.job_step
+    )))
+    .execute(&tables.pool)
+    .await
+    .unwrap();
+    let kills: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT last_value FROM \"{schema}\".finish_kills"
+    )))
+    .fetch_one(&tables.pool)
+    .await
+    .unwrap();
+    assert_eq!(kills, 2, "the first finish must have been cut off");
+    assert_eq!(counted(label), 1);
+    let [row] = &step_rows(id).await[..] else {
+        panic!("one step row expected");
+    };
+    assert_eq!((row.state.as_str(), row.starts), ("done", 1));
+    let detail = jalari::admin::job(id).await.unwrap().unwrap();
+    assert_eq!(detail.job.attempts, 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_step() {
     let Some(database) = Database::start("step", 16).await else {
@@ -484,6 +916,7 @@ async fn test_step() {
     };
     let _ = TABLES.set(Tables {
         pool: database.pool.clone(),
+        schema: database.schema_name.clone(),
         job_control: database.table("job_control"),
         job_step: database.table("job_step"),
     });
@@ -493,6 +926,13 @@ async fn test_step() {
     check_recorded_step_returns_its_output().await;
     check_a_step_is_a_stop_point().await;
     check_a_zombie_cannot_start_a_step().await;
+    let worker = check_a_done_step_is_not_rerun_after_a_crash(worker).await;
+    let worker = check_a_crash_before_done_reruns_the_step(worker).await;
+    check_a_zombie_cannot_finish_a_step().await;
+    check_a_bad_output_leaves_the_step_started().await;
+    check_closure_errors_pass_through().await;
+    check_a_retry_clears_the_recorded_error().await;
+    check_the_finish_survives_a_dropped_connection().await;
     worker.stop().await;
     database.finish().await;
 }

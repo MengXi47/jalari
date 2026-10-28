@@ -1,19 +1,26 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgPool, Row};
+use tracing::{debug, warn};
 
 use super::checkpoint::RunControl;
 use super::fence::begin_fenced;
 use super::run::current_job;
 use crate::init::config;
-use crate::{Error, JobError, Schema};
+use crate::{Error, ErrorKind, JobError, Schema};
 
 const MAX_KEY_LENGTH: usize = 255;
+const MAX_OUTPUT_LENGTH: usize = 1024 * 1024;
+const MAX_ERROR_LENGTH: usize = 1024;
+const FINISH_WINDOW: Duration = Duration::from_secs(30);
+const FINISH_BACKOFF: Duration = Duration::from_millis(100);
+const FINISH_BACKOFF_LIMIT: Duration = Duration::from_millis(500);
 const STARTED: &str = "started";
 const DONE: &str = "done";
 
@@ -59,7 +66,7 @@ impl StepRun {
     /// It is a hyphenated UUID created with the step's record, so it is unique per step and
     /// job. Pass it to an API that deduplicates requests by key. An
     /// [`OnConflict::Replace`](crate::OnConflict::Replace) of the job or
-    /// [`admin::clear_steps`](crate::admin::clear_steps) deletes the record, and the next start
+    /// `admin::clear_steps` deletes the record, and the next start
     /// gets a new key.
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
@@ -202,6 +209,104 @@ impl StepRecord<'_> {
         Ok(row)
     }
 
+    async fn finish(&self, output: &Value) -> Result<(), JobError> {
+        let deadline = Instant::now() + FINISH_WINDOW;
+        let mut backoff = FINISH_BACKOFF;
+        loop {
+            match self.try_finish(output).await {
+                Ok((true, 1)) => return Ok(()),
+                Ok((false, _)) => return Err(self.control.lose()),
+                Ok((true, _)) => {
+                    return Err(JobError::new(format!(
+                        "step {:?}: its record was cleared or finished elsewhere while it ran",
+                        self.key
+                    )));
+                }
+                Err(e) if unanswered(&e) && Instant::now() + backoff < deadline => {
+                    if backoff == FINISH_BACKOFF {
+                        warn!(error = %e, key = self.key, "the database did not answer the step's output, retrying");
+                    } else {
+                        debug!(error = %e, key = self.key, "the database did not answer the step's output, retrying");
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(FINISH_BACKOFF_LIMIT);
+                }
+                Err(e) => {
+                    return Err(JobError::new(format!(
+                        "step {:?}: could not record the output, it may have been recorded: {e}",
+                        self.key
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn try_finish(&self, output: &Value) -> crate::Result<(bool, i64)> {
+        let mut transaction = begin_fenced(&self.pool).await?;
+        let finished = sqlx::query_as(AssertSqlSafe(format!(
+            "WITH fence AS (
+                 SELECT job_id FROM {job_control} WHERE job_id = $1 AND lease = $2 FOR SHARE
+             ),
+             finished AS (
+                 UPDATE {job_step} AS step
+                 SET state = '{DONE}', output = $4, error = NULL,
+                     finished_at = statement_timestamp()
+                 FROM fence
+                 WHERE step.job_id = fence.job_id AND step.key = $3 AND step.state = '{STARTED}'
+                 RETURNING step.key
+             )
+             SELECT EXISTS (SELECT 1 FROM fence), (SELECT count(*) FROM finished)",
+            job_control = self.schema.table("job_control"),
+            job_step = self.schema.table("job_step"),
+        )))
+        .bind(self.control.job_id())
+        .bind(self.control.lease())
+        .bind(self.key)
+        .bind(output)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(finished)
+    }
+
+    async fn record_error(&self, msg: &str) -> Result<(), JobError> {
+        match self.try_record_error(capped(msg)).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(self.control.lose()),
+            Err(e) => {
+                warn!(error = %Error::from(e), key = self.key, "could not record the step's error");
+                Ok(())
+            }
+        }
+    }
+
+    async fn try_record_error(&self, msg: &str) -> sqlx::Result<bool> {
+        let mut transaction = begin_fenced(&self.pool).await?;
+        let fenced = sqlx::query_scalar(AssertSqlSafe(format!(
+            "WITH fence AS (
+                 SELECT job_id FROM {job_control} WHERE job_id = $1 AND lease = $2 FOR SHARE
+             ),
+             recorded AS (
+                 UPDATE {job_step} AS step
+                 SET error = $4
+                 FROM fence
+                 WHERE step.job_id = fence.job_id AND step.key = $3 AND step.state = '{STARTED}'
+                 RETURNING step.key
+             )
+             SELECT EXISTS (SELECT 1 FROM fence)",
+            job_control = self.schema.table("job_control"),
+            job_step = self.schema.table("job_step"),
+        )))
+        .bind(self.control.job_id())
+        .bind(self.control.lease())
+        .bind(self.key)
+        .bind(msg)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(fenced)
+    }
+
     fn failed(&self, action: &str, e: sqlx::Error) -> JobError {
         JobError::new(format!(
             "step {:?}: {action} the step: {}",
@@ -213,6 +318,58 @@ impl StepRecord<'_> {
     fn decode(&self, e: sqlx::Error) -> JobError {
         JobError::new(format!("step {:?}: {}", self.key, Error::from(e)))
     }
+}
+
+fn encode<T: Serialize + DeserializeOwned>(output: &T) -> Result<(Value, T), String> {
+    let value = serde_json::to_value(output)
+        .map_err(|err| format!("the output cannot be serialized to JSON: {err}"))?;
+    if holds_nul(&value) {
+        return Err(
+            "the output contains the character \\u0000, which PostgreSQL cannot store".to_owned(),
+        );
+    }
+    let length = serde_json::to_vec(&value)
+        .map_err(|err| format!("the output cannot be serialized to JSON: {err}"))?
+        .len();
+    if length > MAX_OUTPUT_LENGTH {
+        return Err(format!(
+            "the output is {length} bytes of JSON, above the limit of {MAX_OUTPUT_LENGTH}"
+        ));
+    }
+    let decoded = serde_json::from_value(value.clone())
+        .map_err(|err| format!("the output does not read back as the step's type: {err}"))?;
+    Ok((value, decoded))
+}
+
+fn holds_nul(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains('\0'),
+        Value::Array(items) => items.iter().any(holds_nul),
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(name, field)| name.contains('\0') || holds_nul(field)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn capped(text: &str) -> &str {
+    let mut end = text.len().min(MAX_ERROR_LENGTH);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn unanswered(error: &Error) -> bool {
+    matches!(
+        error.kind,
+        ErrorKind::ConnectionFailed
+            | ErrorKind::ConnectionTerminated
+            | ErrorKind::PoolTimedOut
+            | ErrorKind::PoolClosed
+            | ErrorKind::TlsFailed
+            | ErrorKind::ProtocolViolation
+    )
 }
 
 fn refused(key: &str, reason: &str) -> JobError {
@@ -234,6 +391,12 @@ fn permanent(msg: String) -> JobError {
 /// the next call run `f` again, so a step runs at least once and its effect may happen more than
 /// once; [`StepRun::starts`] and [`StepRun::idempotency_key`] let `f` deal with that.
 ///
+/// The output is stored as JSON, at most 1 MiB of it, and is checked before it is stored: it
+/// must read back as `T`, so the run that executes `f` gets the output as it reads back, the
+/// same value later runs get. When `f` returns an error, the error's text is kept with the
+/// record and the error is returned unchanged, so [`JobError::discard`], [`snooze`](crate::snooze)
+/// and interruptions work inside a step; the next call with the key runs `f` again.
+///
 /// Every write is fenced by the run's lease: a worker that lost the job cannot start or finish a
 /// step, and its run is aborted at its next `.await` even when the error is ignored. Like
 /// [`checkpoint`](crate::checkpoint), a step is a stop point: when the job was asked to stop, it
@@ -251,7 +414,11 @@ fn permanent(msg: String) -> JobError {
 /// - Another worker has taken the job over (the job is aborted)
 /// - The stored output does not deserialize into `T` (a [`JobError::permanent`])
 /// - `f` returned an error, which is passed through unchanged
-/// - The database could not be reached or refused the write
+/// - The output of `f` cannot be serialized, is larger than 1 MiB of JSON, contains the
+///   character `\u{0}`, which PostgreSQL cannot store, or does not deserialize back into `T`,
+///   as a `NaN` float does not (a [`JobError::permanent`]; the record stays started)
+/// - The database could not be reached or refused the write; when the output could not be
+///   stored, the next call runs `f` again
 ///
 /// # Examples
 ///
@@ -318,10 +485,24 @@ where
             in_flight.done();
             Ok(output)
         }
-        Started::Open(run) => {
-            let output = f(run).await?;
-            in_flight.done();
-            Ok(output)
-        }
+        Started::Open(run) => match f(run).await {
+            Ok(output) => {
+                let (value, output) = match encode(&output) {
+                    Ok(encoded) => encoded,
+                    Err(msg) => {
+                        let msg = format!("step {key:?}: {msg}");
+                        record.record_error(&msg).await?;
+                        return Err(permanent(msg));
+                    }
+                };
+                record.finish(&value).await?;
+                in_flight.done();
+                Ok(output)
+            }
+            Err(e) => {
+                record.record_error(e.msg()).await?;
+                Err(e)
+            }
+        },
     }
 }
