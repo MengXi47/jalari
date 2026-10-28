@@ -11,8 +11,8 @@ use syn::{
 };
 
 use super::hash::canonical;
-use super::reexport::Reexport;
-use super::workspace::{Dependency, Workspace};
+use super::reexport::{JALARI, Reexport};
+use super::workspace::{CrateSource, Dependency, Workspace};
 
 pub(crate) type ItemId = usize;
 pub(crate) type ImplId = usize;
@@ -149,6 +149,10 @@ pub(crate) struct Impl {
 
 impl Index {
     pub(crate) fn build(workspace: &Workspace, reexport: Option<Reexport>) -> Self {
+        let reexport = reexport.map(|reexport| {
+            let own = own_items(workspace, reexport.segments());
+            reexport.with_own_items(own)
+        });
         let mut builder = Builder {
             workspace,
             index: Index {
@@ -396,24 +400,16 @@ impl Builder<'_> {
             self.items(&inner, content);
             return;
         }
-        let candidates = match &attribute {
-            Some(relative) => {
-                let base = if place.inline {
-                    &place.dir
-                } else {
-                    &place.file_dir
-                };
-                join(base, relative).into_iter().collect::<Vec<_>>()
-            }
-            None => [format!("{name}.rs"), format!("{name}/mod.rs")]
-                .iter()
-                .filter_map(|relative| join(&place.dir, relative))
-                .collect(),
-        };
         let krate = self.index.units[place.unit].krate;
         let files = &self.workspace.crates[krate].files;
-        if let Some(found) = candidates.into_iter().find(|path| files.contains_key(path)) {
-            let mod_rs = attribute.is_some() || found.ends_with("/mod.rs") || found == "mod.rs";
+        let base = if place.inline {
+            &place.dir
+        } else {
+            &place.file_dir
+        };
+        if let Some((found, mod_rs)) =
+            module_file(files, &place.dir, base, &name, attribute.as_deref())
+        {
             self.file(place.unit, &found, path, mod_rs);
         }
     }
@@ -651,6 +647,105 @@ impl<'ast> Visit<'ast> for Scan {
         }
         visit::visit_item_impl(self, item_impl);
     }
+}
+
+fn module_file(
+    files: &BTreeMap<String, String>,
+    dir: &str,
+    path_base: &str,
+    name: &str,
+    attribute: Option<&str>,
+) -> Option<(String, bool)> {
+    let candidates = match attribute {
+        Some(relative) => join(path_base, relative).into_iter().collect::<Vec<_>>(),
+        None => [format!("{name}.rs"), format!("{name}/mod.rs")]
+            .iter()
+            .filter_map(|relative| join(dir, relative))
+            .collect(),
+    };
+    let found = candidates
+        .into_iter()
+        .find(|path| files.contains_key(path))?;
+    let mod_rs = attribute.is_some() || found.ends_with("/mod.rs") || found == "mod.rs";
+    Some((found, mod_rs))
+}
+
+fn own_items(workspace: &Workspace, segments: &[String]) -> BTreeSet<String> {
+    let Some((first, modules)) = segments.split_first() else {
+        return BTreeSet::new();
+    };
+    let Some(Dependency::Path(krate)) = workspace
+        .crates
+        .first()
+        .and_then(|primary| primary.deps.get(first))
+    else {
+        return BTreeSet::new();
+    };
+    let Some(source) = workspace.crates.get(*krate) else {
+        return BTreeSet::new();
+    };
+    if source.package == JALARI {
+        return BTreeSet::new();
+    }
+    source
+        .roots
+        .iter()
+        .filter_map(|root| module_items(source, root, modules))
+        .flatten()
+        .collect()
+}
+
+fn module_items(source: &CrateSource, root: &str, modules: &[String]) -> Option<Vec<String>> {
+    let mut items = syn::parse_file(source.files.get(root)?).ok()?.items;
+    let mut file_dir = parent(root).to_owned();
+    let mut dir = file_dir.clone();
+    let mut inline = false;
+    for name in modules {
+        let module = items.into_iter().find_map(|item| match item {
+            syn::Item::Mod(module) if module.ident == name => Some(module),
+            _ => None,
+        })?;
+        let attribute = path_attribute(&module.attrs);
+        match module.content {
+            Some((_, content)) => {
+                dir = join(&dir, attribute.as_deref().unwrap_or(name))?;
+                inline = true;
+                items = content;
+            }
+            None => {
+                let path_base = if inline { &dir } else { &file_dir };
+                let (found, mod_rs) =
+                    module_file(&source.files, &dir, path_base, name, attribute.as_deref())?;
+                items = syn::parse_file(source.files.get(&found)?).ok()?.items;
+                file_dir = parent(&found).to_owned();
+                dir = if mod_rs {
+                    file_dir.clone()
+                } else {
+                    join(&file_dir, stem(&found))?
+                };
+                inline = false;
+            }
+        }
+    }
+    Some(items.iter().filter_map(defined_name).collect())
+}
+
+fn defined_name(item: &syn::Item) -> Option<String> {
+    let ident = match item {
+        syn::Item::Fn(function) => &function.sig.ident,
+        syn::Item::Struct(definition) => &definition.ident,
+        syn::Item::Enum(definition) => &definition.ident,
+        syn::Item::Union(definition) => &definition.ident,
+        syn::Item::Type(definition) => &definition.ident,
+        syn::Item::TraitAlias(definition) => &definition.ident,
+        syn::Item::Trait(definition) => &definition.ident,
+        syn::Item::Const(constant) => &constant.ident,
+        syn::Item::Static(definition) => &definition.ident,
+        syn::Item::Mod(module) => &module.ident,
+        syn::Item::Macro(item_macro) => item_macro.ident.as_ref()?,
+        _ => return None,
+    };
+    Some(ident.to_string())
 }
 
 pub(crate) fn hashed_job(item_impl: &ItemImpl, reexport: Option<&Reexport>) -> ItemImpl {

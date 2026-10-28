@@ -1948,6 +1948,165 @@ fn test_registry_jalari_is_pinned_through_the_reexport() {
     assert_eq!(bumped_path, bumped_direct);
 }
 
+#[test]
+fn test_reexport_keeps_paths_to_its_own_items_as_written() {
+    let cases = [
+        (
+            "use facade::{helper, Job, JobResult};",
+            "use {jalari::{Job, JobResult}, facade::{helper}};",
+        ),
+        ("use facade::helper;", "use facade::helper;"),
+        ("use facade::*;", "use {jalari::*, facade::*};"),
+        (
+            "fn f() { facade::helper(); facade::Job::NAME; facade::nested::x(); }",
+            "fn f() { facade::helper(); jalari::Job::NAME; facade::nested::x(); }",
+        ),
+        (
+            "fn f() { println!(\"{}\", facade::helper(), facade::VERSION); }",
+            "fn f() { println!(\"{}\", facade::helper(), jalari::VERSION); }",
+        ),
+    ];
+    let own = ["helper", "nested"].map(str::to_owned).into();
+    let facade = reexport("::facade").unwrap().with_own_items(own);
+    for (input, expected) in cases {
+        let mut file = syn::parse_file(input).unwrap();
+        facade.rewrite_file(&mut file);
+        assert_eq!(
+            canonical(file.to_token_stream()),
+            canonical(syn::parse_file(expected).unwrap().to_token_stream()),
+            "{input}"
+        );
+    }
+}
+
+fn with_facade(app_lib: &str, facade_files: &[(&str, &str)]) -> Workspace {
+    let mut workspace = single(&[("src/lib.rs", app_lib)]);
+    workspace.crates[0]
+        .deps
+        .insert("facade".to_owned(), Dependency::Path(1));
+    workspace
+        .crates
+        .push(crate_source("facade", &["src/lib.rs"], facade_files));
+    workspace
+}
+
+#[test]
+fn test_crate_path_covers_the_items_its_module_defines() {
+    let facade_lib = |value: u32| {
+        format!(
+            "pub use jalari::*;\npub use jalari as __jalari;\n\npub fn helper() -> u32 {{\n    {value}\n}}\n"
+        )
+    };
+    let job = |imports: &str, body: &str, attribute: &str| {
+        source(body, "")
+            .replace("use jalari::{Job, JobResult};", imports)
+            .replace("#[jalari::job]", attribute)
+    };
+    let root = "#[facade::job(crate = ::facade)]";
+    let cases = [
+        job("use facade::{Job, JobResult};", "facade::helper();", root),
+        job("use facade::{helper, Job, JobResult};", "helper();", root),
+        job("use facade::*;", "helper();", root),
+    ];
+    for app in &cases {
+        let build = |value: u32| {
+            through(
+                &with_facade(app, &[("src/lib.rs", &facade_lib(value))]),
+                "::facade",
+            )
+        };
+        assert_ne!(build(1), build(2), "{app}");
+    }
+    let reexported = job(
+        "use facade::__jalari::{Job, JobResult};",
+        "facade::helper();",
+        "#[facade::__jalari::job(crate = ::facade::__jalari)]",
+    );
+    let workspace = with_facade(&reexported, &[("src/lib.rs", &facade_lib(1))]);
+    assert_eq!(
+        through(
+            &with_facade(&cases[0], &[("src/lib.rs", &facade_lib(1))]),
+            "::facade"
+        ),
+        through(&workspace, "::facade::__jalari")
+    );
+    let plain = job("use facade::{Job, JobResult};", "", root);
+    assert_eq!(
+        through(
+            &with_facade(&plain, &[("src/lib.rs", &facade_lib(1))]),
+            "::facade"
+        ),
+        lib(&source("", ""))
+    );
+
+    let nested = job(
+        "use facade::jobs::{Job, JobResult};",
+        "facade::jobs::helper();",
+        "#[facade::jobs::job(crate = ::facade::jobs)]",
+    );
+    for (lib_text, module_file) in [
+        (
+            "pub mod jobs {\n    pub use jalari::*;\n    pub fn helper() -> u32 {\n        {value}\n    }\n}\n",
+            None,
+        ),
+        (
+            "pub mod jobs;\n",
+            Some("pub use jalari::*;\npub fn helper() -> u32 {\n    {value}\n}\n"),
+        ),
+    ] {
+        let build = |value: u32| {
+            let value = value.to_string();
+            let lib_text = lib_text.replace("{value}", &value);
+            let module_text = module_file.map(|text| text.replace("{value}", &value));
+            let mut files = vec![("src/lib.rs", lib_text.as_str())];
+            files.extend(module_text.as_deref().map(|text| ("src/jobs.rs", text)));
+            through(&with_facade(&nested, &files), "::facade::jobs")
+        };
+        assert_ne!(build(1), build(2), "{lib_text}");
+    }
+
+    let local = |value: u32| {
+        let text = job(
+            "use crate::jobs::{Job, JobResult};",
+            "crate::jobs::helper();",
+            "#[crate::jobs::job(crate = crate::jobs)]",
+        );
+        let text = format!(
+            "{text}\nmod jobs {{\n    pub use jalari::*;\n    pub fn helper() -> u32 {{\n        {value}\n    }}\n}}\n"
+        );
+        through(&single(&[("src/lib.rs", &text)]), "crate::jobs")
+    };
+    assert_ne!(local(1), local(2));
+
+    let renamed_jalari = |body: &str| {
+        let text = job(
+            "use platform_jalari::{Job, JobResult};",
+            body,
+            "#[platform_jalari::job(crate = ::platform_jalari)]",
+        );
+        let mut workspace = single(&[("src/lib.rs", &text)]);
+        workspace.crates[0]
+            .deps
+            .insert("platform_jalari".to_owned(), Dependency::Path(1));
+        workspace.crates.push(crate_source(
+            "jalari",
+            &["src/lib.rs"],
+            &[("src/lib.rs", "pub mod admin {\n    pub fn clear() {}\n}\n")],
+        ));
+        through(&workspace, "::platform_jalari")
+    };
+    assert_eq!(
+        renamed_jalari("platform_jalari::admin::clear();"),
+        renamed_jalari("jalari::admin::clear();")
+    );
+
+    let registry = |lock: &str| through(&through_registry_facade(&cases[0], lock), "::facade");
+    assert_eq!(
+        registry(FACADE_LOCK),
+        registry(&FACADE_LOCK.replace("1.0.0", "1.0.1"))
+    );
+}
+
 fn wrapped(call: &str, arguments: &str, body: &str) -> String {
     let plain = source(body, "");
     let (head, job) = plain.split_once("#[jalari::job]\n").unwrap();

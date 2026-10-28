@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::mem;
 
 use proc_macro2::{Group, Ident, Spacing, Span, TokenStream, TokenTree};
@@ -20,6 +21,7 @@ const MACRO_CRATE: &str = "$crate";
 pub(crate) struct Reexport {
     segments: Vec<String>,
     wrapper: Option<Vec<String>>,
+    own: BTreeSet<String>,
 }
 
 impl Reexport {
@@ -27,6 +29,7 @@ impl Reexport {
         (!segments.is_empty() && segments != [JALARI]).then_some(Self {
             segments,
             wrapper: None,
+            own: BTreeSet::new(),
         })
     }
 
@@ -55,6 +58,14 @@ impl Reexport {
             wrapper: wrapper_path(attribute),
             ..self
         }
+    }
+
+    pub(crate) fn with_own_items(self, own: BTreeSet<String>) -> Self {
+        Self { own, ..self }
+    }
+
+    pub(crate) fn segments(&self) -> &[String] {
+        &self.segments
     }
 
     pub(crate) fn is_wrapper(&self, path: &Path) -> bool {
@@ -87,6 +98,7 @@ impl Reexport {
         while position < trees.len() {
             if !continues_path(&out)
                 && let Some(length) = self.leading(&trees[position..])
+                && !self.names_own_item(&trees[position + length..])
             {
                 out.push(TokenTree::Ident(Ident::new(JALARI, trees[position].span())));
                 position += length;
@@ -126,6 +138,19 @@ impl Reexport {
         Some(position)
     }
 
+    fn names_own_item(&self, rest: &[TokenTree]) -> bool {
+        match rest {
+            [first, second, TokenTree::Ident(ident), ..] if is_separator(first, second) => {
+                self.is_own(ident)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_own(&self, ident: &Ident) -> bool {
+        self.own.contains(&ident.to_string())
+    }
+
     fn collapse(&self, path: &mut Path) {
         let length = self.segments.len();
         let through = path.segments.len() >= length
@@ -134,7 +159,11 @@ impl Reexport {
                 .iter()
                 .zip(&self.segments)
                 .all(|(segment, name)| segment.ident == name && segment.arguments.is_none());
-        if !through {
+        let own = path
+            .segments
+            .get(length)
+            .is_some_and(|next| self.is_own(&next.ident));
+        if !through || own {
             return;
         }
         let span = path.segments[0].ident.span();
@@ -171,14 +200,23 @@ impl Reexport {
                 if !last {
                     return self.take(&mut path.tree, depth + 1, taken);
                 }
-                let mut rest = (*path.tree).clone();
+                let (moved, kept) = self.split_own(&path.tree);
+                let Some(mut rest) = moved else {
+                    return false;
+                };
                 self.bind_self(&mut rest);
                 taken.push(UseTree::Path(UsePath {
                     ident: Ident::new(JALARI, path.ident.span()),
                     colon2_token: path.colon2_token,
                     tree: Box::new(rest),
                 }));
-                true
+                match kept {
+                    Some(kept) => {
+                        *path.tree = kept;
+                        false
+                    }
+                    None => true,
+                }
             }
             UseTree::Name(leaf) if last && leaf.ident == name => {
                 taken.push(self.bound(leaf.ident.span()));
@@ -201,6 +239,33 @@ impl Reexport {
                 group.items.is_empty()
             }
             _ => false,
+        }
+    }
+
+    fn split_own(&self, tree: &UseTree) -> (Option<UseTree>, Option<UseTree>) {
+        if self.own.is_empty() {
+            return (Some(tree.clone()), None);
+        }
+        match tree {
+            UseTree::Path(UsePath { ident, .. })
+            | UseTree::Name(UseName { ident })
+            | UseTree::Rename(UseRename { ident, .. })
+                if self.is_own(ident) =>
+            {
+                (None, Some(tree.clone()))
+            }
+            UseTree::Glob(_) => (Some(tree.clone()), Some(tree.clone())),
+            UseTree::Group(group) if !group.items.is_empty() => {
+                let mut moved = Vec::new();
+                let mut kept = Vec::new();
+                for item in &group.items {
+                    let (to_jalari, as_written) = self.split_own(item);
+                    moved.extend(to_jalari);
+                    kept.extend(as_written);
+                }
+                (grouped(moved), grouped(kept))
+            }
+            _ => (Some(tree.clone()), None),
         }
     }
 
@@ -310,6 +375,15 @@ impl VisitMut for Rewrite<'_> {
         visit_mut::visit_meta_list_mut(self, node);
         node.tokens = self.reexport.rewrite_tokens(mem::take(&mut node.tokens));
     }
+}
+
+fn grouped(items: Vec<UseTree>) -> Option<UseTree> {
+    (!items.is_empty()).then(|| {
+        UseTree::Group(UseGroup {
+            brace_token: Default::default(),
+            items: items.into_iter().collect(),
+        })
+    })
 }
 
 fn wrapper_path(attribute: &str) -> Option<Vec<String>> {
