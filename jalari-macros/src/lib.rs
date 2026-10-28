@@ -28,7 +28,7 @@ use syn::{
 ///
 /// * `name` - Sets `Job::NAME`; the type's name, as written, when neither this nor the impl
 ///   sets it. Renaming such a type renames the job, so add the old name to `aliases`
-/// * `queue` - Default queue for the job; `default` when omitted
+/// * `queue` - Default queue for the job; `default` when omitted. Must not be empty
 /// * `max_attempts` - Sets `Job::MAX_ATTEMPTS` from an integer literal
 /// * `timeout` - Sets `Job::TIMEOUT` from an integer literal of seconds; a limit below one
 ///   second needs `const TIMEOUT` in the impl
@@ -43,9 +43,10 @@ use syn::{
 /// * `fingerprint` - `true` turns the code fingerprint on for this job; `false` when omitted
 /// * `checkpoints` - `true` declares that the job reaches checkpoints regularly; an abort at
 ///   `stop_timeout` or `shutdown_timeout` is then logged as an error. `false` when omitted
-/// * `crate` - Path, as a string literal, at which the generated code reaches jalari, such as
-///   `"::my_facade::__jalari"` for a crate that re-exports jalari as `__jalari`; `"::jalari"`
-///   when omitted. Lets a crate that depends only on the re-exporting crate define jobs. The
+/// * `crate` - Path at which the generated code reaches jalari, written as a path or as a
+///   string literal, such as `::my_facade::__jalari` for a crate that re-exports jalari as
+///   `__jalari`; `::jalari` when omitted. Lets a crate that depends only on the re-exporting
+///   crate define jobs, and a `macro_rules!` wrapper of that crate pass `$crate::__jalari`. The
 ///   code fingerprint reads every path through it as the same path through `jalari`
 ///
 /// `name`, `max_attempts`, `timeout`, `priority` and `aliases` are an alternative to declaring
@@ -65,6 +66,9 @@ use syn::{
 /// and at most `i32::MAX` milliseconds, and no entry of `ALIASES` may be empty, equal `NAME`
 /// or repeat another. A violation is a compile error that names the job and points at the
 /// constant, or at the argument that set it.
+///
+/// An empty `queue`, and a `cron` job whose type does not implement `Default`, are compile
+/// errors at the argument.
 ///
 /// # Code fingerprint
 ///

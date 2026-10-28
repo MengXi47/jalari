@@ -191,7 +191,7 @@ impl Job for SendEmail {
 | `#[jalari::job(..)]` argument | Meaning | Default |
 |---|---|---|
 | `name = "..."` | Stable name stored with every job; must be unique in the binary, among names and aliases | the type's name, as written |
-| `queue = "..."` | Queue the job goes to unless the enqueue says otherwise | `default` |
+| `queue = "..."` | Queue the job goes to unless the enqueue says otherwise; must not be empty | `default` |
 | `max_attempts = 5` | Attempts before the job is marked failed, including the first and any interrupted by a crash | 10 |
 | `timeout = 30` | Longest time one attempt may run, in seconds | none |
 | `priority = "high"` | Which due jobs of the queue run first: `"low"`, `"normal"`, `"high"` or `"urgent"`; see [Priority](#priority) | `"normal"` |
@@ -200,15 +200,16 @@ impl Job for SendEmail {
 | `cron = "..."`, `timezone = "..."` | Makes the job [recurring](#declared-in-code); the time zone is only valid with `cron` | none, `UTC` |
 | `missed = "skip"` | What the scheduler does with a run it finds more than a minute overdue: `"once"` enqueues one catch-up run, `"skip"` none; only valid with `cron`; see [Missed runs](#missed-runs) | `"once"` |
 | `fingerprint = true` | Enqueue with a [code fingerprint](#code-fingerprints) and run only jobs of the same build | `false` |
-| `crate = "..."` | Path at which the generated code reaches jalari, for crates that use it through another crate; see [Using jalari through another crate](#using-jalari-through-another-crate) | `"::jalari"` |
+| `crate = ::path` | Path at which the generated code reaches jalari, written as a path or as a string literal, for crates that use it through another crate; see [Using jalari through another crate](#using-jalari-through-another-crate) | `::jalari` |
 
 `name`, `max_attempts`, `timeout`, `priority` and `aliases` set the `Job` constants `NAME`,
 `MAX_ATTEMPTS`, `TIMEOUT`, `PRIORITY` and `ALIASES`. Declaring a constant in the impl instead,
 as 0.6 did, still works; setting one both ways is a compile error, and a timeout below one
 second needs `const TIMEOUT` in the impl. `#[jalari::job]` rejects an empty name, a
 `max_attempts` below 1, a zero timeout or one above `i32::MAX` milliseconds, and an alias that
-is empty, equals the name or repeats, at compile time. A struct that is not a plain path, such
-as a generic one, needs `name`.
+is empty, equals the name or repeats, at compile time. It also rejects an empty `queue` and a
+`cron` job whose struct does not implement `Default`, each with the error on that argument. A
+struct that is not a plain path, such as a generic one, needs `name`.
 
 Two items stay in the impl. `type Context` is the value `run` receives from the worker's
 middleware, `()` by default; see [Context and middleware](#context-and-middleware).
@@ -353,7 +354,7 @@ struct SendInvoice {
     invoice_id: i64,
 }
 
-#[platform::__jalari::job(name = "send_invoice", crate = "::platform::__jalari")]
+#[platform::__jalari::job(name = "send_invoice", crate = ::platform::__jalari)]
 impl Job for SendInvoice {
     async fn run(self) -> JobResult {
         Ok(())
@@ -361,23 +362,53 @@ impl Job for SendInvoice {
 }
 ```
 
-`crate` takes a path as a string literal, written as the defining crate would write it, and
-every path the attribute generates starts with it. A value that is not a path, or a second
-`crate`, is a compile error. Being a string, it cannot hold `$crate`, so a `macro_rules!`
-wrapper names the re-export by its absolute path. An attribute macro of `platform`'s own can
-emit `#[::platform::__jalari::job(.., crate = "::platform::__jalari")]`, so that the crates
-that define jobs never write the path.
+`crate` takes a path, written as the defining crate would write it, and every path the
+attribute generates starts with it. A string literal holding the path, such as
+`"::platform::__jalari"`, works the same. A value that is not a plain path, or a second
+`crate`, is a compile error.
+
+So that the crates that define jobs never write the path, `platform` can export a wrapper that
+passes `$crate`:
+
+```rust
+#[macro_export]
+macro_rules! job {
+    (($($arguments:tt)*) $($item:tt)*) => {
+        #[$crate::__jalari::job(crate = $crate::__jalari, $($arguments)*)]
+        $($item)*
+    };
+}
+```
+
+```rust
+platform::job! {
+    (name = "send_invoice")
+    impl Job for SendInvoice {
+        async fn run(self) -> JobResult {
+            Ok(())
+        }
+    }
+}
+```
 
 The [code fingerprint](#code-fingerprints) reads every path through `platform::__jalari` as the
 same path through `jalari`, so moving a fingerprinted job behind `platform`, renaming `platform`
 or bumping its version leaves waiting jobs runnable, as long as the job reaches `platform` only
 through `__jalari`.
 
+The fingerprint does not look inside a macro call, so a job declared through the wrapper with
+`fingerprint = true` is fingerprinted with every item of its crate and of its `path`
+dependencies, as when the compiler does not report the job's file. A fingerprinted job of the
+same crate that names an item the call mentions, such as `Job` or `JobResult`, also covers the
+whole call, so editing a job declared through the wrapper changes the fingerprints of such jobs
+too.
+
 The repository's [`tests/facade`](../tests/facade) holds such a pair: `facade` re-exports jalari,
 and `facade-consumer` defines a plain and a recurring job through it without depending on
 jalari. `cargo test -p facade-consumer` builds them, checks every argument of the recurring
 job's attribute, checks that its fingerprint equals that of the same job written against jalari,
-and with `DATABASE_URL` set runs the plain job on a worker.
+declares a third job through `facade::job!`, and with `DATABASE_URL` set runs the plain job and
+the third one on a worker.
 
 ## Enqueueing
 
