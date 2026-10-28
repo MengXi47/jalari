@@ -5,26 +5,9 @@ use facade::__jalari::recurring::Missed;
 use facade::__jalari::sqlx::postgres::PgPoolOptions;
 use facade::__jalari::sqlx::{self, AssertSqlSafe};
 use facade::__jalari::{
-    CancellationToken, Job, JobResult, JobState, Priority, Schema, Worker, WorkerConfig, admin,
-    enqueue, init,
+    CancellationToken, JobState, Priority, Schema, Worker, WorkerConfig, admin, enqueue, init,
 };
-use facade_consumer::{ECHOED, Echo};
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-struct WrappedEcho {
-    word: String,
-}
-
-facade::job! {
-    (name = "facade_wrapped_echo")
-    impl Job for WrappedEcho {
-        async fn run(self) -> JobResult {
-            ECHOED.lock().unwrap().push(self.word);
-            Ok(())
-        }
-    }
-}
+use facade_consumer::{ECHOED, Echo, WrappedEcho};
 
 #[test]
 fn test_jobs_register_through_the_facade() {

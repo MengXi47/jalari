@@ -23,6 +23,23 @@ impl Job for Echo {
     }
 }
 
+/// Appends its word to [`ECHOED`], declared through the `facade::job!` wrapper.
+#[derive(Serialize, Deserialize)]
+pub struct WrappedEcho {
+    /// The word to append.
+    pub word: String,
+}
+
+facade::job! {
+    (name = "facade_wrapped_echo", fingerprint = true)
+    impl Job for WrappedEcho {
+        async fn run(self) -> JobResult {
+            ECHOED.lock().unwrap().push(self.word);
+            Ok(())
+        }
+    }
+}
+
 /// A recurring job that sets every argument of the attribute.
 #[derive(Serialize, Deserialize, Default)]
 pub struct Nightly;

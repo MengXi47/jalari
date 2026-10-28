@@ -46,6 +46,19 @@ impl Job for Nightly {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct WrappedEcho {
+    pub word: String,
+}
+
+#[jalari::job(name = "direct_wrapped_echo", fingerprint = true)]
+impl Job for WrappedEcho {
+    async fn run(self) -> JobResult {
+        ECHOED.lock().unwrap().push(self.word);
+        Ok(())
+    }
+}
+
 #[test]
 fn test_fingerprint_equals_the_same_job_written_against_jalari() {
     let fingerprint = |name: &str| {
@@ -56,4 +69,16 @@ fn test_fingerprint_equals_the_same_job_written_against_jalari() {
     let through_facade = fingerprint(<facade_consumer::Nightly as Job>::NAME);
     assert_eq!(through_facade.map(str::len), Some(32));
     assert_eq!(through_facade, fingerprint(<Nightly as Job>::NAME));
+}
+
+#[test]
+fn test_wrapper_job_fingerprint_equals_the_same_job_written_against_jalari() {
+    let fingerprint = |name: &str| {
+        jalari::__private::find(name)
+            .unwrap_or_else(|| panic!("{name} is registered"))
+            .fingerprint
+    };
+    let through_wrapper = fingerprint(<facade_consumer::WrappedEcho as Job>::NAME);
+    assert_eq!(through_wrapper.map(str::len), Some(32));
+    assert_eq!(through_wrapper, fingerprint(<WrappedEcho as Job>::NAME));
 }
