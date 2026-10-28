@@ -10,6 +10,7 @@ reference with every option is on docs.rs; this guide shows how the pieces fit t
 - [Recurring jobs](#recurring-jobs)
 - [Running workers](#running-workers)
 - [Stopping, restarting and cancelling](#stopping-restarting-and-cancelling)
+- [Progress and steps](#progress-and-steps)
 - [Pausing queues](#pausing-queues)
 - [Context and middleware](#context-and-middleware)
 - [Deployment](#deployment)
@@ -148,6 +149,13 @@ indexes, on `parent_id`, `root_id` and `expires_at`; each build reads the job ta
 to the job table wait until the upgrade commits. [Upgrading from 0.6](#upgrading-from-06)
 lists the steps for both versions.
 
+Version 10 ships with 0.8.0. It creates the `job_step` table that records [steps](#steps), adds
+the `progress_seq` column to `job_control`, which numbers the copies of a job's progress, and
+the `missed` column to the `recurring` table for the [missed-run policy](#missed-runs). Both
+columns have a constant default, so adding them is instant; the foreign key from `job_step` to
+the job table blocks writes to the job table until the upgrade commits, normally for a fraction
+of a second. [Upgrading from 0.7](#upgrading-from-07) lists what to upgrade first.
+
 ## Defining jobs
 
 A job is a serializable struct with an `impl Job` inside `#[jalari::job]`. Its fields are the
@@ -190,6 +198,7 @@ impl Job for SendEmail {
 | `aliases = ["old_name"]` | Earlier names whose waiting jobs and schedules this type still runs; see [Renaming a job](#renaming-a-job) | none |
 | `checkpoints = true` | Declares that the job reaches [checkpoints](#checkpoints) regularly, so an abort at `stop_timeout` or `shutdown_timeout` is logged as an error | `false` |
 | `cron = "..."`, `timezone = "..."` | Makes the job [recurring](#declared-in-code); the time zone is only valid with `cron` | none, `UTC` |
+| `missed = "skip"` | What the scheduler does with a run it finds more than a minute overdue: `"once"` enqueues one catch-up run, `"skip"` none; only valid with `cron`; see [Missed runs](#missed-runs) | `"once"` |
 | `fingerprint = true` | Enqueue with a [code fingerprint](#code-fingerprints) and run only jobs of the same build | `false` |
 | `crate = "..."` | Path at which the generated code reaches jalari, for crates that use it through another crate; see [Using jalari through another crate](#using-jalari-through-another-crate) | `"::jalari"` |
 
@@ -217,6 +226,8 @@ queue, attempt number and `max_attempts`, when the job was created and when this
 due, its priority, the previous attempt's error, and the job that enqueued it.
 
 A job can run more than once if its worker dies mid-run, so keep `run` idempotent.
+[Progress and steps](#progress-and-steps) shows how a job records how far it got, so the next
+run does not repeat its effects.
 
 ### Renaming a job
 
@@ -284,9 +295,10 @@ The fingerprint covers:
 Formatting, comments and code that the job cannot reach leave it unchanged. The same sources
 and the same `Cargo.lock` give the same fingerprint on every machine and in every directory.
 
-The name, the aliases, the priority, `RETRY_POLICY`, the `checkpoints` flag and the `crate` path
-are left out, in the attribute and in the impl, so renaming a job with an alias, changing its priority or
-retry policy, or declaring checkpoints leaves waiting jobs runnable by the new build.
+The name, the aliases, the priority, `RETRY_POLICY`, the `checkpoints` flag, the `missed`
+policy and the `crate` path are left out, in the attribute and in the impl, so renaming a job
+with an alias, changing its priority, retry policy or missed-run policy, or declaring
+checkpoints leaves waiting jobs runnable by the new build.
 `max_attempts` and `timeout` are covered in either form, and the two forms hash differently:
 moving `const MAX_ATTEMPTS: i32 = 4` into `max_attempts = 4` changes the fingerprint.
 
@@ -352,6 +364,11 @@ define jobs never write the path.
 The [code fingerprint](#code-fingerprints) leaves `crate` out. The attribute's own path and the
 `use` declarations that name jalari are code like any other, so moving a fingerprinted job from
 `jalari` to `platform` changes its fingerprint once, as any edit of its code does.
+
+The repository's [`tests/facade`](../tests/facade) holds such a pair: `facade` re-exports jalari,
+and `facade-consumer` defines a plain and a recurring job through it without depending on
+jalari. `cargo test -p facade-consumer` builds them, checks every argument of the recurring
+job's attribute, and with `DATABASE_URL` set runs the plain job on a worker.
 
 ## Enqueueing
 
@@ -663,7 +680,8 @@ jalari::recurring::add_or_update("digest:sales", every_five_days, &digest).await
   last day, and later months use the anchor's day again: every month from January 31st runs
   on February 28th or 29th, then on March 31st.
 - The next run is computed directly from the anchor, never by stepping through the missed
-  rounds, so a long outage costs nothing.
+  rounds, so a long outage costs nothing. A run found overdue fires once, or not at all under
+  the `Skip` policy for [missed runs](#missed-runs).
 
 ### End conditions
 
@@ -1042,16 +1060,110 @@ aborted at `stop_timeout` or `shutdown_timeout`, the worker logs an error that s
 went without a checkpoint, or that it kept running after a checkpoint asked it to stop. The
 flag changes nothing else.
 
+### Blocking code
+
+Blocking code belongs in `spawn_blocking`, and it can stop itself there. `jalari::interrupted()`
+and `jalari::current_job()` read a task-local that `spawn_blocking` does not carry, so they do
+not work inside it. Take the run handle in the job's own task, move it in, and poll
+`is_interrupted()` between pieces of work:
+
+```rust
+let run = jalari::current_job().expect("inside a job");
+let polled = run.clone();
+let finished = tokio::task::spawn_blocking(move || {
+    for chunk in chunks {
+        if polled.is_interrupted() {
+            return false;
+        }
+        process(chunk);
+    }
+    true
+})
+.await?;
+if !finished {
+    return Err(run.interrupted().await);
+}
+```
+
+`is_interrupted()` turns `true` when `interrupted()` would complete: on a stop, a cancel, a
+shutdown or a lost job, and once the attempt has timed out and been aborted. It never turns
+back. Once the loop has returned, return the error of `run.interrupted()`, which is ready at
+once, so a stop, a cancel or a shutdown settles the job as it does for async code. In jalari's tests such a loop, polling
+every 10 milliseconds, saw a stop about 1.0 second after the request and a 1 second timeout 1.0
+seconds after the attempt started. The [`blocking_work`](../jalari/examples/blocking_work.rs)
+example stops such a loop and times one out.
+
+### What each call does
+
+| Call | Waiting job | Running job | Stopped job | Finished job |
+|---|---|---|---|---|
+| `stop` | `Stopped` at once | `Requested` | `Stopped` | `Finished` |
+| `cancel` | `Cancelled` at once | `Requested` | `Cancelled` | `Finished` |
+| `restart` | `NotStopped` | `NotStopped` | `Restarted` | `NotStopped` |
+
+The calls return a `jalari::StopOutcome`, a `jalari::CancelOutcome` and a
+`jalari::RestartOutcome`. An id with no job returns `NotFound`. A job whose worker died less
+than about 8 seconds ago counts as running.
+
+A running job sees a request within about a second. How it ends:
+
+| The job | It ends as |
+|---|---|
+| Returns the checkpoint's error, or the error from `interrupted()` | `stopped` (or `deleted` for a cancel) with the progress it saved last |
+| Reaches no checkpoint within `stop_timeout` | aborted at its current `.await`, then `stopped` with the last saved progress; the worker waits up to a second for the aborted code to be dropped first |
+| Returns any other error, panics or times out | `stopped` (or `deleted`), not retried |
+| Returns `Ok` first | `succeeded`; a later `stop` returns `Finished` |
+| Its worker crashes | `stopped` (or `deleted`) by another worker 6 to 8 seconds later; it never runs again |
+
+`stop` and `cancel` are safe to repeat and report the current state, so call them again until
+they stop returning `Requested`. A cancel wins over a stop that is still pending.
+
+A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snooze time, and
+`jalari::admin::run_now` after the restart makes it due at once. A stopped job past its
+[expiry](#expiry) cannot be restarted: `restart` answers `Expired`.
+
+### What a stop keeps and releases
+
+- A stop or cancel never counts as an attempt. A restarted job has the attempts it had before
+  the stop and continues from its saved progress.
+- A stopped job keeps its `job_key`: enqueueing the same key returns `Kept`, even with
+  `Replace`, and a recurring schedule skips its runs until the job is restarted or cancelled.
+- A pending stop or cancel beats `Replace` too: while `stop` or `cancel` returns `Requested`,
+  enqueueing the same key with `Replace` returns `Kept`, and the request still applies.
+- A stopped job releases its `queue_key`, so other jobs with the key can run.
+- Housekeeping never deletes stopped jobs. A cancelled job is `deleted` and frees its
+  `job_key`; housekeeping removes it after `deleted_retention`.
+
+### Limits
+
+- The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
+  work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
+  outlive the stop, as with `timeout` and shutdown aborts. After a `stop_timeout` or `timeout`
+  abort, the worker waits up to a second for the job's task to be dropped, so drop guards have
+  run before the outcome is recorded. A job that never yields cannot be dropped: its outcome is
+  recorded a second after the abort, and the stop takes up to `stop_timeout` plus a second.
+  [Blocking code](#blocking-code) shows how code in `spawn_blocking` stops itself.
+- A job a worker aborted at shutdown keeps waiting the 7 seconds after the abort when it is
+  stopped and restarted or retried in between.
+
+## Progress and steps
+
+A job that a crash, a retry, a takeover or a restart interrupts runs again from the start,
+unless it recorded how far it got. [Checkpoints](#checkpoints) keep a cursor in memory and
+write it every few seconds; the calls below record a cursor or a step's result before the job
+goes on, so the next run neither loses it nor repeats the work behind it.
+
+| Call | What a crash keeps | Cost | Use it for |
+|---|---|---|---|
+| `checkpoint.save(&progress)` | the progress, up to about 6 seconds behind | none | a loop whose units may run again without harm |
+| `checkpoint.save_now(&progress).await?` | the progress, stored before the call returns | one short transaction | a loop whose units have effects outside the database, such as a page sent to another system |
+| `checkpoint.save_in(&mut transaction, &progress).await?` | the progress, committed with your rows | one statement in your transaction | a loop that writes to tables in the database jalari uses |
+| `jalari::step(key, f).await?` | each step's output, stored once `f` returns | two short transactions | a few named effects whose results later steps need |
+
 ### Durable progress
 
 `checkpoint.save` keeps its copy in memory, so a crash loses the last few seconds of progress
-and the job repeats that work. Two calls store the copy before the job goes on:
-
-| Call | The copy is stored | Cost | Use it when a unit of work |
-|---|---|---|---|
-| `checkpoint.save(&progress)` | by the worker within about 6 seconds | none | may run again without harm |
-| `checkpoint.save_now(&progress).await?` | before the call returns | one short transaction | has effects outside the database, such as a page sent to another system |
-| `checkpoint.save_in(&mut transaction, &progress).await?` | when your transaction commits | one statement in it | writes to tables in the database jalari uses |
+and the job repeats that work. `save_now` and `save_in` store the copy before the job goes on:
 
 ```rust
 let (saved, checkpoint) = jalari::resume::<Cursor>()?;
@@ -1082,6 +1194,9 @@ effects an idempotency key.
   `save_now` then keeps the copy for the stopped state without writing; `save_in` writes first
   and then returns the error, so the transaction rolls back with the unit it carried when you
   propagate the error.
+- **What a crash loses.** At most about 6 seconds of progress saved with `save`: one second
+  before a copy is kept, and five before it is written. A copy for which `save_now` returned,
+  or whose `save_in` transaction committed, is never lost.
 - **`save_now`** waits at most 2 seconds for a lock. A database error means the copy may have
   been stored; the worker writes it again later. A missing control row is a permanent error: the
   pool given to `jalari::init` reaches another database or schema than the worker.
@@ -1125,13 +1240,6 @@ async fn run(self) -> JobResult {
 `jalari::step(key, f)` runs `f` and records its output under `key` for the job. Every later run
 of the job, after a retry, a crash and takeover, a restart or `admin::retry`, gets the recorded
 output back without running `f`. So when the receipt fails, the retry does not charge again.
-
-| Call | What a crash keeps | Use it for |
-|---|---|---|
-| `checkpoint.save` | the progress, up to about 6 seconds behind | a loop whose units may run again without harm |
-| `checkpoint.save_now` | the progress, stored before the call returns | a loop whose units have effects outside the database |
-| `checkpoint.save_in` | the progress, committed with your rows | a loop that writes to the database jalari uses |
-| `jalari::step` | each step's output, stored once `f` returns | a few named effects whose results later steps need |
 
 **A step runs at least once.** The output is stored after `f` returns. When the worker dies
 while `f` runs, or after the effect and before the output is stored, the next run of the job
@@ -1226,95 +1334,6 @@ record, and prints and clears the steps.
 - During a rolling upgrade from 0.7, a `Replace` from a 0.7 process keeps the job's steps, so the
   replaced job gets the old payload's outputs. Upgrade those processes first, as
   [Upgrading from 0.7](#upgrading-from-07) says.
-
-### What each call does
-
-| Call | Waiting job | Running job | Stopped job | Finished job |
-|---|---|---|---|---|
-| `stop` | `Stopped` at once | `Requested` | `Stopped` | `Finished` |
-| `cancel` | `Cancelled` at once | `Requested` | `Cancelled` | `Finished` |
-| `restart` | `NotStopped` | `NotStopped` | `Restarted` | `NotStopped` |
-
-The calls return a `jalari::StopOutcome`, a `jalari::CancelOutcome` and a
-`jalari::RestartOutcome`. An id with no job returns `NotFound`. A job whose worker died less
-than about 8 seconds ago counts as running.
-
-A running job sees a request within about a second. How it ends:
-
-| The job | It ends as |
-|---|---|
-| Returns the checkpoint's error, or the error from `interrupted()` | `stopped` (or `deleted` for a cancel) with the progress it saved last |
-| Reaches no checkpoint within `stop_timeout` | aborted at its current `.await`, then `stopped` with the last saved progress; the worker waits up to a second for the aborted code to be dropped first |
-| Returns any other error, panics or times out | `stopped` (or `deleted`), not retried |
-| Returns `Ok` first | `succeeded`; a later `stop` returns `Finished` |
-| Its worker crashes | `stopped` (or `deleted`) by another worker 6 to 8 seconds later; it never runs again |
-
-`stop` and `cancel` are safe to repeat and report the current state, so call them again until
-they stop returning `Requested`. A cancel wins over a stop that is still pending.
-
-A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snooze time, and
-`jalari::admin::run_now` after the restart makes it due at once. A stopped job past its
-[expiry](#expiry) cannot be restarted: `restart` answers `Expired`.
-
-### What a stop keeps and releases
-
-- A stop or cancel never counts as an attempt. A restarted job has the attempts it had before
-  the stop and continues from its saved progress.
-- A stopped job keeps its `job_key`: enqueueing the same key returns `Kept`, even with
-  `Replace`, and a recurring schedule skips its runs until the job is restarted or cancelled.
-- A pending stop or cancel beats `Replace` too: while `stop` or `cancel` returns `Requested`,
-  enqueueing the same key with `Replace` returns `Kept`, and the request still applies.
-- A stopped job releases its `queue_key`, so other jobs with the key can run.
-- Housekeeping never deletes stopped jobs. A cancelled job is `deleted` and frees its
-  `job_key`; housekeeping removes it after `deleted_retention`.
-
-### Blocking code
-
-Blocking code belongs in `spawn_blocking`, and it can stop itself there. `jalari::interrupted()`
-and `jalari::current_job()` read a task-local that `spawn_blocking` does not carry, so they do
-not work inside it. Take the run handle in the job's own task, move it in, and poll
-`is_interrupted()` between pieces of work:
-
-```rust
-let run = jalari::current_job().expect("inside a job");
-let polled = run.clone();
-let finished = tokio::task::spawn_blocking(move || {
-    for chunk in chunks {
-        if polled.is_interrupted() {
-            return false;
-        }
-        process(chunk);
-    }
-    true
-})
-.await?;
-if !finished {
-    return Err(run.interrupted().await);
-}
-```
-
-`is_interrupted()` turns `true` when `interrupted()` would complete: on a stop, a cancel, a
-shutdown or a lost job, and once the attempt has timed out and been aborted. It never turns
-back. Then return the error of `run.interrupted()`, which is ready at once, so a stop, a cancel
-or a shutdown settles the job as it does for async code. In jalari's tests such a loop, polling
-every 10 milliseconds, saw a stop about 1.0 second after the request and a 1 second timeout 1.0
-seconds after the attempt started. The [`blocking_work`](../jalari/examples/blocking_work.rs)
-example stops such a loop and times one out.
-
-### Limits
-
-- The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
-  work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
-  outlive the stop, as with `timeout` and shutdown aborts. After a `stop_timeout` or `timeout`
-  abort, the worker waits up to a second for the job's task to be dropped, so drop guards have
-  run before the outcome is recorded. A job that never yields cannot be dropped: its outcome is
-  recorded a second after the abort, and the stop takes up to `stop_timeout` plus a second.
-  [Blocking code](#blocking-code) shows how code in `spawn_blocking` stops itself.
-- A crash loses at most about 6 seconds of progress saved with `save`: one second before a
-  copy is kept, and five before it is written. A copy for which `save_now` returned, or whose
-  `save_in` transaction committed, is never lost.
-- A job a worker aborted at shutdown keeps waiting the 7 seconds after the abort when it is
-  stopped and restarted or retried in between.
 
 ## Pausing queues
 
@@ -1601,8 +1620,10 @@ otherwise, but it cannot catch every pooler configuration.
 
 A job's writes to your own tables commit separately from jalari marking it done. If the worker
 dies in between, the job runs again, so make those writes idempotent, for example with a table
-keyed by `jalari::current_job()` id in the same transaction. When the job tables and your data
-live in different databases, enqueueing inside your transaction is no longer possible either.
+keyed by `jalari::current_job()` id in the same transaction, or commit each unit's writes
+together with its progress through [`checkpoint.save_in`](#durable-progress). When the job
+tables and your data live in different databases, enqueueing inside your transaction and
+`save_in` are no longer possible either.
 
 ## Deployment
 
@@ -1957,4 +1978,5 @@ cargo run -p jalari --example split_control -- stranded
 | [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job, lists the jobs no live worker can run (`stranded`) or releases a task's jobs to any build (`release <task>`) from yet another process. `vacuum_tables` is the only job without `fingerprint = true`; edit `common/jobs.rs` and rebuild only `split_worker` to see the other jobs wait for the build that enqueued them |
 
 The examples use `jalari::Schema::default()`, so they share the `jalari` schema of the
-database they run against.
+database they run against. [Using jalari through another crate](#using-jalari-through-another-crate)
+points at the facade crates, which run as a test rather than an example.
