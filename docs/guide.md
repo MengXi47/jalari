@@ -737,7 +737,9 @@ jalari::recurring::add_or_update("metrics:eu", every_five_minutes, &sample).awai
   `update_schedule`, so a plain `Cron` or `Interval` sets it back to `Once`. Changing only the
   policy keeps the run count and the next run. `RecurringInfo::missed` shows it.
 
-The `missed_runs` example stops the scheduler past the grace and shows both policies.
+The [`missed_runs`](../jalari/examples/missed_runs.rs) example makes two hourly schedules, one
+per policy, 3 hours overdue and prints what each enqueued, then shows a run 10 seconds late
+firing under `Skip`.
 
 ## Running workers
 
@@ -1924,6 +1926,7 @@ cargo run -p jalari --example migrate
 cargo run -p jalari --example basic
 cargo run -p jalari --example outcomes
 cargo run -p jalari --example queues
+cargo run -p jalari --example missed_runs
 cargo run -p jalari --example stop_restart
 cargo run -p jalari --example blocking_work
 cargo run -p jalari --example middleware
@@ -1939,6 +1942,7 @@ cargo run -p jalari --example split_control -- stranded
 | [`basic`](../jalari/examples/basic.rs) | Defining, enqueueing and running jobs in one process: errors and retries, `job_key` with `KeepExisting` and `Replace`, `queue_key`, delays, transactions, recurring schedules, `current_job`, `interrupted`, a job that reschedules itself with `enqueue_on_success_with` under its own `job_key`, cluster settings and monitoring. It runs until Ctrl-C |
 | [`outcomes`](../jalari/examples/outcomes.rs) | Every way an attempt ends, printed by a middleware's `finished` hook: `retry_after` for a rate limit, a per-job `RETRY_POLICY` that runs out of attempts, `snooze` on the same attempt, `JobError::discard`, and a job that expires with `expire_after` before it runs next to one with `expires_at` that runs in time. The jobs read `created_at`, `scheduled_at`, `priority` and `last_error` from `current_job`, the middleware marks the last attempt with `is_last_attempt`, and the run ends with the job list and the queue's `throughput`. It exits when done |
 | [`queues`](../jalari/examples/queues.rs) | `pause_queue`, `paused_queues` and `resume_queue`; `enqueue_many` with a key repeated in the batch, and `enqueue_many_in` inside a transaction; priorities from the `priority` attribute and from `EnqueueOptions::priority`, moved with `set_priority` while the queue is paused, then run in priority order; `queue_key_limit` letting two jobs of one key run at once; and a job that enqueues children and a grandchild, listed with `JobFilter::parent` and `JobFilter::root`. It exits when done |
+| [`missed_runs`](../jalari/examples/missed_runs.rs) | Two hourly runtime schedules built with `Schedule::missed`, one `Missed::Once` and one `Missed::Skip`, pushed 3 hours overdue in SQL: `Once` enqueues one catch-up run and `Skip` none, then a run 10 seconds late fires under `Skip`. Each step prints the schedules' `run_count`, `last_run_at`, `next_run_at` and the jobs they enqueued. It exits when done |
 | [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress and `checkpoints = true`, a job blocked in one long sleep that `interrupted()` stops within a second, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
 | [`blocking_work`](../jalari/examples/blocking_work.rs) | A loop in `spawn_blocking` that polls `JobRun::is_interrupted` between chunks: run to the end, stopped with `jalari::stop` and noticing it within a second, and ended by a 2 second `timeout`. It exits when done |
 | [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, a job that passes its context to the jobs it enqueues, the `finished` hook with `is_last_attempt`, and a job stored under an old name that runs through `aliases`. It exits when done |
