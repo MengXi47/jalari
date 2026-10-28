@@ -295,12 +295,18 @@ The fingerprint covers:
 Formatting, comments and code that the job cannot reach leave it unchanged. The same sources
 and the same `Cargo.lock` give the same fingerprint on every machine and in every directory.
 
-The name, the aliases, the priority, `RETRY_POLICY`, the `checkpoints` flag, the `missed`
-policy and the `crate` path are left out, in the attribute and in the impl, so renaming a job
-with an alias, changing its priority, retry policy or missed-run policy, or declaring
-checkpoints leaves waiting jobs runnable by the new build.
+The name, the aliases, the priority, `RETRY_POLICY`, the `checkpoints` flag and the `missed`
+policy are left out, in the attribute and in the impl, so renaming a job with an alias, changing
+its priority, retry policy or missed-run policy, or declaring checkpoints leaves waiting jobs
+runnable by the new build.
 `max_attempts` and `timeout` are covered in either form, and the two forms hash differently:
 moving `const MAX_ATTEMPTS: i32 = 4` into `max_attempts = 4` changes the fingerprint.
+
+With [`crate`](#using-jalari-through-another-crate), the `crate` path is left out too, and so are
+the job attribute's own path and every path that reaches jalari through the `crate` path: such a
+path is hashed as the same path through `jalari`, and the crate it goes through is neither
+analysed nor pinned for it. When the job names that crate by another path, such as
+`platform::billing::rates`, the crate is covered like any other dependency.
 
 The analysis matches names rather than resolving paths, so it errs toward a change. Editing a
 function with the same name as one the job calls, in any module, changes the fingerprint too.
@@ -362,14 +368,16 @@ wrapper names the re-export by its absolute path. An attribute macro of `platfor
 emit `#[::platform::__jalari::job(.., crate = "::platform::__jalari")]`, so that the crates
 that define jobs never write the path.
 
-The [code fingerprint](#code-fingerprints) leaves `crate` out. The attribute's own path and the
-`use` declarations that name jalari are code like any other, so moving a fingerprinted job from
-`jalari` to `platform` changes its fingerprint once, as any edit of its code does.
+The [code fingerprint](#code-fingerprints) reads every path through `platform::__jalari` as the
+same path through `jalari`, so moving a fingerprinted job behind `platform`, renaming `platform`
+or bumping its version leaves waiting jobs runnable, as long as the job reaches `platform` only
+through `__jalari`.
 
 The repository's [`tests/facade`](../tests/facade) holds such a pair: `facade` re-exports jalari,
 and `facade-consumer` defines a plain and a recurring job through it without depending on
 jalari. `cargo test -p facade-consumer` builds them, checks every argument of the recurring
-job's attribute, and with `DATABASE_URL` set runs the plain job on a worker.
+job's attribute, checks that its fingerprint equals that of the same job written against jalari,
+and with `DATABASE_URL` set runs the plain job on a worker.
 
 ## Enqueueing
 

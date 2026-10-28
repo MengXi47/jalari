@@ -45,7 +45,8 @@ use syn::{
 ///   `stop_timeout` or `shutdown_timeout` is then logged as an error. `false` when omitted
 /// * `crate` - Path, as a string literal, at which the generated code reaches jalari, such as
 ///   `"::my_facade::__jalari"` for a crate that re-exports jalari as `__jalari`; `"::jalari"`
-///   when omitted. Lets a crate that depends only on the re-exporting crate define jobs
+///   when omitted. Lets a crate that depends only on the re-exporting crate define jobs. The
+///   code fingerprint reads every path through it as the same path through `jalari`
 ///
 /// `name`, `max_attempts`, `timeout`, `priority` and `aliases` are an alternative to declaring
 /// the constant in the impl. Setting one both ways is a compile error.
@@ -79,6 +80,12 @@ use syn::{
 /// with its old name in `aliases`, or changing its priority or retry policy, therefore leaves
 /// waiting jobs runnable by the new build. `MAX_ATTEMPTS` and `TIMEOUT` are covered in either
 /// form.
+///
+/// With `crate`, the attribute's own path and every path that starts with the `crate` path are
+/// hashed as the same paths through `jalari`, and the crate they go through is not pinned for
+/// them. Moving a job behind a crate that re-exports jalari, renaming that crate or bumping its
+/// version therefore leaves waiting jobs runnable, as long as the job reaches that crate only
+/// through the re-export.
 ///
 /// Every enqueue stores the fingerprint with the job, and a worker takes a job only when the
 /// stored fingerprint is empty or equals its own build's. A job enqueued by another build of
