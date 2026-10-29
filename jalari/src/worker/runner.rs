@@ -15,6 +15,7 @@ use super::middleware::ErasedMiddleware;
 use super::ownership::{Target, interrupt};
 use super::pauses::{Pauses, watch_pauses};
 use super::runs::RunBook;
+use super::slot::Slot;
 use super::{housekeeping, listener, reaper, scheduler};
 use crate::init::Config;
 use crate::job::registry::{CronRegistration, JobRegistration};
@@ -214,11 +215,12 @@ impl Worker {
             shutdown.clone(),
         ));
         for queue in &self.queues {
-            for _ in 0..queue.concurrency {
+            let name: Arc<str> = Arc::from(queue.name.as_str());
+            for index in 0..queue.concurrency {
                 tasks.spawn(work_loop(
                     Arc::clone(&self.shared),
                     Arc::clone(&pauses),
-                    queue.name.clone(),
+                    Slot::new(Arc::clone(&name), index),
                     Arc::clone(&wakers.queues[&queue.name]),
                     registered.clone(),
                     shutdown.clone(),
@@ -262,12 +264,15 @@ impl Worker {
 async fn work_loop(
     shared: Arc<Shared>,
     pauses: Arc<Pauses>,
-    queue: String,
+    mut slot: Slot,
     waker: Arc<Notify>,
     mut current: Current,
     shutdown: CancellationToken,
 ) {
     while !shutdown.is_cancelled() {
+        let Some(vacant) = slot.vacate(&shutdown).await else {
+            return;
+        };
         let alive = current.borrow_and_update().clone();
         let Some(incarnation) = alive.filter(|incarnation| !incarnation.dead().is_cancelled())
         else {
@@ -281,16 +286,16 @@ async fn work_loop(
             }
             continue;
         };
-        if pauses.contains(&queue) {
+        if pauses.contains(vacant.queue()) {
             wait(&waker, &shutdown, shared.settings.poll_interval).await;
             continue;
         }
-        match shared.process_next(&incarnation, &queue, &waker).await {
+        match shared.process_next(&incarnation, vacant, &waker).await {
             Ok(true) => {}
             Ok(false) if incarnation.dead().is_cancelled() => {}
             Ok(false) => wait(&waker, &shutdown, shared.settings.poll_interval).await,
             Err(e) => {
-                warn!(queue = %queue, error = %e, "failed to process a job");
+                warn!(queue = %slot.queue(), error = %e, "failed to process a job");
                 wait(&waker, &shutdown, ERROR_BACKOFF).await;
             }
         }

@@ -15,6 +15,7 @@ mod retry;
 mod runner;
 mod runs;
 mod scheduler;
+mod slot;
 
 pub(crate) use ownership::INTERRUPTED;
 

@@ -1,10 +1,8 @@
-use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info_span, warn};
 
 use super::close::{Closing, Ending, Outcome, answered, decide, refused};
@@ -13,6 +11,7 @@ use super::middleware::{Finished, JobMeta, Next, report_finished};
 use super::ownership::{Claimed, Closed, close};
 use super::runner::Shared;
 use super::runs::{Hold, PendingClaim, Registration};
+use super::slot::{Attempt, Cause, Vacant};
 use crate::enqueue::Columns;
 use crate::job::context::{self, Captured};
 use crate::job::registry::{ContextKey, JobRegistration};
@@ -24,26 +23,6 @@ const CLOSE_RETRY: Duration = Duration::from_secs(1);
 const CLOSE_WINDOW: Duration = Duration::from_secs(30);
 const CLOSE_BACKOFF: Duration = Duration::from_millis(100);
 const CLOSE_BACKOFF_LIMIT: Duration = Duration::from_millis(500);
-const ABORT_WAIT: Duration = Duration::from_secs(1);
-
-struct AbortOnDrop(JoinHandle<JobResult>);
-
-impl AbortOnDrop {
-    async fn abort_and_wait(&mut self) {
-        self.0.abort();
-        if tokio::time::timeout(ABORT_WAIT, &mut self.0).await.is_err() {
-            warn!(
-                "the aborted job did not stop within {ABORT_WAIT:?}, recording its outcome anyway"
-            );
-        }
-    }
-}
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 struct Report {
     meta: Arc<JobMeta>,
@@ -55,17 +34,17 @@ impl Shared {
     pub(super) async fn process_next(
         &self,
         incarnation: &Incarnation,
-        queue: &str,
+        slot: Vacant<'_>,
         waker: &Notify,
     ) -> Result<bool> {
         if self.job_shutdown.is_cancelled() {
             return Ok(false);
         }
-        let Some((claimed, pending)) = self.claim(incarnation, queue).await? else {
+        let Some((claimed, pending)) = self.claim(incarnation, slot.queue()).await? else {
             return Ok(false);
         };
         waker.notify_one();
-        self.execute(incarnation, claimed, pending, queue).await;
+        self.execute(incarnation, claimed, pending, slot).await;
         Ok(true)
     }
 
@@ -74,8 +53,9 @@ impl Shared {
         incarnation: &Incarnation,
         claimed: Claimed,
         pending: PendingClaim<'_>,
-        queue: &str,
+        slot: Vacant<'_>,
     ) {
+        let queue = Arc::clone(slot.queue());
         let span = info_span!(
             "job",
             job_id = claimed.hold.job_id,
@@ -107,14 +87,14 @@ impl Shared {
                     claimed.task
                 )))),
                 (Some(job), None) => {
-                    let job_run = claimed.job_run(job, queue, Arc::clone(&control));
+                    let job_run = claimed.job_run(job, &queue, Arc::clone(&control));
                     let meta = Arc::new(JobMeta::new(job_run.clone(), claimed.context.clone()));
                     report = Some(Report {
                         meta: Arc::clone(&meta),
                         needs: (job.context)(),
                         captured: Captured::from_stored(claimed.context.clone()),
                     });
-                    let mut attempt = claimed.spawn(self, job, job_run, meta);
+                    let mut attempt = claimed.spawn(self, job, job_run, meta, slot);
                     let shutdown_abort = ShutdownAbort {
                         control: &control,
                         window: Some(self.settings.shutdown_timeout),
@@ -142,7 +122,7 @@ impl Shared {
                         }
                     };
                     if let Ending::Aborted { .. } = ending {
-                        attempt.abort_and_wait().await;
+                        attempt.abort_and_wait(Cause::StopTimeout).await;
                     }
                     shutdown_abort.finished();
                     ending
@@ -366,13 +346,13 @@ impl Claimed {
     fn job_run(
         &self,
         registration: &'static JobRegistration,
-        queue: &str,
+        queue: &Arc<str>,
         control: Arc<RunControl>,
     ) -> JobRun {
         JobRun {
             id: JobId(self.hold.job_id),
             name: registration.name,
-            queue: Arc::from(queue),
+            queue: Arc::clone(queue),
             attempt: self.attempt,
             max_attempts: self.max_attempts,
             created_at: self.created_at,
@@ -386,13 +366,14 @@ impl Claimed {
         }
     }
 
-    fn spawn(
+    fn spawn<'s>(
         &self,
         shared: &Shared,
         registration: &'static JobRegistration,
         job_run: JobRun,
         meta: Arc<JobMeta>,
-    ) -> AbortOnDrop {
+        slot: Vacant<'s>,
+    ) -> Attempt<'s> {
         let captured = Captured::from_stored(self.context.clone());
         let middlewares = Arc::clone(&shared.middlewares);
         let payload = self.payload.clone();
@@ -408,41 +389,25 @@ impl Claimed {
             .await
         };
         let attempt = run::within(job_run, context::within(captured, attempt)).in_current_span();
-        AbortOnDrop(tokio::spawn(attempt))
+        slot.launch(self.hold.job_id, Box::pin(attempt))
     }
 
-    async fn join(&self, attempt: &mut AbortOnDrop, control: &RunControl) -> JobResult {
-        let joined = match self.timeout_ms {
+    async fn join(&self, attempt: &mut Attempt<'_>, control: &RunControl) -> JobResult {
+        let returned = match self.timeout_ms {
             Some(timeout_ms) => {
                 let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
-                match tokio::time::timeout(timeout, &mut attempt.0).await {
-                    Ok(joined) => joined,
+                match tokio::time::timeout(timeout, attempt.returned()).await {
+                    Ok(returned) => returned,
                     Err(_) => {
-                        attempt.abort_and_wait().await;
+                        attempt.abort_and_wait(Cause::TimedOut).await;
                         control.shutdown().cancel();
                         return Err(JobError::new(format!("timed out after {timeout:?}")));
                     }
                 }
             }
-            None => (&mut attempt.0).await,
+            None => attempt.returned().await,
         };
-        match joined {
-            Ok(result) => result,
-            Err(e) if e.is_panic() => Err(JobError::new(format!(
-                "panicked: {}",
-                panic_message(e.into_panic())
-            ))),
-            Err(e) => Err(JobError::new(format!("job task ended unexpectedly: {e}"))),
-        }
-    }
-}
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    match payload.downcast::<String>() {
-        Ok(message) => *message,
-        Err(payload) => payload
-            .downcast_ref::<&str>()
-            .map_or_else(|| "unknown panic payload".to_owned(), |s| (*s).to_owned()),
+        returned.into_result()
     }
 }
 
