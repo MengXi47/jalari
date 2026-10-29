@@ -31,6 +31,8 @@ const DROP_WORK: Duration = Duration::from_millis(300);
 const ABORT_WAIT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
 const BLOCKING_LIMIT: Duration = Duration::from_secs(30);
+const TIMED_OUT: &str = "the job timed out";
+const SETTLE: Duration = Duration::from_millis(500);
 const IGNORED: &str =
     "job declared checkpoints but kept running after a checkpoint asked it to stop";
 
@@ -289,6 +291,26 @@ impl Job for TimedPoller {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct InlinePoller {
+    label: String,
+}
+
+#[jalari::job(queue = "run_control", timeout = 1, max_attempts = 1)]
+impl Job for InlinePoller {
+    const NAME: &'static str = "run_control_inline_poller";
+
+    async fn run(self) -> JobResult {
+        let run = jalari::current_job().unwrap();
+        if poll_until_interrupted(&run, &self.label) {
+            return Ok(());
+        }
+        let error = run.interrupted().await;
+        record_halt(&self.label, "job", &error);
+        Err(error)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
 struct Shape {
     state: String,
@@ -377,6 +399,7 @@ async fn test_run_control() {
     check_close_waits_at_most_a_second_for_a_blocked_body(&database).await;
     check_blocking_code_sees_a_stop(&database).await;
     check_blocking_code_sees_a_timeout(&database).await;
+    check_inline_loop_sees_its_timeout_before_the_abort(&database).await;
     database.finish().await;
 }
 
@@ -674,6 +697,41 @@ async fn check_blocking_code_sees_a_timeout(database: &Database) {
     assert!(noticed >= TIMEOUT, "{noticed:?}");
     wait_for_state(database, id, "failed", CONTROL_LATENCY).await;
     assert_eq!(LEDGER.count(label, "interrupted at start"), 0);
+    assert_eq!(
+        history(database, id).await,
+        [(
+            "failed".to_owned(),
+            Some(format!("timed out after {TIMEOUT:?}"))
+        )]
+    );
+    worker.stop().await;
+}
+
+async fn check_inline_loop_sees_its_timeout_before_the_abort(database: &Database) {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+    let worker = spawn_worker(PATIENT, PATIENT).await;
+    let label = "inline_timeout";
+    let id = start(
+        &InlinePoller {
+            label: label.to_owned(),
+        },
+        label,
+    )
+    .await;
+    wait_for_state(database, id, "failed", TIMEOUT + SETTLE).await;
+    let events = LEDGER.events(label);
+    let at = |name: &str| {
+        events
+            .iter()
+            .find(|(event, _)| *event == name)
+            .map(|(_, at)| *at)
+            .unwrap()
+    };
+    let noticed = at("noticed").saturating_duration_since(at("start"));
+    eprintln!("inline_timeout: the inline loop saw its timeout {noticed:?} after it started");
+    assert!(noticed >= TIMEOUT, "{noticed:?}");
+    assert!(noticed < TIMEOUT + POLL * 5, "{noticed:?}");
+    assert_eq!(halt_seen(label, "job").as_deref(), Some(TIMED_OUT));
     assert_eq!(
         history(database, id).await,
         [(

@@ -134,8 +134,8 @@ impl JobRun {
         self.root_id
     }
 
-    /// Cancelled when the worker starts shutting down, see [`shutdown_requested`], and after
-    /// this attempt timed out and was aborted.
+    /// Cancelled when the worker starts shutting down, see [`shutdown_requested`], and when
+    /// this attempt times out.
     ///
     /// It covers shutdown and timeouts only. [`JobRun::interrupted`] also completes on a stop, a
     /// cancel or a lost job, with the error to return.
@@ -145,10 +145,9 @@ impl JobRun {
 
     /// Same as [`interrupted`] for this attempt; usable from tasks the job spawns.
     ///
-    /// It also completes after the attempt timed out and was aborted, so a spawned task learns
-    /// that the job it serves has gone. The error then says that the worker is shutting down,
-    /// although only this attempt ended; the attempt is already recorded as timed out, so the
-    /// error only matters to code that logs it.
+    /// It also completes when the attempt times out, so a spawned task learns that the job it
+    /// serves has gone. The error then says that the job timed out; the attempt is recorded as
+    /// timed out whatever the job returns, so the error only matters to code that logs it.
     ///
     /// # Examples
     ///
@@ -176,8 +175,7 @@ impl JobRun {
     ///
     /// It turns `true` at the same moment `interrupted` completes: on a [`stop`](crate::stop) or
     /// a [`cancel`](crate::cancel), when the worker starts shutting down, when the worker has
-    /// lost the job, and once the attempt has timed out and been aborted. It never turns back
-    /// to `false`. Poll it from blocking code, which cannot
+    /// lost the job, and when the attempt times out. It never turns back to `false`. Poll it from blocking code, which cannot
     /// await a future. The free functions [`current_job`] and [`interrupted`] read a task-local
     /// that does not exist inside `spawn_blocking`, so take the handle in the job's own task and
     /// move it in. Once the loop has noticed, return the error from `interrupted`, which is
@@ -261,7 +259,8 @@ pub async fn shutdown_requested() {
 /// Completes with the error to return once the running job should stop.
 ///
 /// It resolves when the job is asked to [`stop`](crate::stop) or [`cancel`](crate::cancel), when
-/// its worker starts shutting down, or when the worker has lost the job. The error is the one
+/// its worker starts shutting down, when the worker has lost the job, or when the attempt times
+/// out. The error is the one
 /// [`checkpoint`](crate::checkpoint) would return, so returning it releases or stops the job
 /// without counting the attempt. During a shutdown any other error counts the attempt; a stop
 /// or a cancel settles the job whatever it returns. Race it against long

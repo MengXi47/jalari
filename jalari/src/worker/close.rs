@@ -381,6 +381,19 @@ mod tests {
     }
 
     #[test]
+    fn test_timeout_halt_counts_the_attempt() {
+        let halted = Ending::Returned(Err(JobError::halted(Halt::Timeout)));
+        assert!(matches!(
+            decide(&halted, None, 1, 3, &policy()),
+            Outcome::Retry { .. }
+        ));
+        assert!(matches!(
+            decide(&halted, None, 3, 3, &policy()),
+            Outcome::Failed { .. }
+        ));
+    }
+
+    #[test]
     fn test_ordinary_error_during_shutdown_is_retried() {
         let ending = Ending::Returned(Err(JobError::new(Halt::Shutdown.message().to_owned())));
         assert!(matches!(

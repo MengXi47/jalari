@@ -1,6 +1,6 @@
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,7 @@ impl Command {
 pub(crate) enum Halt {
     Command(Command),
     Lost,
+    Timeout,
     Shutdown,
 }
 
@@ -84,6 +85,7 @@ impl Halt {
         match self {
             Self::Command(command) => command.message(),
             Self::Lost => "the worker no longer owns the job",
+            Self::Timeout => "the job timed out",
             Self::Shutdown => "the worker is shutting down",
         }
     }
@@ -138,6 +140,7 @@ pub(crate) struct RunControl {
     shutdown: CancellationToken,
     lost: CancellationToken,
     halted: CancellationToken,
+    timed_out: AtomicBool,
     command: AtomicU8,
     commanded: Notify,
     started: Instant,
@@ -165,6 +168,7 @@ impl RunControl {
             halted: shutdown.child_token(),
             shutdown,
             lost,
+            timed_out: AtomicBool::new(false),
             command: AtomicU8::new(0),
             commanded: Notify::new(),
             started: Instant::now(),
@@ -190,6 +194,11 @@ impl RunControl {
 
     pub(crate) fn lost(&self) -> &CancellationToken {
         &self.lost
+    }
+
+    pub(crate) fn time_out(&self) {
+        self.timed_out.store(true, Ordering::SeqCst);
+        self.shutdown.cancel();
     }
 
     pub(crate) fn request(&self, command: Command) {
@@ -220,8 +229,12 @@ impl RunControl {
             Some(Halt::Command(command))
         } else if self.lost.is_cancelled() {
             Some(Halt::Lost)
+        } else if !self.shutdown.is_cancelled() {
+            None
+        } else if self.timed_out.load(Ordering::SeqCst) {
+            Some(Halt::Timeout)
         } else {
-            self.shutdown.is_cancelled().then_some(Halt::Shutdown)
+            Some(Halt::Shutdown)
         }
     }
 
@@ -803,6 +816,25 @@ mod tests {
         assert_eq!(error, JobError::halted(Halt::Shutdown));
         assert!(error.is_interruption());
         assert_eq!(run.halts().await.1, error);
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_names_the_timeout() {
+        let run = Run::new();
+        let waiting = tokio::spawn(run.job().interrupted());
+        tokio::time::sleep(PENDING).await;
+        assert!(!waiting.is_finished());
+        run.control.time_out();
+        let error = tokio::time::timeout(PROMPT, waiting)
+            .await
+            .expect("interrupted() completes when the attempt times out")
+            .unwrap();
+        assert_eq!(error, JobError::halted(Halt::Timeout));
+        assert_eq!(error.msg(), "the job timed out");
+        assert!(run.job().is_interrupted());
+        assert_eq!(run.halts().await.1, error);
+        run.shutdown.cancel();
+        assert_eq!(run.halts().await.0, error);
     }
 
     #[tokio::test]

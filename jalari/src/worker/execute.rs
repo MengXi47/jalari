@@ -399,8 +399,8 @@ impl Claimed {
                 match tokio::time::timeout(timeout, attempt.returned()).await {
                     Ok(returned) => returned,
                     Err(_) => {
+                        control.time_out();
                         attempt.abort_and_wait(Cause::TimedOut).await;
-                        control.shutdown().cancel();
                         return Err(JobError::new(format!("timed out after {timeout:?}")));
                     }
                 }

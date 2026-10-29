@@ -992,10 +992,10 @@ are ready at once, either may win, so the unit of work must be safe to run again
 `jalari::current_job()` returns the running attempt. Its id stays the same across retries, so
 it works as an idempotency key. `current_job()` and `interrupted()` only work in the job's own
 task. A task the job spawns gets the same signal from `run.interrupted()`, where `run` is the
-`current_job()` value taken before the spawn; it also completes once the attempt timed out,
-with the shutdown error although only that attempt ended.
+`current_job()` value taken before the spawn; it also completes when the attempt times out,
+with the error `the job timed out`.
 `run.cancellation()` is the shutdown signal as a `CancellationToken`, for code that takes one;
-it is also cancelled once the attempt timed out.
+it is also cancelled when the attempt times out.
 
 ### Crashes and lost connections
 
@@ -1181,8 +1181,7 @@ if !finished {
 ```
 
 `is_interrupted()` turns `true` when `interrupted()` would complete: on a stop, a cancel, a
-shutdown or a lost job, and once the attempt has timed out and been aborted. It never turns
-back. Once the loop has returned, return the error of `run.interrupted()`, which is ready at
+shutdown or a lost job, and when the attempt times out. It never turns back. Once the loop has returned, return the error of `run.interrupted()`, which is ready at
 once, so a stop, a cancel or a shutdown settles the job as it does for async code. In jalari's
 tests such a loop, polling every 10 milliseconds, saw a stop about 1.0 second after the request
 and a 1 second timeout 1.0 seconds after the attempt started. The
