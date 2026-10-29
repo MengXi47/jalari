@@ -107,6 +107,7 @@ impl Flavor {
 
 #[derive(Debug, Clone)]
 struct Captured {
+    at: Instant,
     level: Level,
     target: String,
     message: String,
@@ -145,6 +146,7 @@ impl Subscriber for Capture {
         event.record(&mut fields);
         let message = fields.0.remove("message").unwrap_or_default();
         EVENTS.lock().unwrap().push(Captured {
+            at: Instant::now(),
             level: *event.metadata().level(),
             target: event.metadata().target().to_owned(),
             message,
@@ -692,14 +694,29 @@ async fn detail(id: JobId) -> JobDetail {
 async fn wait_for_state(id: JobId, state: JobState, since: Instant, within: Duration) {
     let deadline = since + within;
     loop {
-        let seen = detail(id).await.job.state;
+        let detail = detail(id).await;
+        let seen = detail.job.state;
         if seen == state {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "job {id} is {seen:?}, not {state:?}, {within:?} after the action"
-        );
+        if Instant::now() >= deadline {
+            let events: Vec<(i128, Level, String)> = slot_events(id)
+                .into_iter()
+                .map(|event| {
+                    let offset = if event.at >= since {
+                        i128::try_from(event.at.duration_since(since).as_millis()).unwrap()
+                    } else {
+                        -i128::try_from(since.duration_since(event.at).as_millis()).unwrap()
+                    };
+                    (offset, event.level, event.message)
+                })
+                .collect();
+            panic!(
+                "job {id} is {seen:?}, not {state:?}, {within:?} after the action\njob: {:?}\n\
+                 history: {:?}\nslot events (ms after the action): {events:?}",
+                detail.job, detail.history
+            );
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -893,16 +910,25 @@ async fn run_catalogue(flavor: Flavor) {
     if flavor == Flavor::AwaitedOnCurrentThread {
         let shutdown = CancellationToken::new();
         let checks = async {
+            wait_registered(&database).await;
             run_checks(flavor, &database).await;
             shutdown.cancel();
         };
         tokio::join!(worker.run(shutdown.clone()), checks);
     } else {
         let running = RunningWorker::spawn(worker);
+        wait_registered(&database).await;
         run_checks(flavor, &database).await;
         running.stop().await;
     }
     database.finish().await;
+}
+
+async fn wait_registered(database: &Database) {
+    wait_until("the worker's lifeline to register", START, || async {
+        database.lifelines().await.len() == 1
+    })
+    .await;
 }
 
 async fn run_checks(flavor: Flavor, database: &Database) {
