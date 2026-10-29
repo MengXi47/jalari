@@ -12,8 +12,8 @@ use common::{Database, LEDGER, RunningWorker, wait_until};
 use jalari::admin::JobDetail;
 use jalari::sqlx::PgPool;
 use jalari::{
-    CancelOutcome, CancellationToken, EnqueueOptions, Finished, Job, JobError, JobId, JobMeta,
-    JobMiddleware, JobResult, JobState, Next, StopOutcome, Worker, WorkerConfig,
+    CancelOutcome, CancellationToken, Cron, EnqueueOptions, Finished, Job, JobError, JobId,
+    JobMeta, JobMiddleware, JobResult, JobState, Next, StopOutcome, Worker, WorkerConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -32,6 +32,10 @@ const CROWD: &str = "crowd";
 const LONG_QUEUE: &str = "a_very_long_queue_name";
 const DOWN: &str = "down";
 const CRASH: &str = "crash";
+const CRON_QUEUE: &str = "cron_spin";
+const CRON_SLOTS: usize = 2;
+const CRON_WINDOW: Duration = Duration::from_secs(5);
+const HELD_FIRE_BACKOFF: Duration = Duration::from_millis(100);
 const SLOT_TARGET: &str = "jalari::worker::slot";
 const WATCHDOG: &str = "the worker's runtime";
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -76,6 +80,9 @@ static EVENTS: LazyLock<Mutex<Vec<Captured>>> = LazyLock::new(|| Mutex::new(Vec:
 enum Flavor {
     TwoThreads,
     CurrentThread,
+    DefaultThreads,
+    OneThread,
+    AwaitedOnCurrentThread,
 }
 
 impl Flavor {
@@ -83,7 +90,18 @@ impl Flavor {
         match self {
             Flavor::TwoThreads => "isolation_mt",
             Flavor::CurrentThread => "isolation_ct",
+            Flavor::DefaultThreads => "isolation_default",
+            Flavor::OneThread => "isolation_one",
+            Flavor::AwaitedOnCurrentThread => "isolation_awaited",
         }
+    }
+
+    fn is_current_thread(self) -> bool {
+        matches!(self, Flavor::CurrentThread | Flavor::AwaitedOnCurrentThread)
+    }
+
+    fn runs_every_check(self) -> bool {
+        matches!(self, Flavor::TwoThreads | Flavor::CurrentThread)
     }
 }
 
@@ -268,6 +286,13 @@ fn spin(duration: Duration) {
     }
 }
 
+fn wall_clock() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
 fn pool() -> &'static PgPool {
     POOL.get().unwrap()
 }
@@ -289,6 +314,7 @@ enum Style {
     AsyncIo,
     AsyncSleep,
     Spin { millis: u64 },
+    ClockedSpin { millis: u64 },
     ThreadSleep { millis: u64 },
     InlinePoll,
     SpawnBlockingPoll,
@@ -346,6 +372,12 @@ async fn run_style(style: Style, label: &str) -> JobResult {
         }
         Style::Spin { millis } => {
             spin(Duration::from_millis(millis));
+            Ok(())
+        }
+        Style::ClockedSpin { millis } => {
+            note(&format!("{label}:from"), wall_clock().to_string());
+            spin(Duration::from_millis(millis));
+            note(&format!("{label}:to"), wall_clock().to_string());
             Ok(())
         }
         Style::ThreadSleep { millis } => {
@@ -758,23 +790,21 @@ fn crowd_size() -> usize {
     std::thread::available_parallelism().map_or(4, usize::from) * 2
 }
 
-async fn spawn_main_worker() -> RunningWorker {
-    RunningWorker::spawn(
-        Worker::builder()
-            .queue(ISO, 2)
-            .queue(SOLO, 1)
-            .queue(OTHER, 2)
-            .queue(QUIET, 2)
-            .queue(CROWD, crowd_size())
-            .queue(LONG_QUEUE, 1)
-            .task_queue(TASKS, 1)
-            .middleware(Hooks)
-            .config(worker_config(Duration::from_secs(10)))
-            .scheduler(false)
-            .build()
-            .await
-            .unwrap(),
-    )
+async fn build_main_worker() -> Worker {
+    Worker::builder()
+        .queue(ISO, 2)
+        .queue(SOLO, 1)
+        .queue(OTHER, 2)
+        .queue(QUIET, 2)
+        .queue(CROWD, crowd_size())
+        .queue(LONG_QUEUE, 1)
+        .task_queue(TASKS, 1)
+        .middleware(Hooks)
+        .config(worker_config(Duration::from_secs(10)))
+        .scheduler(false)
+        .build()
+        .await
+        .unwrap()
 }
 
 #[test]
@@ -786,6 +816,9 @@ fn test_isolation() {
     for driver in [
         "test_isolation_on_two_threads",
         "test_isolation_on_current_thread",
+        "test_isolation_on_default_threads",
+        "test_isolation_on_one_thread",
+        "test_isolation_awaited_on_current_thread",
     ] {
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -814,6 +847,34 @@ async fn test_isolation_on_current_thread() {
     run_catalogue(Flavor::CurrentThread).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "runs only inside the process test_isolation spawns"]
+async fn test_isolation_on_default_threads() {
+    run_catalogue(Flavor::DefaultThreads).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "runs only inside the process test_isolation spawns"]
+async fn test_isolation_on_one_thread() {
+    run_catalogue(Flavor::OneThread).await;
+}
+
+#[tokio::test]
+#[ignore = "runs only inside the process test_isolation spawns"]
+async fn test_isolation_awaited_on_current_thread() {
+    run_catalogue(Flavor::AwaitedOnCurrentThread).await;
+}
+
+const CORE_CHECKS: [&str; 7] = [
+    "slot_threads_are_named",
+    "jobs_that_succeed",
+    "cooperative_loops_stop_on_time",
+    "panics_leave_the_thread_serving",
+    "never_returning_body_is_recorded_on_time",
+    "cron_under_blocking_bodies",
+    "shutdown_with_a_body_that_never_yields",
+];
+
 fn selected(check: &str) -> bool {
     std::env::var("ISOLATION_ONLY").map_or(true, |only| only.split(',').any(|name| name == check))
 }
@@ -828,78 +889,98 @@ async fn run_catalogue(flavor: Flavor) {
         return;
     };
     POOL.set(database.pool.clone()).unwrap();
-    let worker = spawn_main_worker().await;
-    if selected("slot_threads_are_named") {
+    let worker = build_main_worker().await;
+    if flavor == Flavor::AwaitedOnCurrentThread {
+        let shutdown = CancellationToken::new();
+        let checks = async {
+            run_checks(flavor, &database).await;
+            shutdown.cancel();
+        };
+        tokio::join!(worker.run(shutdown.clone()), checks);
+    } else {
+        let running = RunningWorker::spawn(worker);
+        run_checks(flavor, &database).await;
+        running.stop().await;
+    }
+    database.finish().await;
+}
+
+async fn run_checks(flavor: Flavor, database: &Database) {
+    let wanted = |check: &str| {
+        selected(check) && (flavor.runs_every_check() || CORE_CHECKS.contains(&check))
+    };
+    if wanted("slot_threads_are_named") {
         check_slot_threads_are_named().await;
     }
-    if selected("jobs_that_succeed") {
+    if wanted("jobs_that_succeed") {
         check_jobs_that_succeed(flavor).await;
     }
-    if selected("documented_runtime_limits") {
+    if wanted("documented_runtime_limits") {
         check_documented_runtime_limits(flavor).await;
     }
-    if selected("cooperative_loops_stop_on_time") {
+    if wanted("cooperative_loops_stop_on_time") {
         check_cooperative_loops_stop_on_time().await;
     }
-    if selected("spawn_blocking_recipe_on_both_placements") {
+    if wanted("spawn_blocking_recipe_on_both_placements") {
         check_spawn_blocking_recipe_on_both_placements().await;
     }
-    if selected("block_in_place") {
+    if wanted("block_in_place") {
         check_block_in_place(flavor).await;
     }
-    if selected("mixed_body_with_a_timeout") {
+    if wanted("mixed_body_with_a_timeout") {
         check_mixed_body_with_a_timeout().await;
     }
-    if selected("panics_leave_the_thread_serving") {
+    if wanted("panics_leave_the_thread_serving") {
         check_panics_leave_the_thread_serving().await;
     }
-    if selected("nested_block_on_panics") {
+    if wanted("nested_block_on_panics") {
         check_nested_block_on_panics().await;
     }
-    if selected("never_returning_body_is_recorded_on_time") {
+    if wanted("never_returning_body_is_recorded_on_time") {
         check_never_returning_body_is_recorded_on_time().await;
     }
-    if selected("stops_on_bodies_that_never_check") {
+    if wanted("stops_on_bodies_that_never_check") {
         check_stops_on_bodies_that_never_check().await;
     }
-    if selected("held_slots_keep_capacity_honest") {
+    if wanted("held_slots_keep_capacity_honest") {
         check_held_slots_keep_capacity_honest().await;
     }
-    if selected("progress_is_the_same_on_both_placements") {
+    if wanted("progress_is_the_same_on_both_placements") {
         check_progress_is_the_same_on_both_placements().await;
     }
-    if selected("progress_survives_a_stop") {
+    if wanted("progress_survives_a_stop") {
         check_progress_survives_a_stop().await;
     }
-    if selected("middleware_call_blocks_only_its_slot") {
+    if wanted("middleware_call_blocks_only_its_slot") {
         check_middleware_call_blocks_only_its_slot().await;
     }
-    if selected("finished_hook_runs_after_the_outcome") {
+    if wanted("finished_hook_runs_after_the_outcome") {
         check_finished_hook_runs_after_the_outcome(flavor).await;
     }
-    if selected("task_ids") {
+    if wanted("task_ids") {
         check_task_ids().await;
     }
-    if selected("more_blocking_bodies_than_cores") {
+    if wanted("more_blocking_bodies_than_cores") {
         check_more_blocking_bodies_than_cores().await;
     }
-    if selected("long_hold_reports_and_watchdog") {
-        check_long_hold_reports_and_watchdog(&database).await;
+    if wanted("long_hold_reports_and_watchdog") {
+        check_long_hold_reports_and_watchdog(database).await;
     }
-    if flavor == Flavor::TwoThreads && selected("task_queue_holds_too") {
+    if flavor == Flavor::TwoThreads && wanted("task_queue_holds_too") {
         check_task_queue_holds_too().await;
     }
-    if selected("stop_and_lost_holds") {
-        check_stop_and_lost_holds(&database).await;
+    if wanted("cron_under_blocking_bodies") {
+        check_cron_under_blocking_bodies(database).await;
     }
-    if selected("shutdown_with_a_body_that_never_yields") {
+    if wanted("stop_and_lost_holds") {
+        check_stop_and_lost_holds(database).await;
+    }
+    if wanted("shutdown_with_a_body_that_never_yields") {
         check_shutdown_with_a_body_that_never_yields().await;
     }
-    if selected("dropped_worker_leaves_nothing") {
-        check_dropped_worker_leaves_nothing(&database).await;
+    if wanted("dropped_worker_leaves_nothing") {
+        check_dropped_worker_leaves_nothing(database).await;
     }
-    worker.stop().await;
-    database.finish().await;
 }
 
 async fn check_slot_threads_are_named() {
@@ -1009,7 +1090,7 @@ async fn check_documented_runtime_limits(flavor: Flavor) {
         wait_for_state(id, JobState::Succeeded, enqueued, BLOCK + SETTLE).await;
         let measured = pulse.finish().await;
         eprintln!("{label}: blocking code on the worker's runtime, {measured:?}");
-        if flavor == Flavor::CurrentThread {
+        if flavor.is_current_thread() {
             assert!(
                 measured.widest_tick >= BLOCK / 2,
                 "{label}: code on the worker's runtime did not block it: {measured:?}"
@@ -1109,11 +1190,11 @@ async fn check_block_in_place(flavor: Flavor) {
 
     let label = format!("block_in_place_task:{flavor:?}");
     let (id, enqueued) = enqueue(&label, Style::BlockInPlace, TASKS, None).await;
-    match flavor {
-        Flavor::TwoThreads => {
+    match flavor.is_current_thread() {
+        false => {
             wait_for_state(id, JobState::Succeeded, enqueued, BLOCK + SETTLE).await;
         }
-        Flavor::CurrentThread => {
+        true => {
             wait_for_state(id, JobState::Failed, enqueued, SETTLE).await;
             assert_eq!(
                 last_error(id).await.as_deref(),
@@ -1417,7 +1498,7 @@ async fn check_finished_hook_runs_after_the_outcome(flavor: Flavor) {
     .await;
     let measured = pulse.finish().await;
     eprintln!("finished_hook: a blocking hook on the worker's runtime, {measured:?}");
-    if flavor == Flavor::CurrentThread {
+    if flavor.is_current_thread() {
         assert!(measured.widest_tick >= BLOCK / 2, "{measured:?}");
     }
 }
@@ -1756,4 +1837,127 @@ async fn check_dropped_worker_leaves_nothing(database: &Database) {
     })
     .await;
     let _ = jalari::cancel(stuck_id).await.unwrap();
+}
+
+async fn check_cron_under_blocking_bodies(database: &Database) {
+    let spin_millis = u64::try_from((CRON_WINDOW + Duration::from_secs(1)).as_millis()).unwrap();
+    let fire_bound = (HELD_FIRE_BACKOFF + SETTLE).as_secs_f64();
+    for schedulers in [1, 2] {
+        let name = format!("cron_blocked_{schedulers}");
+        let key = format!("recurring:{name}");
+        let mut workers = Vec::new();
+        for _ in 0..schedulers {
+            workers.push(RunningWorker::spawn(
+                Worker::builder()
+                    .queue(CRON_QUEUE, CRON_SLOTS)
+                    .config(worker_config(SHUTDOWN_TIMEOUT))
+                    .build()
+                    .await
+                    .unwrap(),
+            ));
+        }
+        let pulse = Pulse::start(&name);
+        jalari::recurring::add_or_update(
+            &name,
+            Cron::new("* * * * * *").unwrap(),
+            &Styled {
+                label: name.clone(),
+                style: Style::Named,
+            },
+        )
+        .await
+        .unwrap();
+        wait_until(&format!("{name}'s first run"), START, || async {
+            !cron_runs(database, &key).await.is_empty()
+        })
+        .await;
+        let spins: Vec<String> = (0..schedulers * CRON_SLOTS)
+            .map(|n| format!("{name}:spin:{n}"))
+            .collect();
+        for label in &spins {
+            enqueue(
+                label,
+                Style::ClockedSpin {
+                    millis: spin_millis,
+                },
+                CRON_QUEUE,
+                None,
+            )
+            .await;
+        }
+        for label in &spins {
+            wait_ended(label, CRON_WINDOW * 3).await;
+        }
+        jalari::recurring::remove(&name).await.unwrap();
+        let clock = |suffix: &str| -> Vec<f64> {
+            spins
+                .iter()
+                .map(|label| {
+                    noted(&format!("{label}:{suffix}"))
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let blocked_from = clock("from").into_iter().fold(f64::MIN, f64::max);
+        let blocked_to = clock("to").into_iter().fold(f64::MAX, f64::min);
+        let runs = cron_runs(database, &key).await;
+        let mut seconds: Vec<i64> = runs.iter().map(|run| run.floor() as i64).collect();
+        seconds.dedup();
+        assert_eq!(
+            seconds.len(),
+            runs.len(),
+            "{name}: a tick was enqueued twice: {runs:?}"
+        );
+        let first_tick = blocked_from.ceil() as i64;
+        let last_tick = (blocked_to - fire_bound).floor() as i64;
+        let ticks = usize::try_from(last_tick - first_tick + 1).unwrap_or(0);
+        let mut latest = 0.0_f64;
+        for tick in first_tick..=last_tick {
+            let fired: Vec<f64> = runs
+                .iter()
+                .map(|run| run - tick as f64)
+                .filter(|late| (0.0..1.0).contains(late))
+                .collect();
+            assert_eq!(
+                fired.len(),
+                1,
+                "{name}: tick {tick} while every slot spun: {runs:?}"
+            );
+            latest = latest.max(fired[0]);
+        }
+        eprintln!(
+            "{name}: every slot spun for {:.2} s; {ticks} ticks in it each enqueued once, the \
+             latest {latest:.3} s after its tick",
+            blocked_to - blocked_from
+        );
+        assert!(
+            ticks >= 5,
+            "{name}: only {ticks} ticks while every slot spun"
+        );
+        assert!(
+            latest <= fire_bound,
+            "{name}: a run was enqueued {latest} s after its tick"
+        );
+        pulse.assert_unaffected(&name, Duration::ZERO).await;
+        for label in &spins {
+            assert_ran_on(label, CRON_QUEUE);
+        }
+        for worker in workers {
+            worker.stop().await;
+        }
+    }
+}
+
+async fn cron_runs(database: &Database, key: &str) -> Vec<f64> {
+    jalari::sqlx::query_scalar(jalari::sqlx::AssertSqlSafe(format!(
+        "SELECT EXTRACT(EPOCH FROM created_at)::float8 FROM {} WHERE job_key = $1
+         ORDER BY created_at",
+        database.table("job")
+    )))
+    .bind(key)
+    .fetch_all(pool())
+    .await
+    .unwrap()
 }
