@@ -13,8 +13,9 @@ use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
 
 const INTERRUPTED: &str = "the worker stopped during the last attempt";
-const STALLED: &str = "the job runtime has not run for ";
-const RECOVERED: &str = "the job runtime runs again after ";
+const WATCHDOG_PREFIX: &str = "the worker's runtime";
+const STALLED: &str = "the worker's runtime has not run for ";
+const RECOVERED: &str = "the worker's runtime runs again after ";
 
 static WATCHDOG: LazyLock<Mutex<Vec<(Level, String)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -47,7 +48,7 @@ impl Subscriber for CaptureWatchdog {
         let mut message = Message(None);
         event.record(&mut message);
         if let Some(message) = message.0
-            && message.starts_with("the job runtime")
+            && message.starts_with(WATCHDOG_PREFIX)
         {
             WATCHDOG
                 .lock()
@@ -136,7 +137,8 @@ impl Job for Blocking {
 
     async fn run(self) -> JobResult {
         LEDGER.record(&self.label, "start");
-        std::thread::sleep(Duration::from_millis(self.millis));
+        let millis = self.millis;
+        tokio::spawn(async move { std::thread::sleep(Duration::from_millis(millis)) }).await?;
         LEDGER.record(&self.label, "done");
         Ok(())
     }

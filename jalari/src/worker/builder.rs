@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::middleware::ErasedMiddleware;
 use super::runner::{DeclaredCron, QueueConfig, Shared, Worker};
 use super::runs::RunBook;
+use super::slot::Placement;
 use crate::init::{Config, config};
 use crate::job::fingerprint;
 use crate::job::registry::{JobRegistration, entries};
@@ -78,15 +79,66 @@ impl WorkerBuilder {
         self
     }
 
-    /// Processes jobs from `name`, running up to `concurrency` of them at once.
+    /// Processes jobs from `name`, running up to `concurrency` of them at once, each on a thread
+    /// of its own.
     ///
-    /// Call it once per queue. A running job holds no connection: workers use the pool only for
-    /// the short statements that claim and finish jobs, so `concurrency` is independent of the
-    /// pool size.
-    pub fn queue(mut self, name: &str, concurrency: usize) -> Self {
+    /// Call it once per queue. Job code may block: a synchronous loop, a blocking client or
+    /// `std::thread::sleep` inside [`Job::run`](crate::Job::run) holds only the slot that runs
+    /// it, while the worker keeps claiming, timing out and stopping jobs on every queue. A job
+    /// that is timed out, stopped or lost while its code does not yield is recorded on time, and
+    /// its slot takes no other job until that code returns. The slot threads are named
+    /// `queue:index`, cut to 15 bytes, and are started when the worker runs.
+    ///
+    /// Tasks a job spawns and the middleware [`finished`](JobMiddleware::finished) hooks still
+    /// run on the worker's runtime, so blocking code does not belong there. Events a job emits
+    /// with `tracing` reach a subscriber installed with `set_global_default`; one installed only
+    /// for the current thread does not see them. A running job holds no connection: workers use
+    /// the pool only for the short statements that claim and finish jobs, so `concurrency` is
+    /// independent of the pool size.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> jalari::Result<()> {
+    /// let worker = jalari::Worker::builder().queue("reports", 4).build().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn queue(self, name: &str, concurrency: usize) -> Self {
+        self.push(name, concurrency, Placement::Thread)
+    }
+
+    /// Processes jobs from `name` as tasks on the worker's runtime instead of on threads of their
+    /// own.
+    ///
+    /// Use it for queues with many slots whose jobs only await IO, where a thread per slot costs
+    /// more than it protects, and in tests that pause tokio's clock, which cannot see code that
+    /// runs on a slot thread. Job code on such a queue must not block: it shares the runtime's
+    /// threads with the worker's claims, timeouts and stops, and a blocked runtime delays all of
+    /// them, on every queue. A job aborted while its code does not yield still holds its slot
+    /// until it returns.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> jalari::Result<()> {
+    /// let worker = jalari::Worker::builder()
+    ///     .queue("reports", 4)
+    ///     .task_queue("webhooks", 500)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn task_queue(self, name: &str, concurrency: usize) -> Self {
+        self.push(name, concurrency, Placement::Task)
+    }
+
+    fn push(mut self, name: &str, concurrency: usize, placement: Placement) -> Self {
         self.queues.push(QueueConfig {
             name: name.to_owned(),
             concurrency,
+            placement,
         });
         self
     }

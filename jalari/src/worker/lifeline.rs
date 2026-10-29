@@ -130,8 +130,9 @@ impl RuntimeWatch {
                 *stalled_at = Some(ticked);
                 error!(
                     worker_id,
-                    "the job runtime has not run for {} s; its jobs cannot be stopped or timed out \
-                     until it does",
+                    "the worker's runtime has not run for {} s; it claims, times out and stops \
+                     no job until it does. Blocking code in a task queue, in a task a job spawned \
+                     or in a middleware finished hook can cause this",
                     silence.as_secs()
                 );
             }
@@ -139,7 +140,7 @@ impl RuntimeWatch {
                 *stalled_at = None;
                 info!(
                     worker_id,
-                    "the job runtime runs again after {} s without running",
+                    "the worker's runtime runs again after {} s without running",
                     ticked
                         .saturating_sub(last)
                         .saturating_sub(TICK_INTERVAL)
@@ -183,7 +184,7 @@ impl LifelineThread {
         shared: Arc<Shared>,
         registration: WorkerRegistration,
         current: watch::Sender<Option<Arc<Incarnation>>>,
-        job_runtime: Arc<RuntimeWatch>,
+        runtime_watch: Arc<RuntimeWatch>,
     ) -> Self {
         let thread = Self {
             retire: CancellationToken::new(),
@@ -202,7 +203,7 @@ impl LifelineThread {
                     &shared,
                     &registration,
                     &current,
-                    &job_runtime,
+                    &runtime_watch,
                     &retire,
                     &abort,
                     &jobs,
@@ -235,7 +236,7 @@ fn run_thread(
     shared: &Arc<Shared>,
     registration: &WorkerRegistration,
     current: &watch::Sender<Option<Arc<Incarnation>>>,
-    job_runtime: &RuntimeWatch,
+    runtime_watch: &RuntimeWatch,
     retire: &CancellationToken,
     abort: &CancellationToken,
     jobs: &Handle,
@@ -255,7 +256,7 @@ fn run_thread(
             runtime.block_on(async {
                 tokio::select! {
                     () = abort.cancelled() => {}
-                    () = lifeline(shared, registration, current, job_runtime, retire, jobs) => {}
+                    () = lifeline(shared, registration, current, runtime_watch, retire, jobs) => {}
                 }
             });
         }));
@@ -275,7 +276,7 @@ async fn lifeline(
     shared: &Arc<Shared>,
     registration: &WorkerRegistration,
     current: &watch::Sender<Option<Arc<Incarnation>>>,
-    job_runtime: &RuntimeWatch,
+    runtime_watch: &RuntimeWatch,
     retire: &CancellationToken,
     jobs: &Handle,
 ) {
@@ -300,7 +301,7 @@ async fn lifeline(
         }
         let incarnation = Arc::clone(&lifeline.incarnation);
         current.send_replace(Some(Arc::clone(&incarnation)));
-        let kept = lifeline.keep(shared, job_runtime, retire, jobs).await;
+        let kept = lifeline.keep(shared, runtime_watch, retire, jobs).await;
         current.send_replace(None);
         match kept {
             Some(lifeline) => {
@@ -395,7 +396,7 @@ impl Lifeline {
     async fn keep(
         mut self,
         shared: &Arc<Shared>,
-        job_runtime: &RuntimeWatch,
+        runtime_watch: &RuntimeWatch,
         retire: &CancellationToken,
         jobs: &Handle,
     ) -> Option<Self> {
@@ -406,7 +407,7 @@ impl Lifeline {
                 () = retire.cancelled() => return Some(self),
                 () = tokio::time::sleep_until(due) => {}
             }
-            job_runtime.check(&worker_id);
+            runtime_watch.check(&worker_id);
             let sent_at = Instant::now();
             due = sent_at + PING_INTERVAL;
             let deadline = (self.answered + LIFELINE_IDLE_TIMEOUT).min(sent_at + PING_TIMEOUT);

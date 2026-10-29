@@ -15,7 +15,7 @@ use super::middleware::ErasedMiddleware;
 use super::ownership::{Target, interrupt};
 use super::pauses::{Pauses, watch_pauses};
 use super::runs::RunBook;
-use super::slot::Slot;
+use super::slot::{Placement, Slot, SlotThreads};
 use super::{housekeeping, listener, reaper, scheduler};
 use crate::init::Config;
 use crate::job::registry::{CronRegistration, JobRegistration};
@@ -33,10 +33,12 @@ pub(super) const ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// wakes up, because it stops trusting its lifeline 11 seconds after the last answered
 /// heartbeat, before PostgreSQL can have ended that session and released it. A database that
 /// answers heartbeats with errors, such as statement timeouts, keeps the jobs running for up to
-/// 30 seconds. The lifeline runs on its own thread, so job code that blocks the runtime does
-/// not cost the worker its lifeline. Aborting is cooperative: a job stops at its next `.await`,
-/// and code that never yields, such as a blocking loop or a thread the job started, keeps
-/// running. The guide's "Crashes and lost connections" gives the timings.
+/// 30 seconds. The lifeline runs on its own thread, and each slot of a
+/// [`queue`](WorkerBuilder::queue) runs its jobs on a thread of its own, so job code that blocks
+/// costs neither the lifeline nor the worker's claims, timeouts, stops and other jobs. Aborting
+/// is cooperative: a job stops at its next `.await`, and code that never yields, such as a
+/// blocking loop or a thread the job started, keeps running while the slot that ran it takes no
+/// other job until it returns. The guide's "Crashes and lost connections" gives the timings.
 ///
 /// # Examples
 ///
@@ -93,6 +95,7 @@ pub(super) struct DeclaredCron {
 pub(super) struct QueueConfig {
     pub(super) name: String,
     pub(super) concurrency: usize,
+    pub(super) placement: Placement,
 }
 
 pub(super) struct Wakers {
@@ -121,7 +124,9 @@ impl Worker {
     /// [`checkpoint`](crate::checkpoint), a [`Checkpoint`](crate::Checkpoint) or `interrupted`
     /// then is put back in its queue without counting the attempt, keeping its saved progress.
     /// Jobs still running after [`WorkerConfig::shutdown_timeout`] are aborted, which counts as
-    /// an attempt, and another worker runs them again after a few seconds.
+    /// an attempt, and another worker runs them again after a few seconds. It returns at most a
+    /// second later still: every slot thread has ended by then except those whose job code does
+    /// not yield, which are left running.
     ///
     /// # Examples
     ///
@@ -149,6 +154,7 @@ impl Worker {
             pauses: Arc::new(Notify::new()),
         });
 
+        let threads = SlotThreads::new();
         let mut tasks = JoinSet::new();
         tasks.spawn(listener::listen(
             Arc::clone(&self.shared),
@@ -170,10 +176,10 @@ impl Worker {
         let registration = WorkerRegistration::new(&self.queues, self.scheduler);
         let queue_names = registration.queue_names.clone();
         let (current, registered) = watch::channel(None);
-        let job_runtime = Arc::new(RuntimeWatch::new());
-        let _ticker = AbortOnDrop(tokio::spawn(Arc::clone(&job_runtime).tick()));
+        let runtime = Arc::new(RuntimeWatch::new());
+        let _ticker = AbortOnDrop(tokio::spawn(Arc::clone(&runtime).tick()));
         let lifeline =
-            LifelineThread::start(Arc::clone(&self.shared), registration, current, job_runtime);
+            LifelineThread::start(Arc::clone(&self.shared), registration, current, runtime);
         let flusher_shutdown = CancellationToken::new();
         let mut flusher = AbortOnDrop(tokio::spawn(flusher::flush_progress(
             Arc::clone(&self.shared),
@@ -220,7 +226,7 @@ impl Worker {
                 tasks.spawn(work_loop(
                     Arc::clone(&self.shared),
                     Arc::clone(&pauses),
-                    Slot::new(Arc::clone(&name), index),
+                    threads.slot(&name, index, queue.placement),
                     Arc::clone(&wakers.queues[&queue.name]),
                     registered.clone(),
                     shutdown.clone(),
@@ -253,6 +259,7 @@ impl Worker {
                 warn!(error = %e, "failed to hand the aborted jobs back");
             }
         }
+        threads.retire().await;
         flusher_shutdown.cancel();
         if let Err(e) = (&mut flusher.0).await {
             warn!(error = %e, "the progress flusher ended unexpectedly");
