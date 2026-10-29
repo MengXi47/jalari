@@ -24,7 +24,7 @@ reference with every option is on docs.rs; this guide shows how the pieces fit t
 
 ```toml
 [dependencies]
-jalari = "0.8"
+jalari = "0.9"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
