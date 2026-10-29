@@ -929,6 +929,8 @@ async fn wait_registered(database: &Database) {
         database.lifelines().await.len() == 1
     })
     .await;
+    let (id, enqueued) = enqueue("warm_up", Style::Named, ISO, None).await;
+    wait_for_state(id, JobState::Succeeded, enqueued, START).await;
 }
 
 async fn run_checks(flavor: Flavor, database: &Database) {
