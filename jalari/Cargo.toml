@@ -35,7 +35,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["signal", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["signal", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

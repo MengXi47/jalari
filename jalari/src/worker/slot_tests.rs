@@ -375,3 +375,24 @@ fn test_returned_texts() {
         "job task ended unexpectedly: the attempt was aborted"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_paused_clock_cannot_see_code_on_a_slot_thread() {
+    const COMPUTE: Duration = Duration::from_millis(300);
+    const DEADLINE: Duration = Duration::from_secs(10);
+    let shutdown = CancellationToken::new();
+    let threads = SlotThreads::new();
+    for placement in PLACEMENTS {
+        let mut slot = slot(&threads, placement);
+        let body: AttemptFuture = Box::pin(async {
+            std::thread::sleep(COMPUTE);
+            Ok(())
+        });
+        let mut attempt = slot.vacate(&shutdown).await.unwrap().launch(1, body);
+        let returned = tokio::time::timeout(DEADLINE, attempt.returned()).await;
+        match placement {
+            Placement::Thread => assert!(returned.is_err(), "the paused clock waited"),
+            Placement::Task => assert!(matches!(returned, Ok(Returned::Finished(Ok(()))))),
+        }
+    }
+}
