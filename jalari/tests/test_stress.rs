@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use common::{Database, OCCUPANCY, Rng, RunningWorker};
 use jalari::sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use jalari::sqlx::{self, AssertSqlSafe, PgPool};
-use jalari::{CancellationToken, EnqueueOptions, Job, JobResult, Schema, Worker, WorkerConfig};
+use jalari::{
+    CancellationToken, EnqueueOptions, Job, JobResult, Schema, Worker, WorkerBuilder, WorkerConfig,
+};
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::field::{Field, Visit};
@@ -314,6 +316,14 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn serve_queue(builder: WorkerBuilder, concurrency: usize) -> WorkerBuilder {
+    match std::env::var("STRESS_PLACEMENT").as_deref() {
+        Ok("task") => builder.task_queue(QUEUE, concurrency),
+        Ok("thread") | Err(_) => builder.queue(QUEUE, concurrency),
+        Ok(other) => panic!("STRESS_PLACEMENT must be thread or task, not {other:?}"),
+    }
 }
 
 fn env_list(name: &str, default: &[u64]) -> Vec<u64> {
@@ -637,8 +647,7 @@ async fn start_workers(total: usize, max_workers: usize) -> (Vec<RunningWorker>,
     let mut built = Vec::new();
     for _ in 0..workers {
         built.push(
-            Worker::builder()
-                .queue(QUEUE, concurrency)
+            serve_queue(Worker::builder(), concurrency)
                 .scheduler(false)
                 .config(WorkerConfig::default())
                 .build()
@@ -1033,8 +1042,7 @@ async fn run_child(schema: String) {
     let mut running = Vec::new();
     for _ in 0..workers {
         running.push(RunningWorker::spawn(
-            Worker::builder()
-                .queue(QUEUE, concurrency)
+            serve_queue(Worker::builder(), concurrency)
                 .scheduler(false)
                 .config(WorkerConfig::default())
                 .build()
