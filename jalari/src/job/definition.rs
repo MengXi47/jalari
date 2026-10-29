@@ -297,6 +297,12 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// [`MAX_ATTEMPTS`](Self::MAX_ATTEMPTS) is reached, unless it is [`JobError::permanent`].
     /// A panic or a timeout counts as a failed attempt and does not affect other jobs.
     ///
+    /// On a queue added with [`WorkerBuilder::queue`](crate::WorkerBuilder::queue) it runs on
+    /// its slot's own thread, so it may block; on a
+    /// [`task_queue`](crate::WorkerBuilder::task_queue) it runs on the worker's runtime and must
+    /// not. Either way it stops only where it awaits or checks
+    /// [`JobRun::is_interrupted`](crate::JobRun::is_interrupted).
+    ///
     /// Inside `#[jalari::job]` the `context` parameter may be left out when it is not needed.
     fn run(self, context: &Self::Context) -> impl Future<Output = JobResult> + Send;
 }

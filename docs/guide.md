@@ -884,7 +884,11 @@ worker.run(shutdown).await;
 ```
 
 A worker runs every `#[jalari::job]` linked into its binary and only takes jobs from the
-queues it lists. A running job holds no connection: workers use the pool only for the short
+queues it lists. Each slot of a queue runs its jobs on a thread of its own, named
+`queue:index` and cut to 15 bytes, so job code may block without delaying the worker or other
+jobs, as [Blocking code](#blocking-code) describes. `.task_queue(name, concurrency)` adds a
+queue whose jobs run as tasks on the worker's runtime instead, for queues with hundreds of slots
+whose jobs only await IO. A running job holds no connection: workers use the pool only for the short
 statements that claim jobs, store their progress and finish them, so the concurrency does not
 depend on the pool size.
 The pool needs at least two connections, one for the notification listener and one for those
@@ -967,7 +971,9 @@ job that brings down its process from crashing workers forever.
 Cancelling the token stops the worker from claiming new jobs and waits for running ones.
 Jobs still running after `shutdown_timeout` are aborted and count as an attempt; the worker
 saves their progress and hands them back, and another worker runs them again 7 seconds later,
-so whatever the aborted run spawned has time to stop. A job that reaches a
+so whatever the aborted run spawned has time to stop. `Worker::run` returns at most a second
+after that: it joins every slot thread that has ended by then and leaves running, with a
+warning naming the job, those whose code does not yield. A job that reaches a
 [checkpoint](#checkpoints) during the shutdown gets an error from it; when it returns that
 error, the job goes back to its queue without counting the attempt and keeps its saved progress.
 
@@ -1001,8 +1007,8 @@ it is also cancelled when the attempt times out.
 
 Each worker holds a lifeline: one session outside the pool, named `jalari lifeline <worker id>`
 in `pg_stat_activity`, that keeps an advisory lock on the worker's id and records a heartbeat
-every second. The lifeline runs on a thread of its own, so job code that blocks the worker's
-runtime threads does not delay it. PostgreSQL itself ends a lifeline that stays silent for 11
+every second. The lifeline runs on a thread of its own, so code that blocks the worker's
+runtime does not delay it. PostgreSQL itself ends a lifeline that stays silent for 11
 seconds, through `idle_session_timeout` set on that session only, and the lock goes with the
 session. The worker also sets `tcp_user_timeout` to 11 seconds there, which only servers that
 support it (Linux) apply; others, macOS among them, ignore it and report 0, and
@@ -1018,7 +1024,8 @@ heartbeat is at least 7 seconds old, and takes them over.
 | The database restarts | within about 1 s | 6 to 8 s later if the database is back by then, otherwise within about 1 s of it accepting connections again |
 | The worker freezes for less than 10 s | never; it continues | never |
 | The worker freezes for 10 s or more | as soon as it wakes up | 10 to 12 s after the freeze began |
-| Job code blocks every runtime thread of the worker | never; it continues | never |
+| Job code blocks its slot's thread | never; it continues, and the slot takes no other job | never |
+| Code blocks every thread of the worker's runtime | never; it continues | never |
 | The database answers heartbeats with errors, such as statement timeouts while the worker row is locked | never; it continues | never |
 | The network goes silent | within 3 s | 10 to 13 s after the failure |
 | One of the jobs holds a [`save_in`](#durable-progress) transaction open when its worker freezes or loses its lifeline | as above | that job about 11 s after the transaction went idle; the worker's other jobs as above |
@@ -1068,14 +1075,19 @@ over while it is frozen; when it wakes up those 11 seconds have passed, so it ab
 once, within milliseconds in jalari's tests, without waiting for the database to answer. In that
 moment the job's writes to the job tables are rejected, but its own side effects are not.
 
-Aborting a job drops its task at its next `.await`. Code that does not yield keeps running: a
+Aborting a job drops it at its next `.await`. Code that does not yield keeps running: a
 blocking loop, `spawn_blocking`, threads, child processes and tasks the job spawned itself. In
 every case above such code can still run while the job runs again elsewhere, for as long as it
-takes. Blocked runtime threads do not cost the worker its lifeline: in jalari's tests two jobs
-that blocked both runtime threads for 12 seconds each ran once and the worker kept its id. A
-runtime that has not run for 10 seconds cannot stop or time out its jobs, so the lifeline logs
-an error, `the job runtime has not run for 10 s`, and an info line when the runtime runs
-again; it only logs, and the worker keeps its lifeline and its jobs.
+takes. A job whose code keeps running on its slot's thread holds that slot: the slot takes no
+other job until the code returns, so a queue never runs more jobs at once than its concurrency.
+
+Job code on a slot thread cannot block the worker's runtime, but code that runs on that
+runtime can: blocking code in a [task queue](#running-workers), in a task a job spawned or in a
+middleware `finished` hook. A blocked runtime does not cost the worker its lifeline: in
+jalari's tests two jobs whose spawned tasks blocked both runtime threads for 12 seconds each ran
+once and the worker kept its id. A runtime that has not run for 10 seconds claims, times out and
+stops no job, so the lifeline logs an error, `the worker's runtime has not run for 10 s`, and
+an info line when it runs again; it only logs, and the worker keeps its lifeline and its jobs.
 
 A worker also hands back jobs it owns but no longer runs, within a second, and they run again 7
 seconds later. When the database committed a claim but the reply never reached the worker, the
@@ -1157,10 +1169,51 @@ flag changes nothing else.
 
 ### Blocking code
 
-Blocking code belongs in `spawn_blocking`, and it can stop itself there. `jalari::interrupted()`
-and `jalari::current_job()` read a task-local that `spawn_blocking` does not carry, so they do
-not work inside it. Take the run handle in the job's own task, move it in, and poll
-`is_interrupted()` between pieces of work:
+Each slot of a queue runs its job on a thread of its own, so job code may block. A synchronous
+loop, a blocking client or `std::thread::sleep` inside `run` holds only that slot; the worker
+keeps claiming, timing out and stopping jobs on every queue. Blocking code still stops only
+where it checks: poll `is_interrupted()` between pieces of work and return the error of
+`interrupted()`, which is ready at once, so a stop, a cancel, a timeout or a shutdown settles
+the job as it does for async code. `current_job()` works anywhere in `run`, including inside
+such a loop:
+
+```rust
+let run = jalari::current_job().expect("inside a job");
+for chunk in chunks {
+    if run.is_interrupted() {
+        return Err(run.interrupted().await);
+    }
+    process(chunk);
+}
+```
+
+`is_interrupted()` turns `true` when `interrupted()` would complete: on a stop, a cancel, a
+shutdown or a lost job, and when the attempt times out. It never turns back. In jalari's tests
+such a loop, polling every 10 milliseconds, saw a 1 second timeout 1.01 seconds after the
+attempt started; a stop reaches it with the next heartbeat, about a second after the request.
+
+A job that never checks is still recorded on time: `timed out after ...` a second after its
+timeout, or stopped a second after `stop_timeout`. Its code keeps running on the slot's thread,
+and that slot takes no job until the code returns. The worker logs a warning when the code has
+not stopped a second after the abort, an error every 10 seconds while the slot stays held,
+and an info line when the code returns:
+
+```text
+WARN  jalari::worker::slot: job 81 did not stop within 1s after it timed out; slot reports:0 takes no job until it returns
+ERROR jalari::worker::slot: job 81 still runs 10 s after it timed out; slot reports:0 takes no job until it returns
+INFO  jalari::worker::slot: job 81 returned 11 s after it timed out; slot reports:0 takes jobs again
+```
+
+The events carry `job_id`, `queue`, `slot`, `cause` and `held_secs` fields, and every slot logs
+its transitions (`slot running job`, `slot idle`, `slot held`, `slot returned`) at DEBUG under
+the same target. Because the threads are named after their queue and slot, `top -H`, a
+debugger and a panic message (`thread 'reports:0' panicked at ...`) name them too.
+
+Some code still runs on the worker's runtime: tasks the job `tokio::spawn`s, middleware
+`finished` hooks, and every job of a queue added with `task_queue`. Do not block there. Blocking
+work in such a job belongs in `spawn_blocking`, which can stop itself as well. `current_job()`
+and `interrupted()` read a task-local that `spawn_blocking` does not carry, so take the run
+handle in the job and move it in:
 
 ```rust
 let run = jalari::current_job().expect("inside a job");
@@ -1180,13 +1233,19 @@ if !finished {
 }
 ```
 
-`is_interrupted()` turns `true` when `interrupted()` would complete: on a stop, a cancel, a
-shutdown or a lost job, and when the attempt times out. It never turns back. Once the loop has returned, return the error of `run.interrupted()`, which is ready at
-once, so a stop, a cancel or a shutdown settles the job as it does for async code. In jalari's
-tests such a loop, polling every 10 milliseconds, saw a stop about 1.0 second after the request
-and a 1 second timeout 1.0 seconds after the attempt started. The
-[`blocking_work`](../jalari/examples/blocking_work.rs) example stops such a loop and times one
-out.
+A few things differ for job code on a slot thread, because it is not a tokio task:
+
+- `tokio::task::id()` panics there and `tokio::task::try_id()` returns `None`.
+- A `tracing` subscriber installed only for the current thread, with `set_default`, does not
+  see the events the job emits; install it with `set_global_default`.
+- A test that pauses tokio's clock, such as `#[tokio::test(start_paused = true)]`, cannot see
+  code running on a slot thread: the paused clock jumps to the next timer while the job
+  computes, so a job's timeout can fire at once. Put the queue under test on `task_queue`
+  there.
+
+The [`blocking_work`](../jalari/examples/blocking_work.rs) example stops such a loop, times one
+out, keeps a second slot working while a job that never checks is timed out, and runs the
+`spawn_blocking` recipe on a task queue.
 
 ### What each call does
 
@@ -1234,10 +1293,11 @@ A snoozed job is waiting, so `stop` settles it at once. `restart` keeps its snoo
 - The abort after `stop_timeout` drops the job at an `.await`. Code that never reaches one,
   work in `spawn_blocking` and tasks the job spawned keep running, and their side effects may
   outlive the stop, as with `timeout` and shutdown aborts. After a `stop_timeout` or `timeout`
-  abort, the worker waits up to a second for the job's task to be dropped, so drop guards have
-  run before the outcome is recorded. A job that never yields cannot be dropped: its outcome is
-  recorded a second after the abort, and the stop takes up to `stop_timeout` plus a second.
-  [Blocking code](#blocking-code) shows how code in `spawn_blocking` stops itself.
+  abort, the worker waits up to a second for the job to be dropped, so drop guards have run
+  before the outcome is recorded. A job that never yields cannot be dropped: its outcome is
+  recorded a second after the abort, the stop takes up to `stop_timeout` plus a second, and its
+  slot takes no other job until the code returns. [Blocking code](#blocking-code) shows how
+  blocking code stops itself.
 - A job a worker aborted at shutdown keeps waiting the 7 seconds after the abort when it is
   stopped and restarted or retried in between.
 
@@ -1760,12 +1820,16 @@ The same jobs can run in several shapes; pick per process.
   connections with the options the pool was built with, so once the old password is revoked
   every reconnect fails until the process restarts with the new one. Start processes with the
   new credentials before revoking the old ones.
-- Keep blocking work off the runtime. A blocking client, `std::thread::sleep` or a CPU-bound
-  loop belongs in `spawn_blocking`. The lifeline keeps beating while the runtime is blocked,
-  but a stop, a cancel, a timeout and shutdown reach a job only at an `.await`, and a runtime
-  that has not run for 10 seconds makes the lifeline log `the job runtime has not run`. Inside
-  `spawn_blocking`, poll `JobRun::is_interrupted()` between pieces of work, as
-  [Blocking code](#blocking-code) shows.
+- Keep blocking work out of spawned tasks, `finished` hooks and task queues. Job code on a
+  queue added with `queue` may block, at the cost of its own slot, but those three run on the
+  worker's runtime, where blocking delays claims, stops and timeouts on every queue, and a
+  runtime that has not run for 10 seconds makes the lifeline log
+  `the worker's runtime has not run`. In long blocking loops poll `JobRun::is_interrupted()`
+  between pieces of work, as [Blocking code](#blocking-code) shows, so stops and timeouts end
+  them.
+- Count the threads. Each slot of a queue added with `queue` is a thread of its own with the
+  standard 2 MiB stack; a queue with hundreds of slots whose jobs only await IO belongs on
+  `task_queue`.
 
 For a task with `fingerprint = true`, a worker runs only the jobs enqueued by its own build of
 the task's code, as [code fingerprints](#code-fingerprints) describes. A task whose code a
@@ -1776,6 +1840,28 @@ until the old build's jobs have drained. Jobs left behind after the last old wor
 until you release them with `jalari::admin::clear_fingerprint`. Every worker logs a warning
 every five minutes while due jobs in its queues have no live worker that can run them, and
 `jalari::admin::stranded()` lists those jobs.
+
+### Upgrading from 0.8
+
+0.9.0 brings no migration. A queue added with `queue` now runs each slot's jobs on a thread of
+its own instead of as tasks on the worker's runtime:
+
+- Job code that blocks no longer delays claims, timeouts, stops or other queues. A job whose
+  code keeps running after its timeout, stop or loss holds its slot until the code returns,
+  and the worker reports the held slot. This also holds on `task_queue`; before 0.9.0 such a
+  slot claimed the next job after a second while the old code still ran.
+- A job that times out sees the halt at once: `is_interrupted()` turns `true` and
+  `interrupted()` completes with `the job timed out` at the timeout, where 0.8 said
+  `the worker is shutting down` a second later.
+- `tokio::task::id()` panics in job code on a slot thread, a thread-scoped `tracing` subscriber
+  no longer sees job events, and tests with a paused clock need `task_queue`, as
+  [Blocking code](#blocking-code) explains.
+- `Worker::run` returns up to a second later at a shutdown that aborted jobs, while it joins the
+  slot threads.
+- The runtime watchdog's messages now start with `the worker's runtime`.
+
+Move a queue that relies on any of these, or that has hundreds of IO-only slots, to
+`task_queue`.
 
 ### Upgrading from 0.7
 
@@ -2072,7 +2158,7 @@ cargo run -p jalari --example split_control -- stranded
 | [`stop_restart`](../jalari/examples/stop_restart.rs) | `stop`, `restart` and `cancel` on waiting and running jobs, checkpoints with and without progress and `checkpoints = true`, a job blocked in one long sleep that `interrupted()` stops within a second, `stop_timeout` aborting a job without checkpoints, and a shutdown that the next worker resumes from. It exits when done |
 | [`durable_progress`](../jalari/examples/durable_progress.rs) | Three jobs deliver pages in a cursor loop, one storing the cursor with `save`, one with `save_now` and one with `save_in` in the same transaction as its page row. The program kills its first worker process with SIGKILL mid-run, prints each job's stored cursor, lets a second worker take the jobs over, and counts the pages each job delivered twice: only the `save` job repeats the pages after its last written copy. It exits when done |
 | [`steps`](../jalari/examples/steps.rs) | An order job with a `charge` step that passes `idempotency_key()` to a fake payment gateway and a `receipt` step written with the `starts() > 1` at-most-once recipe. A simulated crash after each effect, before its step is recorded, makes the next attempt charge again under the same key, which the gateway deduplicates, and give up on the receipt; the last attempt reads the charge from its record without calling the gateway. The run ends with `JobDetail::steps` and `admin::clear_steps`. It exits when done |
-| [`blocking_work`](../jalari/examples/blocking_work.rs) | A loop in `spawn_blocking` that polls `JobRun::is_interrupted` between chunks: run to the end, stopped with `jalari::stop` and noticing it within a second, and ended by a 2 second `timeout`. It exits when done |
+| [`blocking_work`](../jalari/examples/blocking_work.rs) | A blocking loop inside `run` that polls `JobRun::is_interrupted` between chunks: run to the end, stopped with `jalari::stop` and noticing it within a second, and ended by a 2 second `timeout`. Then a job that sleeps without checking is recorded `timed out` after 2 seconds while the queue's other slot keeps working, and the `spawn_blocking` recipe runs on a `task_queue`. It exits when done |
 | [`middleware`](../jalari/examples/middleware.rs) | Capturing a context with `jalari::scope` and `EnqueueOptions::context`, middleware that wraps every job or provides a per-tenant database, `check`, rejected jobs, a job that passes its context to the jobs it enqueues, the `finished` hook with `is_last_attempt`, and a job stored under an old name that runs through `aliases`. It exits when done |
 | [`split_web`](../jalari/examples/split_web.rs), [`split_worker`](../jalari/examples/split_worker.rs) and [`split_control`](../jalari/examples/split_control.rs) | The same jobs in separate binaries: one enqueues, one runs them (`--no-scheduler` turns its scheduler off), and one stops, restarts, cancels or shows a job, lists the jobs no live worker can run (`stranded`) or releases a task's jobs to any build (`release <task>`) from yet another process. `vacuum_tables` is the only job without `fingerprint = true`; edit `common/jobs.rs` and rebuild only `split_worker` to see the other jobs wait for the build that enqueued them |
 

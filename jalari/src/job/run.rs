@@ -175,12 +175,16 @@ impl JobRun {
     ///
     /// It turns `true` at the same moment `interrupted` completes: on a [`stop`](crate::stop) or
     /// a [`cancel`](crate::cancel), when the worker starts shutting down, when the worker has
-    /// lost the job, and when the attempt times out. It never turns back to `false`. Poll it from blocking code, which cannot
-    /// await a future. The free functions [`current_job`] and [`interrupted`] read a task-local
-    /// that does not exist inside `spawn_blocking`, so take the handle in the job's own task and
-    /// move it in. Once the loop has noticed, return the error from `interrupted`, which is
-    /// ready at once, so a stop, a cancel or a shutdown settles the job the way it does for
-    /// async code.
+    /// lost the job, and when the attempt times out. It never turns back to `false`. Poll it
+    /// from blocking code, which cannot await a future, between pieces of work. Once the loop
+    /// has noticed, return the error from `interrupted`, which is ready at once, so a stop, a
+    /// cancel or a shutdown settles the job the way it does for async code.
+    ///
+    /// On a queue added with [`queue`](crate::WorkerBuilder::queue) the loop can run inline in
+    /// [`Job::run`](crate::Job::run). Inside `spawn_blocking`, which a job on a
+    /// [`task_queue`](crate::WorkerBuilder::task_queue) needs for blocking code, the free
+    /// functions [`current_job`] and [`interrupted`] read a task-local that does not exist, so
+    /// take the handle in the job and move a clone in.
     ///
     /// # Examples
     ///
@@ -188,19 +192,11 @@ impl JobRun {
     /// # fn process(chunk: u32) {}
     /// # async fn example(chunks: Vec<u32>) -> jalari::JobResult {
     /// let run = jalari::current_job().expect("inside a job");
-    /// let polled = run.clone();
-    /// let finished = tokio::task::spawn_blocking(move || {
-    ///     for chunk in chunks {
-    ///         if polled.is_interrupted() {
-    ///             return false;
-    ///         }
-    ///         process(chunk);
+    /// for chunk in chunks {
+    ///     if run.is_interrupted() {
+    ///         return Err(run.interrupted().await);
     ///     }
-    ///     true
-    /// })
-    /// .await?;
-    /// if !finished {
-    ///     return Err(run.interrupted().await);
+    ///     process(chunk);
     /// }
     /// Ok(())
     /// # }

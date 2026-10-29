@@ -38,15 +38,15 @@ jalari = "0.8"
   rate limits, permanent errors, timeouts, and panics isolated to the job that caused them.
 - **Snooze and discard** — a job can ask to run again later without using an attempt, or end
   itself without counting as a failure.
-- **Named queues** — each worker chooses its queues and how many jobs run at once; pause and
-  resume a queue across every worker.
+- **Named queues** — each worker chooses its queues and how many jobs run at once, each slot
+  on a thread of its own, so a job's blocking code costs only its slot; pause and resume a
+  queue across every worker.
 - **Context and middleware** — capture a tenant or user when enqueuing and rebuild it on the
   worker with your own middleware; jobs declare what they need and workers check it at startup,
   and middleware hears how each attempt ended.
 - **Stop, restart and cancel** — stop a job to free everything it holds, restart it later from
   the progress it saved at its last checkpoint, or cancel it for good; `interrupted()` reaches
-  a job blocked in a long `.await`, and `is_interrupted()` reaches blocking code in
-  `spawn_blocking`.
+  a job blocked in a long `.await`, and `is_interrupted()` reaches a blocking loop.
 - **Durable progress and steps** — `save_now` stores a job's cursor before it goes on,
   `save_in` commits it in your own transaction together with the rows it covers, and
   `jalari::step` records each named effect's result, so a retry or a takeover after a crash
